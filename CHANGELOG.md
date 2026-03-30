@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-03-30
+
+### Fixed
+
+- Node `0.1.7` is the clean npm release that ships both the async text-embedder support and the Windows prebuilt-loader cleanup fix from the correct tagged commit.
+
 ## [0.1.6] - 2026-03-30
 
 ### Fixed
