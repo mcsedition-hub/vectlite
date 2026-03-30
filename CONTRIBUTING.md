@@ -7,7 +7,7 @@ The project is intentionally small at the API and storage boundary. Contribution
 ## Before You Start
 
 - Open an issue before writing a large PR.
-- Open an issue first for changes to the `.vdb` / `.wal` format, ANN persistence, filter semantics, or public Python API.
+- Open an issue first for changes to the `.vdb` / `.wal` format, ANN persistence, filter semantics, or public Python / Node API.
 - Keep PRs focused. Small, reviewable changes are much easier to merge than broad refactors.
 
 ## Good First Contribution Areas
@@ -40,6 +40,10 @@ source .venv/bin/activate
 python -m pip install --upgrade pip pytest maturin
 python -m pip install -e bindings/python
 python -m pytest bindings/python/tests -q
+
+# Node
+cd bindings/node
+npm test
 ```
 
 If you are working on packaging locally, you can validate that the package still builds without publishing anything:

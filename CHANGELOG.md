@@ -9,12 +9,15 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 ### Added
 
 - Added a contribution guide, project code of conduct, pull request template, issue templates, and maintainer notes for reviewing community PRs.
+- Added an initial Node binding in `bindings/node` with a native `napi-rs` addon, JavaScript wrapper, TypeScript declarations, and smoke tests for CRUD, collections, and text helpers.
 
 ### Changed
 
 - The repository README now points contributors to the contribution and conduct docs before opening pull requests.
 - Contribution and release docs now distinguish local packaging validation from maintainer-only publishing steps, so public contributors are not told to upload releases.
 - Local packaging commands in the docs are now explicitly labeled as no-upload validation steps.
+- The main CI workflow now runs Node smoke tests on Linux, macOS, and Windows in addition to the Rust and Python checks.
+- The repository README now shows the Node binding as available from source instead of just planned.
 
 ## [0.1.3] - 2026-03-30
 

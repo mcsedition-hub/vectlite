@@ -9,4 +9,5 @@ __pycache__/
 bindings/python/vectlite/_vectlite*.so
 bindings/python/vectlite/_vectlite*.pyd
 bindings/python/vectlite/_vectlite*.dylib
+bindings/node/vectlite.node
 *.dSYM/

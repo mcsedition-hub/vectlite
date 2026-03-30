@@ -1,0 +1,39 @@
+{
+  "name": "vectlite",
+  "version": "0.1.3",
+  "description": "Embedded vector store for local-first AI applications.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "homepage": "https://github.com/mcsedition-hub/vectlite/tree/main/bindings/node",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mcsedition-hub/vectlite.git",
+    "directory": "bindings/node"
+  },
+  "bugs": {
+    "url": "https://github.com/mcsedition-hub/vectlite/issues"
+  },
+  "keywords": [
+    "vectlite",
+    "vector-database",
+    "vector-search",
+    "embeddings",
+    "hnsw",
+    "rag",
+    "napi-rs"
+  ],
+  "license": "MIT",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md",
+    "vectlite.node"
+  ],
+  "scripts": {
+    "build": "node ./scripts/build-addon.mjs",
+    "test": "npm run build && node --test tests/*.test.cjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

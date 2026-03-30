@@ -3,6 +3,7 @@ members = [
     "crates/vectlite-core",
     "crates/vectlite-cli",
     "bindings/python",
+    "bindings/node",
 ]
 resolver = "2"
 

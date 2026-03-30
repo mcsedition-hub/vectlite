@@ -1,0 +1,23 @@
+[package]
+name = "vectlite-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Node.js bindings for vectlite."
+homepage = "https://github.com/mcsedition-hub/vectlite"
+repository = "https://github.com/mcsedition-hub/vectlite"
+documentation = "https://github.com/mcsedition-hub/vectlite/tree/main/bindings/node"
+build = "build.rs"
+
+[lib]
+name = "vectlite_node"
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3.5.2", default-features = false, features = ["napi8"] }
+napi-derive = "3.3.0"
+serde_json = "1.0"
+vectlite = { package = "vectlite-core", path = "../../crates/vectlite-core" }
+
+[build-dependencies]
+napi-build = "2.2.3"

@@ -50,6 +50,8 @@ results = db.search(query, k=5, filter={"source": "blog"})
 
 Once Python stabilizes the object model, Node should mirror it closely.
 
+That work is now started: the initial source-built binding lives in `bindings/node` and mirrors the core CRUD, collection, and search flows.
+
 Recommended implementation path:
 
 - wrapper crate with `napi-rs`

@@ -7,7 +7,7 @@
 
 **Embedded vector store for local-first AI applications.**
 
-vectlite is a single-file vector database written in Rust with language bindings starting with Python. Dense + sparse hybrid search, HNSW indexing, MongoDB-style metadata filters, transactions, crash-safe persistence, and file locking -- all in a portable `.vdb` file. No server, no Docker, no network calls.
+vectlite is a single-file vector database written in Rust with language bindings for Python today and Node from source today. Dense + sparse hybrid search, HNSW indexing, MongoDB-style metadata filters, transactions, crash-safe persistence, and file locking -- all in a portable `.vdb` file. No server, no Docker, no network calls.
 
 ## Install
 
@@ -24,6 +24,18 @@ Install from source:
 ```bash
 pip install git+https://github.com/mcsedition-hub/vectlite.git#subdirectory=bindings/python
 ```
+
+### Node.js
+
+The Node binding is implemented in-repo and currently builds from source:
+
+```bash
+git clone https://github.com/mcsedition-hub/vectlite.git
+cd vectlite/bindings/node
+npm test
+```
+
+This compiles the native addon with `napi-rs` and runs the smoke tests. An npm publication is not live yet.
 
 ### Rust
 
@@ -221,7 +233,7 @@ crates/
   vectlite-cli/     # CLI for smoke testing and file inspection
 bindings/
   python/           # Python package (PyO3 + maturin)
-  node/             # Node binding (planned)
+  node/             # Node binding (napi-rs, source build today)
 scripts/            # Release and CI scripts
 .github/workflows/  # CI: cross-platform wheel builds, tests
 ```
@@ -244,7 +256,7 @@ The snapshot + WAL are the source of truth. ANN sidecars are acceleration artifa
 | Language | Status | Package |
 |----------|--------|---------|
 | Python | Available | [`pip install vectlite`](https://pypi.org/project/vectlite/) |
-| Node | Planned | `bindings/node` with `napi-rs` |
+| Node | Available from source | `bindings/node` with `napi-rs` |
 | Swift | Planned | After FFI layer stabilizes |
 | Kotlin | Planned | After FFI layer stabilizes |
 
