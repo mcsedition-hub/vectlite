@@ -23,6 +23,13 @@ No upload happens unless `UPLOAD=1` is set.
 
 Contributors can use that command to validate the package locally. It is not the preferred production release path.
 
+To validate the prebuilt path locally for the current machine:
+
+```bash
+cd bindings/node
+npm test
+```
+
 ## Preferred Publish Path
 
 Use GitHub Actions trusted publishing for real npm releases when the package has a trusted publisher configured on npmjs.com.
@@ -43,6 +50,13 @@ git push origin vX.Y.Z
 
 You can also trigger the workflow manually from the Actions tab for the current version.
 
+The workflow builds and embeds prebuilt binaries for:
+
+- `darwin-x64`
+- `darwin-arm64`
+- `linux-x64-gnu`
+- `win32-x64-msvc`
+
 ## Fallback Token Publish
 
 If you intentionally need a local token-based fallback:
@@ -61,8 +75,8 @@ UPLOAD=1 bash scripts/publish_npm.sh
 ## Notes
 
 - Preferred release path: GitHub Actions trusted publishing with OIDC.
-- The current npm package is a source-build package.
-- End users need Rust/Cargo installed when they run `npm install vectlite`.
+- The current npm package prefers prebuilt binaries and only falls back to source-build on unsupported targets.
+- End users need Rust/Cargo only when no matching prebuilt is available.
 - Prebuilt binaries are a future step.
 - After trusted publishing is working, restrict or revoke old publish tokens.
 

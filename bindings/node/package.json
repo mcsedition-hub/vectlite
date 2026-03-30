@@ -28,12 +28,13 @@
     "index.d.ts",
     "README.md",
     "scripts",
-    "native"
+    "native",
+    "prebuilds"
   ],
   "scripts": {
     "build": "node ./scripts/build-addon.mjs",
-    "test": "npm run build && node --test tests/smoke.test.cjs",
-    "install": "node ./scripts/build-addon.mjs",
+    "test": "npm run build && node --test tests/smoke.test.cjs && node --test tests/prebuild-loader.test.cjs",
+    "install": "node ./scripts/install-addon.mjs",
     "prepack": "node ./scripts/prepare-package.mjs",
     "postpack": "node ./scripts/clean-package.mjs"
   },

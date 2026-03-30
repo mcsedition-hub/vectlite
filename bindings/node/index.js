@@ -1,6 +1,66 @@
 'use strict'
 
-const native = require('./vectlite.node')
+const fs = require('node:fs')
+const path = require('node:path')
+
+function linuxLibc() {
+  if (process.platform !== 'linux') {
+    return null
+  }
+
+  const report = process.report?.getReport?.()
+  return report?.header?.glibcVersionRuntime ? 'gnu' : 'musl'
+}
+
+function runtimePrebuildTag() {
+  switch (process.platform) {
+    case 'darwin':
+      if (process.arch === 'x64') return 'darwin-x64'
+      if (process.arch === 'arm64') return 'darwin-arm64'
+      return null
+    case 'linux': {
+      const libc = linuxLibc()
+      if (process.arch === 'x64' && libc === 'gnu') return 'linux-x64-gnu'
+      if (process.arch === 'arm64' && libc === 'gnu') return 'linux-arm64-gnu'
+      return null
+    }
+    case 'win32':
+      if (process.arch === 'x64') return 'win32-x64-msvc'
+      if (process.arch === 'arm64') return 'win32-arm64-msvc'
+      return null
+    default:
+      return null
+  }
+}
+
+function loadNative() {
+  const candidates = []
+  const prebuildTag = runtimePrebuildTag()
+  if (prebuildTag != null) {
+    candidates.push(path.join(__dirname, 'prebuilds', prebuildTag, 'vectlite.node'))
+  }
+  candidates.push(path.join(__dirname, 'vectlite.node'))
+
+  const errors = []
+  for (const candidate of candidates) {
+    if (!fs.existsSync(candidate)) {
+      continue
+    }
+    try {
+      return require(candidate)
+    } catch (error) {
+      errors.push(`${candidate}: ${error?.message ?? String(error)}`)
+    }
+  }
+
+  const detail = errors.length === 0 ? 'No compatible prebuilt binary was found.' : errors.join('\n')
+  throw new Error(
+    `Unable to load the vectlite native addon.\n${detail}\n` +
+      'If this platform is not covered by prebuilt binaries, install Rust/Cargo and reinstall the package.',
+  )
+}
+
+const native = loadNative()
 
 const TOKEN_RE = /[a-z0-9]+/g
 

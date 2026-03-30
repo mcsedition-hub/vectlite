@@ -11,6 +11,7 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - Added a contribution guide, project code of conduct, pull request template, issue templates, and maintainer notes for reviewing community PRs.
 - Added an initial Node binding in `bindings/node` with a native `napi-rs` addon, JavaScript wrapper, TypeScript declarations, and smoke tests for CRUD, collections, and text helpers.
 - Added a GitHub Actions workflow for npm trusted publishing, with tag-to-package-version validation and package tarball checks before publish.
+- Added Node prebuilt-binary support for macOS x64/arm64, Linux x64 (glibc), and Windows x64, with a source-build fallback on unsupported targets.
 
 ### Changed
 

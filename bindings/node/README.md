@@ -1,6 +1,6 @@
 # Node Binding
 
-The Node binding is published on npm and builds from source on install.
+The Node binding is published on npm and uses prebuilt binaries on supported platforms.
 
 Current state:
 
@@ -8,7 +8,8 @@ Current state:
 - JavaScript wrapper and TypeScript declarations included
 - local smoke test available in `bindings/node/tests`
 - npm package live as `vectlite`
-- installing the npm package requires a working Rust toolchain on the target machine
+- prebuilt binaries for macOS x64/arm64, Linux x64 (glibc), and Windows x64
+- source-build fallback for other platforms
 
 ## Install
 
@@ -36,13 +37,16 @@ npm test
 
 ## npm Package Model
 
-The npm package is set up as a source-build package:
+The npm package is set up as a hybrid prebuilt + source-build package:
 
 - `prepack` stages a self-contained native crate plus the core Rust crate
-- `install` compiles the addon with Cargo on the target machine
-- the published tarball does not ship prebuilt binaries yet
+- `publish-npm.yml` attaches platform binaries into `prebuilds/`
+- `install` uses a matching prebuilt when available
+- unsupported platforms fall back to compiling the addon with Cargo
 
-That keeps one source of truth for the Rust core, but it means `npm install vectlite` requires:
+For supported prebuilt targets, `npm install vectlite` only needs Node.
+
+For unsupported targets, installation still requires:
 
 - Node 18+
 - Rust/Cargo installed
@@ -78,4 +82,4 @@ The initial Node surface covers the core database and store operations:
 Not yet included:
 
 - JS callback rerank hooks
-- prebuilt binaries
+- prebuilt binaries for Linux arm64 and musl targets

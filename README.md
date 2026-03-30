@@ -27,19 +27,26 @@ pip install git+https://github.com/mcsedition-hub/vectlite.git#subdirectory=bind
 
 ### Node.js
 
-The Node binding is published on npm as a source-build package:
+The Node binding is published on npm with prebuilt binaries for the main desktop/server targets:
 
 ```bash
 npm install vectlite
 ```
 
-Install requires:
+Prebuilt coverage:
+
+- macOS x64
+- macOS arm64
+- Linux x64 (glibc)
+- Windows x64
+
+Fallback source build still requires:
 
 - Node 18+
 - Rust/Cargo on the target machine
 - network access to fetch Rust crates during install
 
-The package compiles the native addon with `napi-rs` during installation. The source remains in this repository under `bindings/node`.
+The package uses a matching prebuilt binary when one is available, and falls back to compiling the native addon with `napi-rs` otherwise. The source remains in this repository under `bindings/node`.
 
 ### Rust
 
