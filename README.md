@@ -251,6 +251,7 @@ The snapshot + WAL are the source of truth. ANN sidecars are acceleration artifa
 ## Contributing
 
 Found a bug or have a feature request? [Open an issue](https://github.com/mcsedition-hub/vectlite/issues).
+Before opening a PR, read [CONTRIBUTING.md](https://github.com/mcsedition-hub/vectlite/blob/main/CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](https://github.com/mcsedition-hub/vectlite/blob/main/CODE_OF_CONDUCT.md).
 
 ### Development Setup
 
@@ -273,6 +274,7 @@ pytest bindings/python/tests/
 - [PyPI Package](https://pypi.org/project/vectlite/)
 - [Changelog](https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md)
 - [Issue Tracker](https://github.com/mcsedition-hub/vectlite/issues)
+- [Contribution Guide](https://github.com/mcsedition-hub/vectlite/blob/main/CONTRIBUTING.md)
 
 ## License
 

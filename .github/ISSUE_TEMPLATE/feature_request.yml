@@ -1,0 +1,49 @@
+name: Feature request
+description: Propose a new feature or API improvement
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For large changes, especially API or storage changes, open the issue before writing code.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem does this solve?
+      placeholder: I want to ...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the API, behavior, or workflow you want.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Python API
+        - Rust core
+        - Retrieval / ranking
+        - Storage format / persistence
+        - Packaging / release
+        - Documentation
+        - Node binding
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility impact
+      description: Could this change break API behavior, file compatibility, or release tooling?
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

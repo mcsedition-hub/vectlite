@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: vectlite Changelog
+    url: https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md
+    about: Check recent shipped changes before opening an issue.
+  - name: vectlite Contribution Guide
+    url: https://github.com/mcsedition-hub/vectlite/blob/main/CONTRIBUTING.md
+    about: Read contribution and PR expectations first.

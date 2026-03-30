@@ -6,7 +6,13 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
-No unreleased changes yet.
+### Added
+
+- Added a contribution guide, project code of conduct, pull request template, issue templates, and maintainer notes for reviewing community PRs.
+
+### Changed
+
+- The repository README now points contributors to the contribution and conduct docs before opening pull requests.
 
 ## [0.1.3] - 2026-03-30
 
