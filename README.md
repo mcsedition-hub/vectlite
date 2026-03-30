@@ -370,6 +370,7 @@ npm test
 
 ## Links
 
+- [Official Documentation](https://vectlite.mcsedition.org/)
 - [PyPI Package](https://pypi.org/project/vectlite/)
 - [npm Package](https://www.npmjs.com/package/vectlite)
 - [Changelog](https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md)

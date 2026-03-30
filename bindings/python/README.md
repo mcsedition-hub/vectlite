@@ -196,6 +196,7 @@ print(outcome["results"][0]["explain"])  # Detailed scoring breakdown
 
 ## Links
 
+- [Official Documentation](https://vectlite.mcsedition.org/)
 - [GitHub Repository](https://github.com/mcsedition-hub/vectlite)
 - [Issue Tracker](https://github.com/mcsedition-hub/vectlite/issues)
 - [Changelog](https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md)

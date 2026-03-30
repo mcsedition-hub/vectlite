@@ -4,7 +4,7 @@
   "description": "Embedded vector store for local-first AI applications.",
   "main": "index.js",
   "types": "index.d.ts",
-  "homepage": "https://github.com/mcsedition-hub/vectlite/tree/main/bindings/node",
+  "homepage": "https://vectlite.mcsedition.org/",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mcsedition-hub/vectlite.git",

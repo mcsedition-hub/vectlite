@@ -18,7 +18,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mcsedition-hub/vectlite"
+Homepage = "https://vectlite.mcsedition.org/"
+Documentation = "https://vectlite.mcsedition.org/"
 Repository = "https://github.com/mcsedition-hub/vectlite"
 Issues = "https://github.com/mcsedition-hub/vectlite/issues"
 Changelog = "https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md"

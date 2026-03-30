@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Node.js bindings for vectlite."
-homepage = "https://github.com/mcsedition-hub/vectlite"
+homepage = "https://vectlite.mcsedition.org/"
 repository = "https://github.com/mcsedition-hub/vectlite"
-documentation = "https://github.com/mcsedition-hub/vectlite/tree/main/bindings/node"
+documentation = "https://vectlite.mcsedition.org/"
 build = "build.rs"
 
 [lib]
