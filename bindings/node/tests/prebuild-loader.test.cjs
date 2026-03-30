@@ -65,6 +65,14 @@ test('prebuilt loader works when the root addon is absent', () => {
     if (fs.existsSync(backupAddon)) {
       fs.renameSync(backupAddon, rootAddon)
     }
-    fs.rmSync(path.join(packageRoot, 'prebuilds'), { recursive: true, force: true })
+    if (fs.existsSync(prebuiltAddon)) {
+      fs.rmSync(prebuiltAddon, { force: true })
+    }
+    try {
+      fs.rmdirSync(prebuildDir)
+    } catch {}
+    try {
+      fs.rmdirSync(path.join(packageRoot, 'prebuilds'))
+    } catch {}
   }
 })

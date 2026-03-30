@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-03-30
+
+### Fixed
+
+- The Node prebuilt-loader smoke test now cleans up safely on Windows, so the cross-platform npm publish workflow can complete instead of failing on `EPERM` during test cleanup.
+
 ## [0.1.5] - 2026-03-30
 
 ### Fixed
