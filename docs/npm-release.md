@@ -33,6 +33,7 @@ npm test
 ## Preferred Publish Path
 
 Use GitHub Actions trusted publishing for real npm releases when the package has a trusted publisher configured on npmjs.com.
+If the repository still has an `NPM_TOKEN` secret, the workflow automatically falls back to token-based publishing.
 
 On npmjs.com, open the `vectlite` package settings and add a trusted publisher with these exact values:
 
@@ -76,6 +77,7 @@ UPLOAD=1 bash scripts/publish_npm.sh
 ## Notes
 
 - Preferred release path: GitHub Actions trusted publishing with OIDC.
+- Current workflow behavior: if `NPM_TOKEN` is present in GitHub Secrets, publish uses that token; otherwise it uses OIDC trusted publishing.
 - The current npm package prefers prebuilt binaries and only falls back to source-build on unsupported targets.
 - End users need Rust/Cargo only when no matching prebuilt is available.
 - Node releases use `node-vX.Y.Z` tags so they do not collide with PyPI releases.

@@ -6,6 +6,10 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Changed
+
+- The npm release workflow now falls back to the repository `NPM_TOKEN` secret when present, while still keeping trusted publishing as the default path when no token is configured.
+
 ## [0.1.8] - 2026-03-30
 
 ### Fixed
