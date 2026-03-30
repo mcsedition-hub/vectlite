@@ -30,6 +30,16 @@ UPLOAD=1 ./scripts/publish_testpypi.sh
 The upload target defaults to `https://test.pypi.org/legacy/`.
 The script uploads with `--skip-existing`, so rerunning the same release does not fail if an artifact is already present.
 
+## GitHub Actions Release
+
+The repository also has a dedicated workflow:
+
+```bash
+gh workflow run "Publish to TestPyPI" --repo mcsedition-hub/vectlite
+```
+
+That workflow builds the sdist and the cross-platform wheel matrix, then publishes to TestPyPI with `secrets.TEST_PYPI_API_TOKEN`.
+
 ## Install From TestPyPI
 
 ```bash
