@@ -42,10 +42,13 @@ python -m pip install -e bindings/python
 python -m pytest bindings/python/tests -q
 ```
 
-If you are working on packaging locally, you can validate that the package still builds:
+If you are working on packaging locally, you can validate that the package still builds without publishing anything:
 
 ```bash
+# Local validation only. Do not set UPLOAD=1.
 bash scripts/publish_testpypi.sh
+
+# Local validation only. Do not set UPLOAD=1.
 bash scripts/publish_pypi.sh
 ```
 

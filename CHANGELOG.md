@@ -14,6 +14,7 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 - The repository README now points contributors to the contribution and conduct docs before opening pull requests.
 - Contribution and release docs now distinguish local packaging validation from maintainer-only publishing steps, so public contributors are not told to upload releases.
+- Local packaging commands in the docs are now explicitly labeled as no-upload validation steps.
 
 ## [0.1.3] - 2026-03-30
 

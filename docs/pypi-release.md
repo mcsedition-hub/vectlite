@@ -13,6 +13,7 @@ This is a maintainer-only workflow. Contributors should use the build-only path 
 ## Build Only
 
 ```bash
+# Local packaging validation only. No upload happens here.
 ./scripts/publish_pypi.sh
 ```
 
