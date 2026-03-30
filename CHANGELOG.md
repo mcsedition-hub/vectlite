@@ -6,9 +6,15 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+No unreleased changes yet.
+
+## [0.1.3] - 2026-03-30
+
 ### Changed
 
 - GitHub Actions workflows now use Node 24 native action versions for checkout, Python setup, and artifact upload/download, instead of forcing Node 24 through a workflow environment flag.
+- The GitHub repository README now leads with a fuller product overview, install guidance, quick start, and feature map.
+- The Python package README now reflects the broader surface area of the published package, including collections, snapshots, analyzers, rerankers, and diagnostics.
 
 ## [0.1.2] - 2026-03-30
 

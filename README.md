@@ -1,154 +1,205 @@
 # vectlite
 
-`vectlite` is an embedded vector store for local-first applications. The repository is structured around a reusable Rust core, with the first real binding now targeting Python.
+[![PyPI version](https://img.shields.io/pypi/v/vectlite.svg)](https://pypi.org/project/vectlite/)
+[![Python versions](https://img.shields.io/pypi/pyversions/vectlite.svg)](https://pypi.org/project/vectlite/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/Rust-core-orange.svg)](https://www.rust-lang.org/)
 
-## What You Can Use Today
+**Embedded vector store for local-first AI applications.**
 
-`vectlite` is a monorepo:
-
-- this repository is the source of truth for the Rust core and every language binding
-- Python is the first real package surface
-- Node, framework bindings, Swift, and Kotlin will also live here as separate packages
-
-Current status:
-
-- Python: available in this repo now
-- Node: planned in `bindings/node`
-- Swift/Kotlin: planned after the FFI layer stabilizes
+vectlite is a single-file vector database written in Rust with language bindings starting with Python. Dense + sparse hybrid search, HNSW indexing, MongoDB-style metadata filters, transactions, crash-safe persistence, and file locking -- all in a portable `.vdb` file. No server, no Docker, no network calls.
 
 ## Install
 
 ### Python
 
-The Python package is now published on PyPI:
-
 ```bash
 pip install vectlite
 ```
 
-You can also install directly from source:
+Pre-built wheels for macOS (x86_64, arm64), Linux (x86_64, aarch64), and Windows (x86_64). Requires Python 3.9+.
+
+Install from source:
 
 ```bash
 pip install git+https://github.com/mcsedition-hub/vectlite.git#subdirectory=bindings/python
 ```
 
-For local development from a clone of this repository:
+### Rust
 
-```bash
-pip install -e bindings/python
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+vectlite = { path = "crates/vectlite-core" }
 ```
 
-If you only want the Python package details, see `bindings/python/README.md`.
-For release history, see [`CHANGELOG.md`](https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md).
-
-### Node
-
-The Node package is not published yet. It will be shipped from this same repository once the Python surface is considered stable.
-
-This first cut optimizes for portability and simplicity:
-
-- embedded storage rooted at a single `.vdb` path
-- reusable Rust core, no background service
-- CRUD for vectors and metadata
-- dense+sparse retrieval with metadata filtering
-- deterministic binary persistence format
-
-The storage/API boundary is intentionally small so the on-disk format and the search engine can keep evolving without breaking the developer-facing model.
-
-Dense ANN now uses persisted HNSW sidecars, writes flow through a crash-safe WAL before compaction into the snapshot, sparse retrieval uses an inverted index with BM25 scoring, and Python can opt into named-vector search, RRF fusion, MMR diversification, transactions, rerank hooks, built-in rerankers, and search diagnostics.
-
-## Repository Layout
-
-- `crates/vectlite-core`: storage engine and public data model
-- `crates/vectlite-cli`: local CLI for smoke testing and file inspection
-- `bindings/python`: Python package and `PyO3` extension
-- `bindings/node`: second packaging target
-- `docs/language-rollout.md`: rollout and binding strategy
-
-## Python API
+## Quick Start (Python)
 
 ```python
 import vectlite
 
 db = vectlite.open("knowledge.vdb", dimension=384)
-with db.transaction() as tx:
-    tx.upsert(
-        "doc1",
-        [0.9, 0.1, 0.0],
-        {"source": "blog", "priority": 10, "title": "Auth Flow"},
-        namespace="docs",
-        sparse={"auth": 1.0},
-        vectors={"title": [1.0, 0.0, 0.0], "body": [0.0, 1.0, 0.0]},
-    )
-    tx.upsert_many(
-        [
-            {
-                "id": "doc2",
-                "vector": [0.8, 0.2, 0.0],
-                "sparse": {"shipping": 1.0},
-                "metadata": {"source": "notes", "text": "shipping notes"},
-            }
-        ],
-        namespace="notes",
-    )
 
-results = db.search(
-    [1.0, 0.0, 0.0],
-    k=3,
-    filter={"source": {"$ne": "notes"}, "priority": {"$gte": 5}},
-    all_namespaces=True,
-    sparse={"auth": 1.0},
-    vector_name="title",
-    fusion="rrf",
-    rrf_k=30,
-    fetch_k=12,
-    mmr_lambda=0.3,
-    explain=True,
-    rerank=vectlite.rerankers.text_match(),
-)
+db.upsert("doc1", embedding, {"source": "blog", "title": "Auth Guide"})
+db.upsert("doc2", embedding2, {"source": "notes", "title": "Billing"})
 
-debug = db.search_with_stats(
-    [1.0, 0.0, 0.0],
-    k=3,
-    sparse={"auth": 1.0},
-    fusion="rrf",
-    fetch_k=12,
-    mmr_lambda=0.3,
-)
-
+results = db.search(query_embedding, k=5, filter={"source": "blog"})
 db.compact()
 ```
 
-Packaging and local dev details live in `bindings/python/README.md`.
-The TestPyPI release flow lives in `docs/testpypi-release.md`.
-The PyPI release flow lives in `docs/pypi-release.md`.
-The release history lives in [`CHANGELOG.md`](https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md).
+## Features
+
+### Storage & Durability
+
+- **Single-file database** -- one `.vdb` file, portable and easy to back up
+- **Crash-safe WAL** -- writes land in a write-ahead log, then checkpoint with `compact()`
+- **Transactions** -- atomic batched writes with rollback on exception
+- **File locking** -- advisory locks prevent corruption from concurrent access
+- **Read-only mode** -- shared locks for safe concurrent readers
+- **Snapshots** -- `db.snapshot(path)` creates a self-contained copy at any time
+- **Backup / Restore** -- full backup with ANN sidecars and restore to a new path
+- **Physical collections** -- `open_store()` manages a directory of independent databases
+- **Bulk ingestion** -- `bulk_ingest()` with deferred index rebuilds for fast imports
+
+### Search & Retrieval
+
+- **Dense vectors** -- cosine similarity with automatic HNSW indexing
+- **Sparse vectors** -- BM25-scored inverted index for keyword retrieval
+- **Hybrid search** -- dense + sparse fusion via linear combination or reciprocal rank fusion (RRF)
+- **Named vectors** -- multiple vector spaces per record (`"title"`, `"body"`, ...)
+- **Multi-vector queries** -- weighted search across vector spaces in a single call
+- **MMR diversification** -- tunable relevance vs. diversity trade-off
+- **Namespaces** -- logical isolation with per-namespace or cross-namespace search
+
+### Metadata & Filters
+
+- **Rich types** -- `str`, `int`, `float`, `bool`, `None`, `list`, `dict`
+- **MongoDB-style operators** -- `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$contains`, `$exists`
+- **Logical combinators** -- `$and`, `$or`, `$not`
+- **Nested access** -- dot-path traversal (`author.name`), `$elemMatch`, `$size`
+
+### Reranking & Observability
+
+- **Built-in rerankers** -- `text_match()`, `metadata_boost()`, `cross_encoder()`, `bi_encoder()`
+- **Composable** -- chain rerankers sequentially or with RRF via `compose()`
+- **Search diagnostics** -- `search_with_stats()` returns timings, BM25 term scores, ANN stats
+- **Explain mode** -- per-result scoring breakdown with ranks, matched terms, and rerank traces
+
+### Text Processing
+
+- **Text helpers** -- `upsert_text()` and `search_text()` handle embedding + sparse terms
+- **Analyzers** -- configurable tokenizer pipeline with stopwords (en/fr), stemming (Snowball), n-grams, custom filters
+- **Weighted fields** -- `sparse_terms_weighted()` for per-field term boosting
+
+## Python API
+
+### Hybrid Search with Reranking
+
+```python
+import vectlite
+
+db = vectlite.open("knowledge.vdb", dimension=384)
+
+db.upsert(
+    "doc1",
+    dense_embedding,
+    {"source": "docs", "title": "Auth Setup", "text": "How to configure SSO..."},
+    sparse=vectlite.sparse_terms("How to configure SSO authentication"),
+    vectors={"title": title_embedding, "body": body_embedding},
+)
+
+results = db.search(
+    query_embedding,
+    k=10,
+    sparse=vectlite.sparse_terms("SSO authentication"),
+    fusion="rrf",
+    filter={"source": "docs", "author.level": {"$gte": 3}},
+    explain=True,
+    rerank=vectlite.rerankers.compose(
+        vectlite.rerankers.text_match(),
+        vectlite.rerankers.metadata_boost("source", {"docs": 0.5}),
+    ),
+)
+```
+
+### Collections
+
+```python
+store = vectlite.open_store("./my_collections")
+products = store.create_collection("products", dimension=384)
+products.upsert("p1", embedding, {"name": "Widget", "price": 9.99})
+
+logs = store.open_or_create_collection("logs", dimension=128)
+print(store.collections())  # ["logs", "products"]
+```
+
+### Transactions
+
+```python
+with db.transaction() as tx:
+    tx.upsert("doc1", emb1, {"source": "a"})
+    tx.upsert("doc2", emb2, {"source": "b"})
+    tx.delete("old_doc")
+# Commits atomically; rolls back on exception
+```
+
+### Snapshots & Backup
+
+```python
+db.snapshot("/backups/knowledge_2024.vdb")
+db.backup("/backups/full/")
+restored = vectlite.restore("/backups/full/", "restored.vdb")
+```
+
+### Read-Only Mode
+
+```python
+ro = vectlite.open("knowledge.vdb", read_only=True)
+results = ro.search(query, k=5)  # Reads work
+ro.upsert(...)                    # Raises VectLiteError
+```
+
+### Analyzers
+
+```python
+analyzer = vectlite.analyzers.Analyzer().lowercase().stopwords("en").stemmer("english")
+terms = analyzer.sparse_terms("How to authenticate users with SSO")
+```
+
+### Search Diagnostics
+
+```python
+outcome = db.search_with_stats(query, k=5, sparse=terms, explain=True)
+print(outcome["stats"]["timings"])       # {"dense_us": 120, "sparse_us": 45, ...}
+print(outcome["results"][0]["explain"])  # Detailed scoring breakdown
+```
 
 ## Rust API
 
 ```rust
-use vectlite::{Database, Metadata, MetadataFilter, MetadataValue, SearchOptions};
+use vectlite::Database;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut db = Database::open_or_create("knowledge.vdb", 3)?;
+fn main() -> vectlite::Result<()> {
+    let mut db = Database::open_or_create("knowledge.vdb", 384)?;
 
-    let mut metadata = Metadata::new();
-    metadata.insert("source".into(), MetadataValue::from("blog"));
-    metadata.insert("title".into(), MetadataValue::from("auth flow"));
+    let mut metadata = vectlite::Metadata::new();
+    metadata.insert("source".into(), "blog".into());
 
     db.upsert("doc1", vec![0.9, 0.1, 0.0], metadata)?;
 
     let results = db.search(
         &[1.0, 0.0, 0.0],
-        SearchOptions {
-            top_k: 3,
-            filter: Some(MetadataFilter::contains("title", "auth")),
-        },
+        vectlite::SearchOptions { top_k: 5, filter: None },
     )?;
 
-    for result in results {
-        println!("{} -> {}", result.id, result.score);
+    for r in results {
+        println!("{} -> {:.3}", r.id, r.score);
     }
+
+    // Snapshots and backup work from Rust too
+    db.snapshot("backup.vdb")?;
+    db.compact()?;
 
     Ok(())
 }
@@ -159,23 +210,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```bash
 cargo run -p vectlite-cli -- init demo.vdb 3
 cargo run -p vectlite-cli -- insert demo.vdb doc1 0.9,0.1,0.0 source=blog,title=auth
-cargo run -p vectlite-cli -- insert demo.vdb doc2 0.0,1.0,0.0 source=notes,title=shipping
 cargo run -p vectlite-cli -- search demo.vdb 1.0,0.0,0.0 5 title~auth
 ```
 
-## Current Format
+## Repository Layout
 
-Each database now consists of:
+```
+crates/
+  vectlite-core/    # Rust storage engine (the reusable core)
+  vectlite-cli/     # CLI for smoke testing and file inspection
+bindings/
+  python/           # Python package (PyO3 + maturin)
+  node/             # Node binding (planned)
+scripts/            # Release and CI scripts
+.github/workflows/  # CI: cross-platform wheel builds, tests
+```
 
-- a `.vdb` snapshot with a fixed magic header, version, vector dimension, and records
-- a `.wal` write-ahead log for crash-safe write recovery
-- `.ann` / `.hnsw.*` sidecars for persisted dense ANN indexes
+## Storage Format
 
-The snapshot plus WAL are the source of truth. ANN sidecars are acceleration artifacts that can be regenerated. Small collections still fall back to exact dense search.
+Each database consists of:
 
-## Delivery Order
+| File | Purpose |
+|------|---------|
+| `*.vdb` | Binary snapshot: magic header, version, dimension, records |
+| `*.vdb.wal` | Write-ahead log for crash-safe recovery |
+| `*.vdb.ann.*` | HNSW sidecar files (acceleration artifacts, regenerated if missing) |
+| `*.vdb.lock` | Advisory lock file for concurrency control |
 
-1. Python binding with `PyO3` and `maturin`
-2. Node binding with `napi-rs`
-3. Framework bindings on top of a stable FFI layer
-4. Thin Swift and Kotlin wrappers for mobile-native packaging
+The snapshot + WAL are the source of truth. ANN sidecars are acceleration artifacts. Small collections (<128 records) use exact dense search.
+
+## Language Roadmap
+
+| Language | Status | Package |
+|----------|--------|---------|
+| Python | Available | [`pip install vectlite`](https://pypi.org/project/vectlite/) |
+| Node | Planned | `bindings/node` with `napi-rs` |
+| Swift | Planned | After FFI layer stabilizes |
+| Kotlin | Planned | After FFI layer stabilizes |
+
+## Contributing
+
+Found a bug or have a feature request? [Open an issue](https://github.com/mcsedition-hub/vectlite/issues).
+
+### Development Setup
+
+```bash
+git clone https://github.com/mcsedition-hub/vectlite.git
+cd vectlite
+
+# Rust tests
+cargo test
+
+# Python development
+python -m venv .venv && source .venv/bin/activate
+pip install maturin pytest
+maturin develop -m bindings/python/Cargo.toml
+pytest bindings/python/tests/
+```
+
+## Links
+
+- [PyPI Package](https://pypi.org/project/vectlite/)
+- [Changelog](https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md)
+- [Issue Tracker](https://github.com/mcsedition-hub/vectlite/issues)
+
+## License
+
+MIT

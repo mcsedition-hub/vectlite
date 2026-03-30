@@ -1,203 +1,205 @@
-# Python Binding
+# vectlite
 
-The first language target now has a concrete package layout:
+[![PyPI version](https://img.shields.io/pypi/v/vectlite.svg)](https://pypi.org/project/vectlite/)
+[![Python versions](https://img.shields.io/pypi/pyversions/vectlite.svg)](https://pypi.org/project/vectlite/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-- Rust extension crate in `bindings/python/src/lib.rs`
-- Python package in `bindings/python/vectlite`
-- packaging via `maturin`
+**Embedded vector store for local-first AI applications.**
 
-## Local Development
+vectlite is a single-file, zero-dependency vector database written in Rust with Python bindings. It gives you dense + sparse hybrid search, HNSW indexing, metadata filtering, transactions, and crash-safe persistence in a single `.vdb` file -- no server, no Docker, no network calls.
 
-```bash
-cd bindings/python
-maturin develop
-pytest
-```
-
-## Install From PyPI
+## Installation
 
 ```bash
 pip install vectlite
 ```
 
-Release history lives in [`CHANGELOG.md`](https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md).
+Requires Python 3.9+. Pre-built wheels are available for macOS (x86_64, arm64), Linux (x86_64, aarch64), and Windows (x86_64).
 
-## TestPyPI Release
+## Quick Start
 
-From the repo root:
+```python
+import vectlite
 
-```bash
-./scripts/publish_testpypi.sh
+# Create or open a database
+db = vectlite.open("knowledge.vdb", dimension=384)
+
+# Insert records with vectors, metadata, and sparse terms
+db.upsert("doc1", embedding, {"source": "blog", "title": "Auth Guide"})
+db.upsert("doc2", embedding2, {"source": "notes", "title": "Billing"})
+
+# Search with filters
+results = db.search(embedding_query, k=5, filter={"source": "blog"})
+
+# Clean up
+db.compact()
 ```
 
-Then upload with a TestPyPI token:
+## Features
 
-```bash
-export TEST_PYPI_API_TOKEN="pypi-..."
-UPLOAD=1 ./scripts/publish_testpypi.sh
-```
+### Core
 
-The full flow is documented in `docs/testpypi-release.md` in the repository.
+- **Single-file storage** -- one `.vdb` file per database, portable and easy to back up
+- **Dense vectors** -- cosine similarity with automatic HNSW indexing for large collections
+- **Sparse vectors** -- BM25-scored inverted index for keyword retrieval
+- **Hybrid search** -- dense + sparse fusion with linear or RRF strategies
+- **Rich metadata** -- `str`, `int`, `float`, `bool`, `None`, `list`, `dict` values
+- **Crash-safe WAL** -- writes land in a write-ahead log first, then checkpoint with `compact()`
+- **Transactions** -- atomic batched writes with `db.transaction()`
+- **File locking** -- advisory locks prevent corruption from concurrent access
 
-## PyPI Release
+### Search & Retrieval
 
-From the repo root:
+- **Metadata filters** -- MongoDB-style operators: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$contains`, `$exists`, `$and`, `$or`, `$not`
+- **Nested filters** -- dot-path traversal (`author.name`), `$elemMatch`, `$size` on lists and dicts
+- **Named vectors** -- multiple vector spaces per record (`vectors={"title": [...], "body": [...]}`)
+- **Multi-vector queries** -- weighted search across vector spaces in a single call
+- **MMR diversification** -- `mmr_lambda` controls relevance vs. diversity trade-off
+- **Namespaces** -- logical isolation with per-namespace or cross-namespace search
+- **Rerankers** -- built-in `text_match()`, `metadata_boost()`, `cross_encoder()`, `bi_encoder()`, composable with `compose()`
+- **Observability** -- `search_with_stats()` returns timings, BM25 term scores, ANN stats, and per-result `explain` payloads
 
-```bash
-./scripts/publish_pypi.sh
-```
+### Data Management
 
-Then upload with a PyPI token:
+- **Physical collections** -- `vectlite.open_store()` manages a directory of independent databases
+- **Bulk ingestion** -- `bulk_ingest()` with deferred index rebuilds for fast imports
+- **Snapshots** -- `db.snapshot(path)` creates a self-contained copy
+- **Backup / Restore** -- `db.backup(dir)` and `vectlite.restore(dir, path)` for full roundtrips
+- **Read-only mode** -- `vectlite.open(path, read_only=True)` for safe concurrent readers
+- **Text analyzers** -- configurable tokenizer pipeline with stopwords, stemming, and n-grams
 
-```bash
-export PYPI_API_TOKEN="pypi-..."
-UPLOAD=1 ./scripts/publish_pypi.sh
-```
+## Usage
 
-The full flow is documented in `docs/pypi-release.md` in the repository.
-
-## API
+### Hybrid Search with Reranking
 
 ```python
 import vectlite
 
 db = vectlite.open("knowledge.vdb", dimension=384)
-with db.transaction() as tx:
-    tx.upsert(
-        "doc1",
-        embedding,
-        {"source": "notes", "priority": 10, "title": "Auth setup"},
-        namespace="notes",
-        sparse={"auth": 1.0, "sso": 0.5},
-        vectors={"title": title_embedding, "body": body_embedding},
-    )
-    tx.upsert_many(
-        [
-            {
-                "id": "doc2",
-                "vector": other_embedding,
-                "sparse": {"auth": 0.7},
-                "metadata": {"source": "notes", "text": "billing and auth notes"},
-            }
-        ],
-        namespace="notes",
-    )
 
-record = db.get("doc1")
+# Upsert with dense + sparse vectors
+db.upsert(
+    "doc1",
+    dense_embedding,
+    {"source": "docs", "title": "Auth Setup", "text": "How to configure SSO..."},
+    sparse=vectlite.sparse_terms("How to configure SSO authentication"),
+)
+
+# Hybrid search with reranking
 results = db.search(
-    query,
-    k=5,
-    filter={"source": {"$ne": "blog"}, "priority": {"$gte": 5, "$lte": 20}},
-    namespace="notes",
-    sparse={"auth": 1.0},
-    vector_name="title",
-    dense_weight=1.0,
-    sparse_weight=1.0,
+    query_embedding,
+    k=10,
+    sparse=vectlite.sparse_terms("SSO authentication"),
     fusion="rrf",
-    rrf_k=30,
-    fetch_k=20,
-    mmr_lambda=0.3,
+    filter={"source": "docs"},
     explain=True,
     rerank=vectlite.rerankers.compose(
         vectlite.rerankers.text_match(),
-        vectlite.rerankers.metadata_boost("source", {"notes": 0.2}),
+        vectlite.rerankers.metadata_boost("source", {"docs": 0.5}),
     ),
 )
 
-debug = db.search_with_stats(
-    query,
-    k=5,
-    namespace="notes",
-    sparse={"auth": 1.0},
-    vector_name="title",
-    fusion="rrf",
-    fetch_k=20,
-    mmr_lambda=0.3,
-)
-
-db.compact()
-print(db.wal_path)
+for result in results:
+    print(result["id"], result["score"])
 ```
 
-Supported metadata/filter value types are:
+### Collections
 
-- `str`
-- `int`
-- `float`
-- `bool`
-- `None`
-- `list`
-- `dict`
+```python
+store = vectlite.open_store("./my_collections")
+products = store.create_collection("products", dimension=384)
+products.upsert("p1", embedding, {"name": "Widget", "price": 9.99})
 
-Supported filter operators in the MVP are:
+logs = store.open_or_create_collection("logs", dimension=128)
+print(store.collections())  # ["logs", "products"]
+```
 
-- equality with `{"field": "value"}`
-- `{"field": {"$eq": "value"}}`
-- `{"field": {"$contains": "auth"}}`
-- `{"field": {"$gt": 5}}`
-- `{"field": {"$gte": 5}}`
-- `{"field": {"$lt": 20}}`
-- `{"field": {"$lte": 20}}`
-- `{"field": {"$ne": "value"}}`
-- `{"field": {"$in": ["a", "b"]}}`
-- `{"field": {"$nin": ["a", "b"]}}`
-- `{"field": {"$exists": True}}`
-- `{"$and": [...]}`
-- `{"$or": [...]}`
-- `{"$not": {...}}`
+### Transactions
 
-Batch helpers available on `Database`:
+```python
+with db.transaction() as tx:
+    tx.upsert("doc1", emb1, {"source": "a"})
+    tx.upsert("doc2", emb2, {"source": "b"})
+    tx.delete("old_doc")
+# All operations commit atomically or roll back on exception
+```
 
-- `insert_many(records)`
-- `upsert_many(records)`
-- `delete_many(ids)`
+### Text Helpers
 
-Durability helpers available on `Database`:
+```python
+# Handles embedding + sparse term generation for you
+vectlite.upsert_text(db, "doc1", "Auth setup guide", embed_fn, {"source": "docs"})
+results = vectlite.search_text(db, "how to authenticate", embed_fn, k=5)
+```
 
-- `transaction()` for atomic batched writes
-- `wal_path` to inspect the write-ahead log path
-- `compact()` / `flush()` to checkpoint the snapshot and clear the WAL
+### Analyzers
 
-Dense vector helpers available on `Database`:
+```python
+analyzer = vectlite.analyzers.Analyzer().lowercase().stopwords("en").stemmer("english")
+terms = analyzer.sparse_terms("How to authenticate users with SSO")
+# Use with upsert: db.upsert("doc1", emb, meta, sparse=terms)
+```
 
-- `upsert(..., vectors={"title": [...], "body": [...]})`
-- `search(..., vector_name="title")`
-- `get(id)["vectors"]`
+### Snapshots & Backup
 
-Namespace helpers available on `Database`:
+```python
+db.snapshot("/backups/knowledge_2024.vdb")  # Self-contained copy
+db.backup("/backups/full/")                 # Full backup with ANN sidecars
 
-- every CRUD/search method accepts `namespace=...`
-- `search(..., all_namespaces=True)`
-- `namespaces()`
+restored = vectlite.restore("/backups/full/", "restored.vdb")
+```
 
-Text helpers available at package level:
+### Read-Only Mode
 
-- `vectlite.upsert_text(db, id, text, embed, ...)`
-- `vectlite.search_text(db, query, embed, ...)`
-- `vectlite.search_text_with_stats(db, query, embed, ...)`
-- `vectlite.sparse_terms(text)`
+```python
+ro = vectlite.open("knowledge.vdb", read_only=True)
+results = ro.search(query, k=5)  # Reads work
+ro.upsert(...)                    # Raises VectLiteError
+```
 
-## Retrieval Quality
+### Search Diagnostics
 
-- sparse retrieval uses a real inverted index with BM25-style scoring
-- `fetch_k` controls how many candidates are gathered before truncation
-- `mmr_lambda` enables MMR diversification for dense, sparse, or hybrid search
-- `fusion="linear"` and `fusion="rrf"` control dense+sparse score fusion
-- `rerank(query, results)` can reorder the top candidates from Python
-- `rerank_k` limits how many initial candidates are sent into the rerank hook
-- `vectlite.rerankers.text_match()` boosts metadata text/title overlap
-- `vectlite.rerankers.metadata_boost(field, boosts)` boosts metadata values
-- `vectlite.rerankers.compose(...)` chains rerankers sequentially or with RRF
-- `db.search_with_stats(...)` returns both results and search diagnostics
-- `explain=True` adds per-result debug payloads with ranks, matched terms, and rerank traces
-- lower `mmr_lambda` favors diversity more aggressively; higher values stay closer to raw relevance
+```python
+outcome = db.search_with_stats(query, k=5, sparse=terms, explain=True)
 
-## ANN Behavior
+print(outcome["stats"]["timings"])       # {"dense_us": 120, "sparse_us": 45, ...}
+print(outcome["stats"]["used_ann"])      # True
+print(outcome["results"][0]["explain"])  # Detailed scoring breakdown
+```
 
-- dense and hybrid search use HNSW indexes when enough points are present
-- named vector spaces get their own dense ANN indexes
-- ANN sidecars are persisted on disk and reloaded on open when the manifest still matches the record set
-- sparse-only search remains exact but uses the inverted index instead of a full scan
-- small collections stay on exact dense search to avoid ANN overhead and low-cardinality edge cases
-- writes land in a crash-safe WAL first, then `compact()` checkpoints back into the `.vdb` snapshot
-- the `.vdb` snapshot plus `.wal` are the source of truth; ANN sidecars are acceleration artifacts
+## Filter Operators
+
+| Operator | Example | Description |
+|----------|---------|-------------|
+| `$eq` | `{"field": {"$eq": "value"}}` | Equal (also `{"field": "value"}`) |
+| `$ne` | `{"field": {"$ne": "value"}}` | Not equal |
+| `$gt` / `$gte` | `{"field": {"$gt": 5}}` | Greater than (or equal) |
+| `$lt` / `$lte` | `{"field": {"$lt": 20}}` | Less than (or equal) |
+| `$in` / `$nin` | `{"field": {"$in": ["a", "b"]}}` | In / not in set |
+| `$contains` | `{"field": {"$contains": "auth"}}` | Substring match |
+| `$exists` | `{"field": {"$exists": True}}` | Field presence |
+| `$and` / `$or` | `{"$and": [{...}, {...}]}` | Logical combinators |
+| `$not` | `{"$not": {...}}` | Logical negation |
+| `$elemMatch` | `{"tags": {"$elemMatch": {"$eq": "rust"}}}` | Match list elements |
+| `$size` | `{"tags": {"$size": 3}}` | List length |
+| dot-path | `{"author.name": "Alice"}` | Nested field access |
+
+## How It Works
+
+- Records are stored in a compact binary `.vdb` snapshot file
+- Writes go through a crash-safe WAL (`.wal`) before being applied in memory
+- `compact()` folds the WAL into the snapshot and persists HNSW sidecar files
+- Dense search uses HNSW indexes (auto-built for collections above ~128 records)
+- Sparse search uses an inverted index with BM25 scoring
+- Hybrid fusion combines dense + sparse via linear combination or reciprocal rank fusion
+- Advisory file locks (`flock`) prevent concurrent write corruption
+
+## Links
+
+- [GitHub Repository](https://github.com/mcsedition-hub/vectlite)
+- [Issue Tracker](https://github.com/mcsedition-hub/vectlite/issues)
+- [Changelog](https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md)
+
+## License
+
+MIT

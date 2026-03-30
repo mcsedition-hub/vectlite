@@ -844,14 +844,14 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "vectlite-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "vectlite-core",
 ]
 
 [[package]]
 name = "vectlite-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "fs2",
  "hnsw_rs",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "vectlite-python"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "pyo3",
  "vectlite-core",
