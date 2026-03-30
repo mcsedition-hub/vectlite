@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-03-30
+
+### Fixed
+
+- Node `0.1.8` keeps the staged Windows prebuilt in place during the prebuilt-loader smoke test, avoiding an `EPERM` cleanup failure on GitHub Actions and allowing npm publication to complete.
+
 ## [0.1.7] - 2026-03-30
 
 ### Fixed

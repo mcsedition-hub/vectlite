@@ -65,7 +65,10 @@ test('prebuilt loader works when the root addon is absent', () => {
     if (fs.existsSync(backupAddon)) {
       fs.renameSync(backupAddon, rootAddon)
     }
-    if (fs.existsSync(prebuiltAddon)) {
+
+    // Windows keeps the loaded .node binary locked for the lifetime of the
+    // process, so cleanup must leave the staged prebuilt in place.
+    if (process.platform !== 'win32' && fs.existsSync(prebuiltAddon)) {
       fs.rmSync(prebuiltAddon, { force: true })
     }
     try {
