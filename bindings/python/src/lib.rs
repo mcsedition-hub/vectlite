@@ -48,7 +48,10 @@ impl PyStore {
     }
 
     fn create_collection(&self, name: &str, dimension: usize) -> PyResult<PyDatabase> {
-        let database = self.inner.create_collection(name, dimension).map_err(to_py_error)?;
+        let database = self
+            .inner
+            .create_collection(name, dimension)
+            .map_err(to_py_error)?;
         Ok(PyDatabase {
             inner: Arc::new(RwLock::new(database)),
         })
@@ -73,7 +76,10 @@ impl PyStore {
     }
 
     fn open_collection_read_only(&self, name: &str) -> PyResult<PyDatabase> {
-        let database = self.inner.open_collection_read_only(name).map_err(to_py_error)?;
+        let database = self
+            .inner
+            .open_collection_read_only(name)
+            .map_err(to_py_error)?;
         Ok(PyDatabase {
             inner: Arc::new(RwLock::new(database)),
         })
@@ -217,7 +223,9 @@ impl PyDatabase {
     ) -> PyResult<usize> {
         let records = parse_record_batch(py, records, namespace.as_deref())?;
         let mut database = self.write()?;
-        database.bulk_ingest(records, batch_size).map_err(to_py_error)
+        database
+            .bulk_ingest(records, batch_size)
+            .map_err(to_py_error)
     }
 
     #[pyo3(signature = (id, namespace=None))]
@@ -404,16 +412,15 @@ impl PyDatabase {
             multi,
         )?;
 
-        let (results, rerank_applied, rerank_count) =
-            render_search_result_items(
-                py,
-                &outcome.results,
-                query_payload,
-                rerank.as_ref(),
-                rerank_k,
-                explain,
-                fusion,
-            )?;
+        let (results, rerank_applied, rerank_count) = render_search_result_items(
+            py,
+            &outcome.results,
+            query_payload,
+            rerank.as_ref(),
+            rerank_k,
+            explain,
+            fusion,
+        )?;
         let response = search_outcome_to_pydict(py, &outcome, results)?;
         let stats = response
             .get_item("stats")?
@@ -651,7 +658,11 @@ impl PyDatabase {
             .map(|filter| parse_filter_dict(filter.bind(py)))
             .transpose()?;
         let sparse = parse_sparse_dict(sparse.as_ref().map(|dict| dict.bind(py)))?;
-        let sparse_ref = if sparse.is_empty() { None } else { Some(&sparse) };
+        let sparse_ref = if sparse.is_empty() {
+            None
+        } else {
+            Some(&sparse)
+        };
         let options = HybridSearchOptions {
             top_k: k,
             filter,
@@ -693,7 +704,9 @@ fn open_database(path: String, dimension: Option<usize>, read_only: bool) -> PyR
         CoreDatabase::open_read_only(&path).map_err(to_py_error)?
     } else if Path::new(&path).exists() {
         match dimension {
-            Some(dimension) => CoreDatabase::open_or_create(&path, dimension).map_err(to_py_error)?,
+            Some(dimension) => {
+                CoreDatabase::open_or_create(&path, dimension).map_err(to_py_error)?
+            }
             None => CoreDatabase::open(&path).map_err(to_py_error)?,
         }
     } else {
@@ -769,7 +782,9 @@ fn parse_named_vectors_dict(dict: Option<&Bound<'_, PyDict>>) -> PyResult<NamedV
     for (key, value) in dict.iter() {
         let key = key.extract::<String>()?;
         if key.is_empty() {
-            return Err(PyValueError::new_err("named vectors must not use an empty name"));
+            return Err(PyValueError::new_err(
+                "named vectors must not use an empty name",
+            ));
         }
         let value = value.extract::<Vec<f32>>()?;
         vectors.insert(key, value);
@@ -815,8 +830,13 @@ fn parse_field_filter(key: &str, value: &Bound<'_, PyAny>) -> PyResult<MetadataF
             match operator.as_str() {
                 "$eq" => filters.push(MetadataFilter::eq(key, py_to_metadata_value(&operand)?)),
                 "$ne" => filters.push(MetadataFilter::ne(key, py_to_metadata_value(&operand)?)),
-                "$in" => filters.push(MetadataFilter::r#in(key, extract_metadata_values(&operand)?)),
-                "$nin" => filters.push(MetadataFilter::nin(key, extract_metadata_values(&operand)?)),
+                "$in" => filters.push(MetadataFilter::r#in(
+                    key,
+                    extract_metadata_values(&operand)?,
+                )),
+                "$nin" => {
+                    filters.push(MetadataFilter::nin(key, extract_metadata_values(&operand)?))
+                }
                 "$not" => filters.push(MetadataFilter::not(parse_field_filter(key, &operand)?)),
                 "$contains" => {
                     filters.push(MetadataFilter::contains(key, operand.extract::<String>()?))
@@ -857,7 +877,7 @@ fn parse_field_filter(key: &str, value: &Bound<'_, PyAny>) -> PyResult<MetadataF
                 other => {
                     return Err(PyValueError::new_err(format!(
                         "unsupported filter operator: {other}"
-                    )))
+                    )));
                 }
             }
         }
@@ -963,7 +983,8 @@ fn parse_record_batch(
 
     for record in records {
         let record = record.bind(py);
-        let namespace = parse_optional_namespace_item(record.get_item("namespace")?, default_namespace)?;
+        let namespace =
+            parse_optional_namespace_item(record.get_item("namespace")?, default_namespace)?;
         let id = record
             .get_item("id")?
             .ok_or_else(|| PyValueError::new_err("batch record is missing 'id'"))?

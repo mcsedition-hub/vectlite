@@ -79,13 +79,19 @@ impl fmt::Display for VectLiteError {
             Self::Io(err) => write!(f, "io error: {err}"),
             Self::InvalidFormat(message) => write!(f, "invalid .vdb format: {message}"),
             Self::DimensionMismatch { expected, found } => {
-                write!(f, "vector dimension mismatch: expected {expected}, found {found}")
+                write!(
+                    f,
+                    "vector dimension mismatch: expected {expected}, found {found}"
+                )
             }
             Self::DuplicateId { namespace, id } => {
                 if namespace.is_empty() {
                     write!(f, "a record with id '{id}' already exists")
                 } else {
-                    write!(f, "a record with id '{id}' already exists in namespace '{namespace}'")
+                    write!(
+                        f,
+                        "a record with id '{id}' already exists in namespace '{namespace}'"
+                    )
                 }
             }
             Self::ReadOnly => write!(f, "database is opened in read-only mode"),
@@ -241,27 +247,65 @@ impl Record {
     }
 
     fn dense_vectors(&self) -> impl Iterator<Item = (&str, &Vec<f32>)> {
-        std::iter::once((DEFAULT_VECTOR_NAME, &self.vector))
-            .chain(self.vectors.iter().map(|(name, vector)| (name.as_str(), vector)))
+        std::iter::once((DEFAULT_VECTOR_NAME, &self.vector)).chain(
+            self.vectors
+                .iter()
+                .map(|(name, vector)| (name.as_str(), vector)),
+        )
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MetadataFilter {
-    Eq { key: String, value: MetadataValue },
-    NotEq { key: String, value: MetadataValue },
-    In { key: String, values: Vec<MetadataValue> },
-    NotIn { key: String, values: Vec<MetadataValue> },
-    Contains { key: String, needle: String },
-    GreaterThan { key: String, value: f64 },
-    GreaterThanOrEqual { key: String, value: f64 },
-    LessThan { key: String, value: f64 },
-    LessThanOrEqual { key: String, value: f64 },
-    Exists { key: String },
+    Eq {
+        key: String,
+        value: MetadataValue,
+    },
+    NotEq {
+        key: String,
+        value: MetadataValue,
+    },
+    In {
+        key: String,
+        values: Vec<MetadataValue>,
+    },
+    NotIn {
+        key: String,
+        values: Vec<MetadataValue>,
+    },
+    Contains {
+        key: String,
+        needle: String,
+    },
+    GreaterThan {
+        key: String,
+        value: f64,
+    },
+    GreaterThanOrEqual {
+        key: String,
+        value: f64,
+    },
+    LessThan {
+        key: String,
+        value: f64,
+    },
+    LessThanOrEqual {
+        key: String,
+        value: f64,
+    },
+    Exists {
+        key: String,
+    },
     /// Matches if a list-typed field has at least one element satisfying `filter`.
-    ElemMatch { key: String, filter: Box<MetadataFilter> },
+    ElemMatch {
+        key: String,
+        filter: Box<MetadataFilter>,
+    },
     /// Matches if a list-typed field has exactly `size` elements.
-    Size { key: String, size: usize },
+    Size {
+        key: String,
+        size: usize,
+    },
     Not(Box<MetadataFilter>),
     And(Vec<MetadataFilter>),
     Or(Vec<MetadataFilter>),
@@ -364,12 +408,15 @@ impl MetadataFilter {
     fn matches(&self, metadata: &Metadata) -> bool {
         match self {
             Self::Eq { key, value } => resolve_dot_path(metadata, key) == Some(value),
-            Self::NotEq { key, value } => resolve_dot_path(metadata, key)
-                .is_some_and(|candidate| candidate != value),
-            Self::In { key, values } => resolve_dot_path(metadata, key)
-                .is_some_and(|candidate| values.contains(candidate)),
-            Self::NotIn { key, values } => resolve_dot_path(metadata, key)
-                .is_some_and(|candidate| !values.contains(candidate)),
+            Self::NotEq { key, value } => {
+                resolve_dot_path(metadata, key).is_some_and(|candidate| candidate != value)
+            }
+            Self::In { key, values } => {
+                resolve_dot_path(metadata, key).is_some_and(|candidate| values.contains(candidate))
+            }
+            Self::NotIn { key, values } => {
+                resolve_dot_path(metadata, key).is_some_and(|candidate| !values.contains(candidate))
+            }
             Self::Contains { key, needle } => resolve_dot_path(metadata, key)
                 .and_then(|value| match value {
                     MetadataValue::String(value) => Some(value.contains(needle)),
@@ -426,14 +473,12 @@ impl MetadataFilter {
                     })
                     .unwrap_or(false)
             }
-            Self::Size { key, size } => {
-                resolve_dot_path(metadata, key)
-                    .and_then(|value| match value {
-                        MetadataValue::List(items) => Some(items.len() == *size),
-                        _ => None,
-                    })
-                    .unwrap_or(false)
-            }
+            Self::Size { key, size } => resolve_dot_path(metadata, key)
+                .and_then(|value| match value {
+                    MetadataValue::List(items) => Some(items.len() == *size),
+                    _ => None,
+                })
+                .unwrap_or(false),
             Self::Not(filter) => !filter.matches(metadata),
             Self::And(filters) => filters.iter().all(|filter| filter.matches(metadata)),
             Self::Or(filters) => filters.iter().any(|filter| filter.matches(metadata)),
@@ -1051,7 +1096,10 @@ impl Database {
         let mut ops = Vec::new();
 
         for id in ids {
-            if self.records.contains_key(&(namespace.to_owned(), id.as_ref().to_owned())) {
+            if self
+                .records
+                .contains_key(&(namespace.to_owned(), id.as_ref().to_owned()))
+            {
                 removed += 1;
                 ops.push(WalOp::Delete {
                     namespace: namespace.to_owned(),
@@ -1079,18 +1127,18 @@ impl Database {
     ) -> Result<Vec<SearchResult>> {
         Ok(self
             .hybrid_search_in_namespace_with_stats(
-            namespace,
-            Some(query),
-            None,
-            HybridSearchOptions {
-                top_k: options.top_k,
-                filter: options.filter,
-                dense_weight: 1.0,
-                sparse_weight: 0.0,
-                ..HybridSearchOptions::default()
-            },
-        )?
-        .results)
+                namespace,
+                Some(query),
+                None,
+                HybridSearchOptions {
+                    top_k: options.top_k,
+                    filter: options.filter,
+                    dense_weight: 1.0,
+                    sparse_weight: 0.0,
+                    ..HybridSearchOptions::default()
+                },
+            )?
+            .results)
     }
 
     pub fn search_all_namespaces(
@@ -1100,17 +1148,17 @@ impl Database {
     ) -> Result<Vec<SearchResult>> {
         Ok(self
             .hybrid_search_all_namespaces_with_stats(
-            Some(query),
-            None,
-            HybridSearchOptions {
-                top_k: options.top_k,
-                filter: options.filter,
-                dense_weight: 1.0,
-                sparse_weight: 0.0,
-                ..HybridSearchOptions::default()
-            },
-        )?
-        .results)
+                Some(query),
+                None,
+                HybridSearchOptions {
+                    top_k: options.top_k,
+                    filter: options.filter,
+                    dense_weight: 1.0,
+                    sparse_weight: 0.0,
+                    ..HybridSearchOptions::default()
+                },
+            )?
+            .results)
     }
 
     pub fn hybrid_search_in_namespace(
@@ -1231,12 +1279,17 @@ impl Database {
         } else {
             options.top_k
         };
-        let fetch_k = resolve_fetch_k(top_k, options.fetch_k, self.records.len(), options.mmr_lambda);
+        let fetch_k = resolve_fetch_k(
+            top_k,
+            options.fetch_k,
+            self.records.len(),
+            options.mmr_lambda,
+        );
         let vector_name = options.vector_name.as_deref();
 
         let dense_start = Instant::now();
-        let ann_candidates =
-            dense_query.and_then(|query| self.ann_candidate_keys(namespace, vector_name, query, fetch_k));
+        let ann_candidates = dense_query
+            .and_then(|query| self.ann_candidate_keys(namespace, vector_name, query, fetch_k));
         let dense_us = dense_start.elapsed().as_micros() as u64;
 
         let sparse_start = Instant::now();
@@ -1248,7 +1301,10 @@ impl Database {
         let candidate_keys = if dense_query.is_some() && ann_candidates.is_none() {
             None
         } else {
-            merge_candidate_keys(ann_candidates.as_deref(), Some(sparse_candidates.as_slice()))
+            merge_candidate_keys(
+                ann_candidates.as_deref(),
+                Some(sparse_candidates.as_slice()),
+            )
         };
         let mut stats = SearchStats {
             used_ann: ann_candidates.is_some(),
@@ -1278,7 +1334,12 @@ impl Database {
 
         let fusion_start = Instant::now();
         apply_rank_metadata(&mut results);
-        apply_fusion_strategy(&mut results, &options.fusion, options.dense_weight, options.sparse_weight);
+        apply_fusion_strategy(
+            &mut results,
+            &options.fusion,
+            options.dense_weight,
+            options.sparse_weight,
+        );
         sort_scored_records(&mut results);
         let fusion_us = fusion_start.elapsed().as_micros() as u64;
 
@@ -1308,7 +1369,10 @@ impl Database {
         };
 
         Ok(SearchOutcome {
-            results: results.into_iter().map(ScoredRecord::into_search_result).collect(),
+            results: results
+                .into_iter()
+                .map(ScoredRecord::into_search_result)
+                .collect(),
             stats,
         })
     }
@@ -1418,10 +1482,9 @@ impl Database {
         let dest = dest.as_ref();
         fs::create_dir_all(dest)?;
 
-        let file_name = self
-            .path
-            .file_name()
-            .ok_or_else(|| VectLiteError::InvalidFormat("database path has no file name".to_owned()))?;
+        let file_name = self.path.file_name().ok_or_else(|| {
+            VectLiteError::InvalidFormat("database path has no file name".to_owned())
+        })?;
         let dest_vdb = dest.join(file_name);
         self.snapshot(&dest_vdb)?;
 
@@ -1567,7 +1630,9 @@ impl Database {
             return Err(err.into());
         }
         if &magic != WAL_MAGIC {
-            return Err(VectLiteError::InvalidFormat("invalid WAL header".to_owned()));
+            return Err(VectLiteError::InvalidFormat(
+                "invalid WAL header".to_owned(),
+            ));
         }
 
         let mut replayed = 0;
@@ -1610,7 +1675,9 @@ impl Database {
         let mut magic = [0_u8; 4];
         reader.read_exact(&mut magic)?;
         if &magic != MAGIC {
-            return Err(VectLiteError::InvalidFormat("missing VDB1 magic header".to_owned()));
+            return Err(VectLiteError::InvalidFormat(
+                "missing VDB1 magic header".to_owned(),
+            ));
         }
 
         let version = read_u16(reader)?;
@@ -1816,7 +1883,8 @@ impl Database {
 
         for expected_entry in expected {
             let Some(manifest_entry) = entries.iter().find(|entry| {
-                entry.namespace == expected_entry.namespace && entry.vector_name == expected_entry.vector_name
+                entry.namespace == expected_entry.namespace
+                    && entry.vector_name == expected_entry.vector_name
             }) else {
                 return false;
             };
@@ -1829,7 +1897,11 @@ impl Database {
 
             let Some(index) = load_ann_index(
                 parent,
-                &ann_basename(&self.path, expected_entry.namespace.as_deref(), &expected_entry.vector_name),
+                &ann_basename(
+                    &self.path,
+                    expected_entry.namespace.as_deref(),
+                    &expected_entry.vector_name,
+                ),
                 expected_entry.keys.clone(),
             ) else {
                 return false;
@@ -2006,34 +2078,37 @@ impl Database {
                         .unwrap_or(true)
             })
             .map(|record| {
-                let (dense_score, resolved_vector_name) = if !options.multi_vector_queries.is_empty()
-                {
-                    // Multi-vector weighted search
-                    let mut weighted_sum = 0.0_f32;
-                    for (name, (query, weight)) in &options.multi_vector_queries {
-                        if let Some(vector) = record.vector_for(Some(name.as_str())) {
-                            weighted_sum += weight * cosine_similarity(query, vector);
+                let (dense_score, resolved_vector_name) =
+                    if !options.multi_vector_queries.is_empty() {
+                        // Multi-vector weighted search
+                        let mut weighted_sum = 0.0_f32;
+                        for (name, (query, weight)) in &options.multi_vector_queries {
+                            if let Some(vector) = record.vector_for(Some(name.as_str())) {
+                                weighted_sum += weight * cosine_similarity(query, vector);
+                            }
                         }
-                    }
-                    (weighted_sum, None)
-                } else {
-                    let score = dense_query
-                        .and_then(|query| {
-                            record
-                                .vector_for(options.vector_name.as_deref())
-                                .map(|vector| cosine_similarity(query, vector))
-                        })
-                        .unwrap_or(0.0);
-                    (score, options.vector_name.clone())
-                };
+                        (weighted_sum, None)
+                    } else {
+                        let score = dense_query
+                            .and_then(|query| {
+                                record
+                                    .vector_for(options.vector_name.as_deref())
+                                    .map(|vector| cosine_similarity(query, vector))
+                            })
+                            .unwrap_or(0.0);
+                        (score, options.vector_name.clone())
+                    };
                 let sparse_score = sparse_query
-                    .map(|query| self.bm25_score((record.namespace.clone(), record.id.clone()), query))
+                    .map(|query| {
+                        self.bm25_score((record.namespace.clone(), record.id.clone()), query)
+                    })
                     .unwrap_or(0.0);
                 let record_key = (record.namespace.clone(), record.id.clone());
                 let mut bm25_term_scores = BTreeMap::<String, f32>::new();
                 let matched_terms = sparse_query
                     .map(|query| {
-                        query.keys()
+                        query
+                            .keys()
                             .filter(|term| record.sparse.contains_key(*term))
                             .map(|term| {
                                 let score = self.bm25_term_score(
@@ -2077,7 +2152,10 @@ impl Database {
                 .namespaces
                 .get(namespace)
                 .and_then(|indexes| indexes.get(vector_name.unwrap_or(DEFAULT_VECTOR_NAME))),
-            None => self.ann.global.get(vector_name.unwrap_or(DEFAULT_VECTOR_NAME)),
+            None => self
+                .ann
+                .global
+                .get(vector_name.unwrap_or(DEFAULT_VECTOR_NAME)),
         }?;
         if index.keys.len() < ANN_SEARCH_MIN_POINTS {
             return None;
@@ -2167,7 +2245,12 @@ impl Database {
         }
 
         let idf = (((self.sparse_index.doc_count as f32 - df + 0.5) / (df + 0.5)) + 1.0).ln();
-        let doc_len = self.sparse_index.doc_lengths.get(key).copied().unwrap_or(0.0);
+        let doc_len = self
+            .sparse_index
+            .doc_lengths
+            .get(key)
+            .copied()
+            .unwrap_or(0.0);
         let norm = if self.sparse_index.avg_doc_len > 0.0 {
             1.0 - BM25_B + BM25_B * (doc_len / self.sparse_index.avg_doc_len)
         } else {
@@ -2180,11 +2263,9 @@ impl Database {
     #[cfg(test)]
     fn has_ann_index(&self, namespace: Option<&str>, vector_name: Option<&str>) -> bool {
         match namespace {
-            Some(namespace) => self
-                .ann
-                .namespaces
-                .get(namespace)
-                .is_some_and(|indexes| indexes.contains_key(vector_name.unwrap_or(DEFAULT_VECTOR_NAME))),
+            Some(namespace) => self.ann.namespaces.get(namespace).is_some_and(|indexes| {
+                indexes.contains_key(vector_name.unwrap_or(DEFAULT_VECTOR_NAME))
+            }),
             None => self
                 .ann
                 .global
@@ -2458,7 +2539,9 @@ fn read_ann_manifest(path: &Path) -> Result<Vec<AnnManifestEntry>> {
     let mut magic = [0_u8; 4];
     file.read_exact(&mut magic)?;
     if &magic != b"ANN1" {
-        return Err(VectLiteError::InvalidFormat("invalid ANN manifest".to_owned()));
+        return Err(VectLiteError::InvalidFormat(
+            "invalid ANN manifest".to_owned(),
+        ));
     }
 
     let count = usize_from_u32(read_u32(&mut file)?)?;
@@ -2522,7 +2605,12 @@ fn apply_rank_metadata(results: &mut [ScoredRecord<'_>]) {
         results[*right]
             .dense_score
             .total_cmp(&results[*left].dense_score)
-            .then_with(|| results[*left].record.namespace.cmp(&results[*right].record.namespace))
+            .then_with(|| {
+                results[*left]
+                    .record
+                    .namespace
+                    .cmp(&results[*right].record.namespace)
+            })
             .then_with(|| results[*left].record.id.cmp(&results[*right].record.id))
     });
     for (rank, index) in dense_order.into_iter().enumerate() {
@@ -2536,7 +2624,12 @@ fn apply_rank_metadata(results: &mut [ScoredRecord<'_>]) {
         results[*right]
             .sparse_score
             .total_cmp(&results[*left].sparse_score)
-            .then_with(|| results[*left].record.namespace.cmp(&results[*right].record.namespace))
+            .then_with(|| {
+                results[*left]
+                    .record
+                    .namespace
+                    .cmp(&results[*right].record.namespace)
+            })
             .then_with(|| results[*left].record.id.cmp(&results[*right].record.id))
     });
     for (rank, index) in sparse_order.into_iter().enumerate() {
@@ -2555,7 +2648,8 @@ fn apply_fusion_strategy(
     match fusion {
         FusionStrategy::Linear => {
             for result in results {
-                result.score = (dense_weight * result.dense_score) + (sparse_weight * result.sparse_score);
+                result.score =
+                    (dense_weight * result.dense_score) + (sparse_weight * result.sparse_score);
             }
         }
         FusionStrategy::Rrf { rank_constant } => {
@@ -2647,7 +2741,8 @@ fn apply_mmr<'a>(
                             && candidate.record.namespace < candidates[best_index].record.namespace)
                         || (mmr_score == best_score
                             && candidate.score == candidates[best_index].score
-                            && candidate.record.namespace == candidates[best_index].record.namespace
+                            && candidate.record.namespace
+                                == candidates[best_index].record.namespace
                             && candidate.record.id < candidates[best_index].record.id)
                 }
                 None => true,
@@ -2680,8 +2775,7 @@ fn record_similarity(
         _ => 0.0,
     };
 
-    (dense_weight * dense_score)
-        + (sparse_weight * sparse_dot_product(&left.sparse, &right.sparse))
+    (dense_weight * dense_score) + (sparse_weight * sparse_dot_product(&left.sparse, &right.sparse))
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -2744,7 +2838,7 @@ fn read_metadata_value(reader: &mut impl Read) -> Result<MetadataValue> {
         other => {
             return Err(VectLiteError::InvalidFormat(format!(
                 "unknown metadata value tag {other}"
-            )))
+            )));
         }
     };
     Ok(value)
@@ -2878,7 +2972,9 @@ fn read_wal_op(reader: &mut impl Read, dimension: usize) -> Result<WalOp> {
             namespace: read_string(reader)?,
             id: read_string(reader)?,
         }),
-        other => Err(VectLiteError::InvalidFormat(format!("unknown WAL op tag {other}"))),
+        other => Err(VectLiteError::InvalidFormat(format!(
+            "unknown WAL op tag {other}"
+        ))),
     }
 }
 
@@ -2967,15 +3063,13 @@ fn read_f32(reader: &mut impl Read) -> io::Result<f32> {
 }
 
 fn u32_from_usize(value: usize) -> Result<u32> {
-    u32::try_from(value).map_err(|_| {
-        VectLiteError::InvalidFormat("value exceeds the u32 storage limit".to_owned())
-    })
+    u32::try_from(value)
+        .map_err(|_| VectLiteError::InvalidFormat("value exceeds the u32 storage limit".to_owned()))
 }
 
 fn u64_from_usize(value: usize) -> Result<u64> {
-    u64::try_from(value).map_err(|_| {
-        VectLiteError::InvalidFormat("value exceeds the u64 storage limit".to_owned())
-    })
+    u64::try_from(value)
+        .map_err(|_| VectLiteError::InvalidFormat("value exceeds the u64 storage limit".to_owned()))
 }
 
 fn usize_from_u32(value: u32) -> Result<usize> {
@@ -3185,7 +3279,10 @@ mod tests {
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].namespace, "docs");
         assert_eq!(all.len(), 2);
-        assert_eq!(database.namespaces(), vec!["docs".to_owned(), "notes".to_owned()]);
+        assert_eq!(
+            database.namespaces(),
+            vec!["docs".to_owned(), "notes".to_owned()]
+        );
 
         cleanup(&path);
     }
@@ -3384,7 +3481,13 @@ mod tests {
             .expect("insert doc3");
 
         let plain_results = database
-            .search(&[1.0, 0.0], SearchOptions { top_k: 2, filter: None })
+            .search(
+                &[1.0, 0.0],
+                SearchOptions {
+                    top_k: 2,
+                    filter: None,
+                },
+            )
             .expect("search database");
         let mmr_outcome = database
             .hybrid_search_in_namespace_with_stats(
@@ -3430,7 +3533,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        std::env::temp_dir().join(format!("vectlite-{name}-{}-{nanos}.vdb", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "vectlite-{name}-{}-{nanos}.vdb",
+            std::process::id()
+        ))
     }
 
     fn cleanup(path: &Path) {

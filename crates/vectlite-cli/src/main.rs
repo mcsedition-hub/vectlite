@@ -36,9 +36,7 @@ fn run() -> Result<(), String> {
         }
         "insert" => {
             if args.len() < 5 || args.len() > 6 {
-                return Err(
-                    "usage: vectlite insert <path> <id> <vector> [metadata]".to_owned(),
-                );
+                return Err("usage: vectlite insert <path> <id> <vector> [metadata]".to_owned());
             }
 
             let path = &args[2];
@@ -81,9 +79,7 @@ fn run() -> Result<(), String> {
         }
         "search" => {
             if args.len() < 5 || args.len() > 7 {
-                return Err(
-                    "usage: vectlite search <path> <vector> <k> [filters]".to_owned(),
-                );
+                return Err("usage: vectlite search <path> <vector> <k> [filters]".to_owned());
             }
 
             let database = Database::open(&args[2]).map_err(|err| err.to_string())?;
@@ -150,7 +146,10 @@ fn parse_metadata(input: Option<&str>) -> Result<Metadata, String> {
         let Some((key, raw_value)) = pair.split_once('=') else {
             return Err(format!("invalid metadata pair: {pair}"));
         };
-        metadata.insert(key.trim().to_owned(), infer_metadata_value(raw_value.trim()));
+        metadata.insert(
+            key.trim().to_owned(),
+            infer_metadata_value(raw_value.trim()),
+        );
     }
 
     Ok(metadata)
