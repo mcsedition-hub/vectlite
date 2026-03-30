@@ -2,7 +2,7 @@
 
 `vectlite` for Node is released from `bindings/node`.
 
-## Maintainer Flow
+## Local Validation
 
 From the repository root:
 
@@ -17,9 +17,31 @@ That does two local validations:
 
 No upload happens unless `UPLOAD=1` is set.
 
-## Publish
+Contributors can use that command to validate the package locally. It is not the preferred production release path.
 
-If you have an npm token:
+## Preferred Publish Path
+
+Use GitHub Actions trusted publishing for real npm releases.
+
+On npmjs.com, open the `vectlite` package settings and add a trusted publisher with these exact values:
+
+- Organization or user: `mcsedition-hub`
+- Repository: `vectlite`
+- Workflow filename: `publish-npm.yml`
+- Environment name: leave blank
+
+Once that is configured, release from GitHub by pushing a version tag that matches `bindings/node/package.json`:
+
+```bash
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+You can also trigger the workflow manually from the Actions tab for the current version.
+
+## Fallback Token Publish
+
+If you intentionally need a local token-based fallback:
 
 ```bash
 export NPM_TOKEN="npm_..."
@@ -34,6 +56,13 @@ UPLOAD=1 bash scripts/publish_npm.sh
 
 ## Notes
 
+- Preferred release path: GitHub Actions trusted publishing with OIDC.
 - The current npm package is a source-build package.
 - End users need Rust/Cargo installed when they run `npm install vectlite`.
 - Prebuilt binaries are a future step.
+- After trusted publishing is working, restrict or revoke old publish tokens.
+
+Official docs:
+
+- npm trusted publishers: https://docs.npmjs.com/trusted-publishers/
+- GitHub Actions publishing Node packages: https://docs.github.com/actions/publishing-packages/publishing-nodejs-packages

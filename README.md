@@ -35,7 +35,7 @@ cd vectlite/bindings/node
 npm test
 ```
 
-This compiles the native addon with `napi-rs` and runs the smoke tests. An npm publication is not live yet.
+This compiles the native addon with `napi-rs` and runs the smoke tests. An npm publication is not live yet, but the release path is wired for GitHub Actions trusted publishing.
 
 ### Rust
 
