@@ -44,8 +44,8 @@ On npmjs.com, open the `vectlite` package settings and add a trusted publisher w
 Once that is configured, release from GitHub by pushing a version tag that matches `bindings/node/package.json`:
 
 ```bash
-git tag vX.Y.Z
-git push origin vX.Y.Z
+git tag node-vX.Y.Z
+git push origin node-vX.Y.Z
 ```
 
 You can also trigger the workflow manually from the Actions tab for the current version.
@@ -77,7 +77,8 @@ UPLOAD=1 bash scripts/publish_npm.sh
 - Preferred release path: GitHub Actions trusted publishing with OIDC.
 - The current npm package prefers prebuilt binaries and only falls back to source-build on unsupported targets.
 - End users need Rust/Cargo only when no matching prebuilt is available.
-- Prebuilt binaries are a future step.
+- Node releases use `node-vX.Y.Z` tags so they do not collide with PyPI releases.
+- Additional prebuilt targets are a future step.
 - After trusted publishing is working, restrict or revoke old publish tokens.
 
 Official docs:

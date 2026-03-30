@@ -1,13 +1,14 @@
 # vectlite
 
 [![PyPI version](https://img.shields.io/pypi/v/vectlite.svg)](https://pypi.org/project/vectlite/)
+[![npm version](https://img.shields.io/npm/v/vectlite.svg)](https://www.npmjs.com/package/vectlite)
 [![Python versions](https://img.shields.io/pypi/pyversions/vectlite.svg)](https://pypi.org/project/vectlite/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Rust-core-orange.svg)](https://www.rust-lang.org/)
 
 **Embedded vector store for local-first AI applications.**
 
-vectlite is a single-file vector database written in Rust with language bindings for Python today and Node from source today. Dense + sparse hybrid search, HNSW indexing, MongoDB-style metadata filters, transactions, crash-safe persistence, and file locking -- all in a portable `.vdb` file. No server, no Docker, no network calls.
+vectlite is a single-file vector database written in Rust with language bindings for Python and Node.js. Dense + sparse hybrid search, HNSW indexing, MongoDB-style metadata filters, transactions, crash-safe persistence, and file locking -- all in a portable `.vdb` file. No server, no Docker, no network calls.
 
 ## Install
 
@@ -27,26 +28,11 @@ pip install git+https://github.com/mcsedition-hub/vectlite.git#subdirectory=bind
 
 ### Node.js
 
-The Node binding is published on npm with prebuilt binaries for the main desktop/server targets:
-
 ```bash
 npm install vectlite
 ```
 
-Prebuilt coverage:
-
-- macOS x64
-- macOS arm64
-- Linux x64 (glibc)
-- Windows x64
-
-Fallback source build still requires:
-
-- Node 18+
-- Rust/Cargo on the target machine
-- network access to fetch Rust crates during install
-
-The package uses a matching prebuilt binary when one is available, and falls back to compiling the native addon with `napi-rs` otherwise. The source remains in this repository under `bindings/node`.
+Requires Node.js 18+. Pre-built binaries are available for macOS (x86_64, arm64), Linux (x86_64), and Windows (x86_64). Other platforms fall back to compiling from source (requires Rust/Cargo).
 
 ### Rust
 
@@ -68,6 +54,20 @@ db.upsert("doc1", embedding, {"source": "blog", "title": "Auth Guide"})
 db.upsert("doc2", embedding2, {"source": "notes", "title": "Billing"})
 
 results = db.search(query_embedding, k=5, filter={"source": "blog"})
+db.compact()
+```
+
+## Quick Start (Node.js)
+
+```js
+const vectlite = require('vectlite')
+
+const db = vectlite.open('knowledge.vdb', { dimension: 384 })
+
+db.upsert('doc1', embedding, { source: 'blog', title: 'Auth Guide' })
+db.upsert('doc2', embedding2, { source: 'notes', title: 'Billing' })
+
+const results = db.search(queryEmbedding, { k: 5, filter: { source: 'blog' } })
 db.compact()
 ```
 
@@ -198,6 +198,78 @@ print(outcome["stats"]["timings"])       # {"dense_us": 120, "sparse_us": 45, ..
 print(outcome["results"][0]["explain"])  # Detailed scoring breakdown
 ```
 
+## Node.js API
+
+### Hybrid Search
+
+```js
+const vectlite = require('vectlite')
+
+const db = vectlite.open('knowledge.vdb', { dimension: 384 })
+
+db.upsert(
+  'doc1',
+  denseEmbedding,
+  { source: 'docs', title: 'Auth Setup', text: 'How to configure SSO...' },
+  { sparse: vectlite.sparseTerms('How to configure SSO authentication') },
+)
+
+const results = db.search(queryEmbedding, {
+  k: 10,
+  sparse: vectlite.sparseTerms('SSO authentication'),
+  fusion: 'rrf',
+  filter: { source: 'docs' },
+  explain: true,
+})
+```
+
+### Collections
+
+```js
+const store = vectlite.openStore('./my_collections')
+const products = store.createCollection('products', 384)
+products.upsert('p1', embedding, { name: 'Widget', price: 9.99 })
+
+const logs = store.openOrCreateCollection('logs', 128)
+console.log(store.collections()) // ["logs", "products"]
+```
+
+### Transactions
+
+```js
+const tx = db.transaction()
+try {
+  tx.upsert('doc1', emb1, { source: 'a' })
+  tx.upsert('doc2', emb2, { source: 'b' })
+  tx.delete('old_doc')
+  tx.commit() // All operations commit atomically
+} catch (err) {
+  tx.rollback() // Roll back on error
+  throw err
+}
+```
+
+### Text Helpers
+
+```js
+vectlite.upsertText(db, 'doc1', 'Auth setup guide', embedFn, { source: 'docs' })
+const results = vectlite.searchText(db, 'how to authenticate', embedFn, { k: 5 })
+```
+
+### Search Diagnostics
+
+```js
+const outcome = db.searchWithStats(query, {
+  k: 5,
+  sparse: terms,
+  explain: true,
+})
+
+console.log(outcome.stats.timings)      // { dense_us: 120, sparse_us: 45, ... }
+console.log(outcome.stats.used_ann)     // true
+console.log(outcome.results[0].explain) // Detailed scoring breakdown
+```
+
 ## Rust API
 
 ```rust
@@ -244,7 +316,7 @@ crates/
   vectlite-cli/     # CLI for smoke testing and file inspection
 bindings/
   python/           # Python package (PyO3 + maturin)
-  node/             # Node binding (napi-rs, source build today)
+  node/             # Node.js package (napi-rs)
 scripts/            # Release and CI scripts
 .github/workflows/  # CI: cross-platform wheel builds, tests
 ```
@@ -267,7 +339,7 @@ The snapshot + WAL are the source of truth. ANN sidecars are acceleration artifa
 | Language | Status | Package |
 |----------|--------|---------|
 | Python | Available | [`pip install vectlite`](https://pypi.org/project/vectlite/) |
-| Node | Available from source | `bindings/node` with `napi-rs` |
+| Node.js | Available | [`npm install vectlite`](https://www.npmjs.com/package/vectlite) |
 | Swift | Planned | After FFI layer stabilizes |
 | Kotlin | Planned | After FFI layer stabilizes |
 
@@ -290,11 +362,16 @@ python -m venv .venv && source .venv/bin/activate
 pip install maturin pytest
 maturin develop -m bindings/python/Cargo.toml
 pytest bindings/python/tests/
+
+# Node.js development
+cd bindings/node
+npm test
 ```
 
 ## Links
 
 - [PyPI Package](https://pypi.org/project/vectlite/)
+- [npm Package](https://www.npmjs.com/package/vectlite)
 - [Changelog](https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md)
 - [Issue Tracker](https://github.com/mcsedition-hub/vectlite/issues)
 - [Contribution Guide](https://github.com/mcsedition-hub/vectlite/blob/main/CONTRIBUTING.md)

@@ -53,13 +53,14 @@ gh secret set PYPI_API_TOKEN --repo mcsedition-hub/vectlite
 Then push a version tag:
 
 ```bash
-git tag vX.Y.Z
-git push origin vX.Y.Z
+git tag py-vX.Y.Z
+git push origin py-vX.Y.Z
 ```
 
 ## Notes
 
 - Update `CHANGELOG.md` before tagging a new version so the release notes and package metadata stay aligned.
+- Python releases use `py-vX.Y.Z` tags so they do not collide with Node package releases.
 - PyPI versions are immutable once uploaded.
 - The release script removes local `__pycache__` directories before building so the wheel stays clean.
 - A token exported in your interactive shell is not automatically visible to the Codex shell session.

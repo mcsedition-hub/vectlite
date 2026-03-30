@@ -22,6 +22,7 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - The repository README now shows the Node binding as available from source instead of just planned.
 - The Node package is now structured as a self-contained source-build npm package with prepack/install scripts and a maintainer npm release flow.
 - The repository and Node package docs now advertise `npm install vectlite` as the default Node install path.
+- Python and Node package releases now use separate tag namespaces (`py-v*` and `node-v*`) so Node-only releases do not trigger PyPI publication.
 
 ## [0.1.3] - 2026-03-30
 
