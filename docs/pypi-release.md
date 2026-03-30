@@ -2,6 +2,8 @@
 
 `vectlite` can be published to the real PyPI registry either locally with an API token or from GitHub Actions.
 
+This is a maintainer-only workflow. Contributors should use the build-only path to validate packaging, not upload releases.
+
 ## Prerequisites
 
 - a PyPI account: https://pypi.org/account/register/
@@ -22,6 +24,8 @@ This builds:
 
 ## Upload To PyPI
 
+Maintainer-only:
+
 ```bash
 export PYPI_API_TOKEN="pypi-..."
 UPLOAD=1 ./scripts/publish_pypi.sh
@@ -31,6 +35,8 @@ The upload target defaults to `https://upload.pypi.org/legacy/`.
 The script uploads with `--skip-existing`, so rerunning the same release will not fail if the exact files were already accepted.
 
 ## GitHub Actions Release
+
+Maintainer-only.
 
 The release workflow in `.github/workflows/wheels.yml` supports two publication modes:
 

@@ -42,14 +42,16 @@ python -m pip install -e bindings/python
 python -m pytest bindings/python/tests -q
 ```
 
-If you are working on packaging:
+If you are working on packaging locally, you can validate that the package still builds:
 
 ```bash
 bash scripts/publish_testpypi.sh
 bash scripts/publish_pypi.sh
 ```
 
-These build artifacts locally and run `twine check` without uploading unless `UPLOAD=1`.
+These commands only build artifacts locally and run `twine check`.
+
+Do not publish from a contributor PR. Real uploads to TestPyPI or PyPI are maintainer-only release steps and require project credentials or GitHub release permissions.
 
 ## Pull Request Expectations
 

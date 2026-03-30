@@ -2,6 +2,8 @@
 
 `vectlite` can be staged on TestPyPI before a real PyPI push.
 
+This is a maintainer-only workflow. Contributors should use the build-only path to validate packaging, not upload staged releases.
+
 ## Prerequisites
 
 - a separate TestPyPI account: https://test.pypi.org/account/register/
@@ -22,6 +24,8 @@ This builds:
 
 ## Upload To TestPyPI
 
+Maintainer-only:
+
 ```bash
 export TEST_PYPI_API_TOKEN="pypi-..."
 UPLOAD=1 ./scripts/publish_testpypi.sh
@@ -31,6 +35,8 @@ The upload target defaults to `https://test.pypi.org/legacy/`.
 The script uploads with `--skip-existing`, so rerunning the same release does not fail if an artifact is already present.
 
 ## GitHub Actions Release
+
+Maintainer-only.
 
 The repository also has a dedicated workflow:
 
