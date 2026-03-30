@@ -1,14 +1,20 @@
 # Node Binding
 
-The Node binding now exists in-repo and builds from source.
+The Node binding is published on npm and builds from source on install.
 
 Current state:
 
 - Rust addon implemented with `napi-rs`
 - JavaScript wrapper and TypeScript declarations included
 - local smoke test available in `bindings/node/tests`
-- npm package can be published as a source-build package
+- npm package live as `vectlite`
 - installing the npm package requires a working Rust toolchain on the target machine
+
+## Install
+
+```bash
+npm install vectlite
+```
 
 ## Local Build
 

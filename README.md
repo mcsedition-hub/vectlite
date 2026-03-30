@@ -27,15 +27,19 @@ pip install git+https://github.com/mcsedition-hub/vectlite.git#subdirectory=bind
 
 ### Node.js
 
-The Node binding is implemented in-repo and currently builds from source:
+The Node binding is published on npm as a source-build package:
 
 ```bash
-git clone https://github.com/mcsedition-hub/vectlite.git
-cd vectlite/bindings/node
-npm test
+npm install vectlite
 ```
 
-This compiles the native addon with `napi-rs` and runs the smoke tests. An npm publication is not live yet, but the release path is wired for GitHub Actions trusted publishing.
+Install requires:
+
+- Node 18+
+- Rust/Cargo on the target machine
+- network access to fetch Rust crates during install
+
+The package compiles the native addon with `napi-rs` during installation. The source remains in this repository under `bindings/node`.
 
 ### Rust
 

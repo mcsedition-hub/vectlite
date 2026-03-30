@@ -2,6 +2,10 @@
 
 `vectlite` for Node is released from `bindings/node`.
 
+Current published package:
+
+- npm: https://www.npmjs.com/package/vectlite
+
 ## Local Validation
 
 From the repository root:
@@ -21,7 +25,7 @@ Contributors can use that command to validate the package locally. It is not the
 
 ## Preferred Publish Path
 
-Use GitHub Actions trusted publishing for real npm releases.
+Use GitHub Actions trusted publishing for real npm releases when the package has a trusted publisher configured on npmjs.com.
 
 On npmjs.com, open the `vectlite` package settings and add a trusted publisher with these exact values:
 
