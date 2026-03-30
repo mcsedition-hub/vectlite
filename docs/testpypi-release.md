@@ -51,6 +51,7 @@ python -m pip install \
 
 ## Notes
 
+- Update `CHANGELOG.md` before cutting a new test release so the staged package matches the documented changes.
 - TestPyPI is separate from PyPI. Accounts and tokens are not shared.
 - Just like PyPI, you should treat versions as immutable once uploaded. `--skip-existing` only makes reruns idempotent; it does not replace files.
 - The release script removes local `__pycache__` directories before building so the wheel stays clean.

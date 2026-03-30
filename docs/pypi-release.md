@@ -52,6 +52,7 @@ git push origin v0.1.1
 
 ## Notes
 
+- Update `CHANGELOG.md` before tagging a new version so the release notes and package metadata stay aligned.
 - PyPI versions are immutable once uploaded.
 - The release script removes local `__pycache__` directories before building so the wheel stays clean.
 - A token exported in your interactive shell is not automatically visible to the Codex shell session.

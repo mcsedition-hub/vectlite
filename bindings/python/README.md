@@ -20,6 +20,8 @@ pytest
 pip install vectlite
 ```
 
+Release history lives in [`CHANGELOG.md`](https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md).
+
 ## TestPyPI Release
 
 From the repo root:
@@ -123,6 +125,9 @@ Supported metadata/filter value types are:
 - `int`
 - `float`
 - `bool`
+- `None`
+- `list`
+- `dict`
 
 Supported filter operators in the MVP are:
 

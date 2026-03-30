@@ -21,7 +21,7 @@ classifiers = [
 Homepage = "https://github.com/mcsedition-hub/vectlite"
 Repository = "https://github.com/mcsedition-hub/vectlite"
 Issues = "https://github.com/mcsedition-hub/vectlite/issues"
-Changelog = "https://github.com/mcsedition-hub/vectlite/releases"
+Changelog = "https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md"
 
 [tool.maturin]
 module-name = "vectlite._vectlite"

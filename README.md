@@ -39,6 +39,7 @@ pip install -e bindings/python
 ```
 
 If you only want the Python package details, see `bindings/python/README.md`.
+For release history, see [`CHANGELOG.md`](https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md).
 
 ### Node
 
@@ -121,6 +122,7 @@ db.compact()
 Packaging and local dev details live in `bindings/python/README.md`.
 The TestPyPI release flow lives in `docs/testpypi-release.md`.
 The PyPI release flow lives in `docs/pypi-release.md`.
+The release history lives in [`CHANGELOG.md`](https://github.com/mcsedition-hub/vectlite/blob/main/CHANGELOG.md).
 
 ## Rust API
 
