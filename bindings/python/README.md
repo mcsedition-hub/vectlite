@@ -14,6 +14,12 @@ maturin develop
 pytest
 ```
 
+## Install From PyPI
+
+```bash
+pip install vectlite
+```
+
 ## TestPyPI Release
 
 From the repo root:

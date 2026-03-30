@@ -20,7 +20,13 @@ Current status:
 
 ### Python
 
-Today, the Python package can be installed from source:
+The Python package is now published on PyPI:
+
+```bash
+pip install vectlite
+```
+
+You can also install directly from source:
 
 ```bash
 pip install git+https://github.com/mcsedition-hub/vectlite.git#subdirectory=bindings/python
