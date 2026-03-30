@@ -6,7 +6,9 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
-No unreleased changes yet.
+### Changed
+
+- GitHub Actions workflows now use Node 24 native action versions for checkout, Python setup, and artifact upload/download, instead of forcing Node 24 through a workflow environment flag.
 
 ## [0.1.2] - 2026-03-30
 
