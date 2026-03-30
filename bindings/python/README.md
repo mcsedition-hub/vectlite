@@ -31,6 +31,23 @@ UPLOAD=1 ./scripts/publish_testpypi.sh
 
 The full flow is documented in `docs/testpypi-release.md` in the repository.
 
+## PyPI Release
+
+From the repo root:
+
+```bash
+./scripts/publish_pypi.sh
+```
+
+Then upload with a PyPI token:
+
+```bash
+export PYPI_API_TOKEN="pypi-..."
+UPLOAD=1 ./scripts/publish_pypi.sh
+```
+
+The full flow is documented in `docs/pypi-release.md` in the repository.
+
 ## API
 
 ```python

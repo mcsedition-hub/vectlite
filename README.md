@@ -114,6 +114,7 @@ db.compact()
 
 Packaging and local dev details live in `bindings/python/README.md`.
 The TestPyPI release flow lives in `docs/testpypi-release.md`.
+The PyPI release flow lives in `docs/pypi-release.md`.
 
 ## Rust API
 
