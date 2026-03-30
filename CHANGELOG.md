@@ -8,6 +8,20 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 No unreleased changes yet.
 
+## [0.1.2] - 2026-03-30
+
+### Added
+
+- GitHub Actions CI for Rust formatting and tests plus Python install, test, and packaging validation across Linux, macOS, and Windows.
+- Dedicated GitHub Actions release flows for TestPyPI staging and PyPI publishing with repository secrets.
+- Project changelog with versioned release notes in the repository root.
+
+### Changed
+
+- Repository and Python package documentation now point directly to the changelog and the published PyPI install path.
+- Release documentation now treats changelog updates as part of the standard cut process.
+- Release examples now use version placeholders instead of hardcoded historical tags.
+
 ## [0.1.1] - 2026-03-30
 
 ### Added

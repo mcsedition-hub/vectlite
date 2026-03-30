@@ -46,8 +46,8 @@ gh secret set PYPI_API_TOKEN --repo mcsedition-hub/vectlite
 Then push a version tag:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 ## Notes
