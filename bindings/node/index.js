@@ -85,6 +85,15 @@ function wrapError(fn) {
   }
 }
 
+function wrapAsync(value) {
+  return Promise.resolve(value).catch((error) => {
+    if (error instanceof VectLiteError) {
+      throw error
+    }
+    throw new VectLiteError(error?.message ?? String(error), error)
+  })
+}
+
 function encode(value) {
   return value == null ? null : JSON.stringify(value)
 }
@@ -95,6 +104,18 @@ function decode(value) {
 
 function asArray(values) {
   return Array.from(values)
+}
+
+function isPromiseLike(value) {
+  return value != null && typeof value.then === 'function'
+}
+
+function embedText(text, embed) {
+  const embedded = wrapError(() => embed(text))
+  if (isPromiseLike(embedded)) {
+    return wrapAsync(embedded).then((vector) => asArray(vector))
+  }
+  return asArray(embedded)
 }
 
 function normalizeWriteOptions(options = {}) {
@@ -318,15 +339,30 @@ function upsertText(db, id, text, embed, metadata = null, options = {}) {
   if (payload.text === undefined) {
     payload.text = text
   }
-  return db.upsert(id, asArray(embed(text)), payload, { ...options, sparse: sparseTerms(text) })
+  const vector = embedText(text, embed)
+  const writeOptions = { ...options, sparse: sparseTerms(text) }
+  if (isPromiseLike(vector)) {
+    return wrapAsync(vector.then((resolved) => db.upsert(id, resolved, payload, writeOptions)))
+  }
+  return db.upsert(id, vector, payload, writeOptions)
 }
 
 function searchText(db, text, embed, options = {}) {
-  return db.search(asArray(embed(text)), { ...options, sparse: sparseTerms(text) })
+  const vector = embedText(text, embed)
+  const searchOptions = { ...options, sparse: sparseTerms(text) }
+  if (isPromiseLike(vector)) {
+    return wrapAsync(vector.then((resolved) => db.search(resolved, searchOptions)))
+  }
+  return db.search(vector, searchOptions)
 }
 
 function searchTextWithStats(db, text, embed, options = {}) {
-  return db.searchWithStats(asArray(embed(text)), { ...options, sparse: sparseTerms(text) })
+  const vector = embedText(text, embed)
+  const searchOptions = { ...options, sparse: sparseTerms(text) }
+  if (isPromiseLike(vector)) {
+    return wrapAsync(vector.then((resolved) => db.searchWithStats(resolved, searchOptions)))
+  }
+  return db.searchWithStats(vector, searchOptions)
 }
 
 module.exports = {

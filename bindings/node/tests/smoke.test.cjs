@@ -44,3 +44,28 @@ test('store and text helpers', () => {
   assert.equal(results.length, 1)
   assert.equal(store.collections()[0], 'products')
 })
+
+test('text helpers support async embedders', async () => {
+  const dbPath = tempPath('knowledge-async.vdb')
+  const db = vectlite.open(dbPath, { dimension: 2 })
+
+  await vectlite.upsertText(
+    db,
+    'doc1',
+    'Auth guide',
+    async (text) => [text.length, 1],
+    { source: 'docs' },
+  )
+
+  const results = await vectlite.searchText(db, 'auth', async (text) => [text.length, 1], { k: 1 })
+  const outcome = await vectlite.searchTextWithStats(
+    db,
+    'auth',
+    async (text) => [text.length, 1],
+    { k: 1 },
+  )
+
+  assert.equal(results.length, 1)
+  assert.equal(results[0].id, 'doc1')
+  assert.equal(Array.isArray(outcome.results), true)
+})

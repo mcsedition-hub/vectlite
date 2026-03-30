@@ -10,6 +10,9 @@ export type Metadata = { [key: string]: MetadataValue }
 export type SparseVector = { [term: string]: number }
 export type NamedVectors = { [name: string]: number[] }
 export type Filter = { [key: string]: unknown }
+export type TextEmbedding = ArrayLike<number>
+export type TextEmbeddingResult = TextEmbedding | Promise<TextEmbedding>
+export type TextEmbedder = (text: string) => TextEmbeddingResult
 
 export interface Record {
   namespace: string
@@ -164,19 +167,39 @@ export function upsertText(
   db: Database,
   id: string,
   text: string,
-  embed: (text: string) => ArrayLike<number>,
+  embed: (text: string) => TextEmbedding,
   metadata?: Metadata | null,
   options?: WriteOptions,
 ): void
+export function upsertText(
+  db: Database,
+  id: string,
+  text: string,
+  embed: (text: string) => Promise<TextEmbedding>,
+  metadata?: Metadata | null,
+  options?: WriteOptions,
+): Promise<void>
 export function searchText(
   db: Database,
   text: string,
-  embed: (text: string) => ArrayLike<number>,
+  embed: (text: string) => TextEmbedding,
   options?: SearchOptions,
 ): SearchResult[]
+export function searchText(
+  db: Database,
+  text: string,
+  embed: (text: string) => Promise<TextEmbedding>,
+  options?: SearchOptions,
+): Promise<SearchResult[]>
 export function searchTextWithStats(
   db: Database,
   text: string,
-  embed: (text: string) => ArrayLike<number>,
+  embed: (text: string) => TextEmbedding,
   options?: SearchOptions,
 ): SearchResponse
+export function searchTextWithStats(
+  db: Database,
+  text: string,
+  embed: (text: string) => Promise<TextEmbedding>,
+  options?: SearchOptions,
+): Promise<SearchResponse>

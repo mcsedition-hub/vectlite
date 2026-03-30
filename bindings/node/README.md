@@ -126,9 +126,11 @@ try {
 ### Text Helpers
 
 ```js
-// Handles embedding + sparse term generation for you
-vectlite.upsertText(db, 'doc1', 'Auth setup guide', embedFn, { source: 'docs' })
-const results = vectlite.searchText(db, 'how to authenticate', embedFn, { k: 5 })
+async function run() {
+  // embedFn can be sync or async
+  await vectlite.upsertText(db, 'doc1', 'Auth setup guide', embedFn, { source: 'docs' })
+  const results = await vectlite.searchText(db, 'how to authenticate', embedFn, { k: 5 })
+}
 ```
 
 ### Snapshots & Backup
