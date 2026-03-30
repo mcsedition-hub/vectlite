@@ -1,5 +1,7 @@
 """Python bindings for the vectlite embedded vector store."""
 
+from __future__ import annotations
+
 import re
 from collections.abc import Callable, Mapping, Sequence
 from importlib.metadata import version as _pkg_version
