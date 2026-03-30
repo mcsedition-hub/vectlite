@@ -7,7 +7,8 @@ Current state:
 - Rust addon implemented with `napi-rs`
 - JavaScript wrapper and TypeScript declarations included
 - local smoke test available in `bindings/node/tests`
-- npm publication is not live yet
+- npm package can be published as a source-build package
+- installing the npm package requires a working Rust toolchain on the target machine
 
 ## Local Build
 
@@ -26,6 +27,20 @@ This compiles the Rust addon and writes `bindings/node/vectlite.node`.
 cd bindings/node
 npm test
 ```
+
+## npm Package Model
+
+The npm package is set up as a source-build package:
+
+- `prepack` stages a self-contained native crate plus the core Rust crate
+- `install` compiles the addon with Cargo on the target machine
+- the published tarball does not ship prebuilt binaries yet
+
+That keeps one source of truth for the Rust core, but it means `npm install vectlite` requires:
+
+- Node 18+
+- Rust/Cargo installed
+- registry/network access to fetch Rust crates during the build
 
 ## Usage
 
@@ -57,4 +72,4 @@ The initial Node surface covers the core database and store operations:
 Not yet included:
 
 - JS callback rerank hooks
-- a published npm package and prebuilt binaries
+- prebuilt binaries

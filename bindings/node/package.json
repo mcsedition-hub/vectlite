@@ -27,11 +27,15 @@
     "index.js",
     "index.d.ts",
     "README.md",
-    "vectlite.node"
+    "scripts",
+    "native"
   ],
   "scripts": {
     "build": "node ./scripts/build-addon.mjs",
-    "test": "npm run build && node --test tests/smoke.test.cjs"
+    "test": "npm run build && node --test tests/smoke.test.cjs",
+    "install": "node ./scripts/build-addon.mjs",
+    "prepack": "node ./scripts/prepare-package.mjs",
+    "postpack": "node ./scripts/clean-package.mjs"
   },
   "engines": {
     "node": ">=18"

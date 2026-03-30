@@ -6,9 +6,17 @@ import { spawnSync } from 'node:child_process'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(__dirname, '..')
 const repoRoot = resolve(packageRoot, '..', '..')
+const packagedManifest = join(packageRoot, 'native', 'Cargo.toml')
+const usingPackagedNative = existsSync(packagedManifest)
 
-const result = spawnSync('cargo', ['build', '-p', 'vectlite-node', '--release'], {
-  cwd: repoRoot,
+const cargoArgs = usingPackagedNative
+  ? ['build', '--manifest-path', packagedManifest, '--release']
+  : ['build', '-p', 'vectlite-node', '--release']
+
+const cargoCwd = usingPackagedNative ? packageRoot : repoRoot
+
+const result = spawnSync('cargo', cargoArgs, {
+  cwd: cargoCwd,
   stdio: 'inherit',
 })
 
@@ -27,7 +35,11 @@ const artifactName = (() => {
   }
 })()
 
-const source = join(repoRoot, 'target', 'release', artifactName)
+const targetRoot = usingPackagedNative
+  ? join(packageRoot, 'native', 'target', 'release')
+  : join(repoRoot, 'target', 'release')
+
+const source = join(targetRoot, artifactName)
 const output = join(packageRoot, 'vectlite.node')
 
 if (!existsSync(source)) {
