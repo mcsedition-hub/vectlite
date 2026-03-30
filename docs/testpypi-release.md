@@ -1,0 +1,46 @@
+# TestPyPI Release
+
+`vectlite` can be staged on TestPyPI before a real PyPI push.
+
+## Prerequisites
+
+- a separate TestPyPI account: https://test.pypi.org/account/register/
+- a TestPyPI API token with project upload access
+- local tools installed in `.venv`: `maturin` and `twine`
+
+## Build Only
+
+```bash
+./scripts/publish_testpypi.sh
+```
+
+This builds:
+
+- a wheel in `dist/testpypi/`
+- an sdist in `dist/testpypi/`
+- and runs `twine check` on both artifacts
+
+## Upload To TestPyPI
+
+```bash
+export TEST_PYPI_API_TOKEN="pypi-..."
+UPLOAD=1 ./scripts/publish_testpypi.sh
+```
+
+The upload target defaults to `https://test.pypi.org/legacy/`.
+The script uploads with `--skip-existing`, so rerunning the same release does not fail if an artifact is already present.
+
+## Install From TestPyPI
+
+```bash
+python -m pip install \
+  --index-url https://test.pypi.org/simple/ \
+  --extra-index-url https://pypi.org/simple \
+  vectlite
+```
+
+## Notes
+
+- TestPyPI is separate from PyPI. Accounts and tokens are not shared.
+- Just like PyPI, you should treat versions as immutable once uploaded. `--skip-existing` only makes reruns idempotent; it does not replace files.
+- The release script removes local `__pycache__` directories before building so the wheel stays clean.

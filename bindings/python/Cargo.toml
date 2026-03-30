@@ -1,0 +1,18 @@
+[package]
+name = "vectlite-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Python bindings for vectlite."
+homepage = "https://github.com/mcsedition-hub/vectlite"
+repository = "https://github.com/mcsedition-hub/vectlite"
+documentation = "https://github.com/mcsedition-hub/vectlite"
+
+[lib]
+name = "_vectlite"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23.5", features = ["abi3-py39", "extension-module"] }
+vectlite = { package = "vectlite-core", path = "../../crates/vectlite-core" }

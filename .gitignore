@@ -1,0 +1,12 @@
+/target
+/*.vdb
+/*.tmp
+/dist
+/node_modules
+/.venv
+__pycache__/
+*.pyc
+bindings/python/vectlite/_vectlite*.so
+bindings/python/vectlite/_vectlite*.pyd
+bindings/python/vectlite/_vectlite*.dylib
+*.dSYM/

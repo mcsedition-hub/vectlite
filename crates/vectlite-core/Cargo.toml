@@ -1,0 +1,17 @@
+[package]
+name = "vectlite-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core storage engine for vectlite."
+homepage = "https://github.com/mcsedition-hub/vectlite"
+repository = "https://github.com/mcsedition-hub/vectlite"
+documentation = "https://github.com/mcsedition-hub/vectlite"
+
+[lib]
+name = "vectlite"
+path = "src/lib.rs"
+
+[dependencies]
+fs2 = "0.4"
+hnsw_rs = "0.3.4"

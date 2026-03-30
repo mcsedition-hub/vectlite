@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/vectlite-core",
+    "crates/vectlite-cli",
+    "bindings/python",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.1"
+edition = "2024"
+license = "MIT"

@@ -1,0 +1,16 @@
+[package]
+name = "vectlite-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for inspecting and validating vectlite databases."
+homepage = "https://github.com/mcsedition-hub/vectlite"
+repository = "https://github.com/mcsedition-hub/vectlite"
+documentation = "https://github.com/mcsedition-hub/vectlite"
+
+[[bin]]
+name = "vectlite"
+path = "src/main.rs"
+
+[dependencies]
+vectlite = { package = "vectlite-core", path = "../vectlite-core" }
