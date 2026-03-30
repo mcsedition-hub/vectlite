@@ -6,6 +6,14 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-03-30
+
+### Fixed
+
+- Node `upsertText()`, `searchText()`, and `searchTextWithStats()` now support async embedding functions that return a `Promise`, matching the documented usage.
+
+## [0.1.4] - 2026-03-30
+
 ### Added
 
 - Added a contribution guide, project code of conduct, pull request template, issue templates, and maintainer notes for reviewing community PRs.
@@ -25,10 +33,6 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - Python and Node package releases now use separate tag namespaces (`py-v*` and `node-v*`) so Node-only releases do not trigger PyPI publication.
 - Public package metadata and README links now point to the official docs site at `https://vectlite.mcsedition.org/`.
 - GitHub Releases can now be created through `scripts/create_github_release.sh`, which prepends links to the official docs, package page, install command, and changelog before auto-generated notes.
-
-### Fixed
-
-- Node `upsertText()`, `searchText()`, and `searchTextWithStats()` now support async embedding functions that return a `Promise`, matching the documented usage.
 
 ## [0.1.3] - 2026-03-30
 
