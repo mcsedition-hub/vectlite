@@ -2,6 +2,42 @@
 
 `vectlite` is an embedded vector store for local-first applications. The repository is structured around a reusable Rust core, with the first real binding now targeting Python.
 
+## What You Can Use Today
+
+`vectlite` is a monorepo:
+
+- this repository is the source of truth for the Rust core and every language binding
+- Python is the first real package surface
+- Node, framework bindings, Swift, and Kotlin will also live here as separate packages
+
+Current status:
+
+- Python: available in this repo now
+- Node: planned in `bindings/node`
+- Swift/Kotlin: planned after the FFI layer stabilizes
+
+## Install
+
+### Python
+
+Today, the Python package can be installed from source:
+
+```bash
+pip install git+https://github.com/mcsedition-hub/vectlite.git#subdirectory=bindings/python
+```
+
+For local development from a clone of this repository:
+
+```bash
+pip install -e bindings/python
+```
+
+If you only want the Python package details, see `bindings/python/README.md`.
+
+### Node
+
+The Node package is not published yet. It will be shipped from this same repository once the Python surface is considered stable.
+
 This first cut optimizes for portability and simplicity:
 
 - embedded storage rooted at a single `.vdb` path
