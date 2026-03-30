@@ -56,6 +56,7 @@ Before cutting a release:
 3. make sure `cargo test --workspace` passes
 4. make sure `python -m pytest bindings/python/tests -q` passes
 5. stage on TestPyPI when the package description or packaging changed
+6. create the GitHub Release with `bash scripts/create_github_release.sh <tag>` so the release notes always link to the official docs
 
 ## Community Workflow
 

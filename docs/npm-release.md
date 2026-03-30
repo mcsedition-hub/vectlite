@@ -46,6 +46,7 @@ Once that is configured, release from GitHub by pushing a version tag that match
 ```bash
 git tag node-vX.Y.Z
 git push origin node-vX.Y.Z
+bash scripts/create_github_release.sh node-vX.Y.Z
 ```
 
 You can also trigger the workflow manually from the Actions tab for the current version.
@@ -78,6 +79,7 @@ UPLOAD=1 bash scripts/publish_npm.sh
 - The current npm package prefers prebuilt binaries and only falls back to source-build on unsupported targets.
 - End users need Rust/Cargo only when no matching prebuilt is available.
 - Node releases use `node-vX.Y.Z` tags so they do not collide with PyPI releases.
+- `scripts/create_github_release.sh` creates a GitHub Release with a standard docs/package preamble and auto-generated notes.
 - Additional prebuilt targets are a future step.
 - After trusted publishing is working, restrict or revoke old publish tokens.
 
