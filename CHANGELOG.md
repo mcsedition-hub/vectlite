@@ -6,7 +6,7 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
-## [0.1.9] - 2026-03-31
+## [0.1.10] - 2026-03-31
 
 ### Added
 
@@ -18,6 +18,7 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - Dimension mismatch errors now explain how to recover after changing embedding models by deleting the existing `.vdb` file or creating a new database path.
 - `insert_many()`, `upsert_many()`, and transaction commits now defer index rebuilds until the end of the batch, removing the rebuild-per-operation cost from bulk writes.
 - Internal WAL batch application now skips sparse index rebuilds when an operation does not touch sparse terms.
+- The PyPI release workflow now reads the workspace version from `[workspace.package]` before validating `py-v*` tags.
 - The npm release workflow now falls back to the repository `NPM_TOKEN` secret when present, while still keeping trusted publishing as the default path when no token is configured.
 
 ### Fixed
