@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-03-31
+
 ### Added
 
 - The repository README and Python package README now document `bulk_ingest()`, batch record formats, and a fuller database methods reference including maintenance and diagnostics APIs.
