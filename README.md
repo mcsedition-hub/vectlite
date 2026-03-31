@@ -146,6 +146,25 @@ results = db.search(
 )
 ```
 
+### Bulk Ingestion
+
+For large imports, use `bulk_ingest()` instead of calling `upsert()` in a loop. It batches WAL writes and rebuilds indexes only once at the end.
+
+```python
+records = [
+    {
+        "id": f"doc{i}",
+        "vector": embeddings[i],
+        "metadata": {"source": "corpus"},
+        "sparse": vectlite.sparse_terms(texts[i]),
+    }
+    for i in range(len(texts))
+]
+db.bulk_ingest(records, batch_size=5000)
+```
+
+`upsert_many(records)` and `insert_many(records)` accept the same format and also rebuild indexes once.
+
 ### Collections
 
 ```python

@@ -143,9 +143,10 @@ impl PyDatabase {
         vector: Vec<f32>,
         metadata: Option<Py<PyDict>>,
         namespace: Option<String>,
-        sparse: Option<Py<PyDict>>,
+        sparse: Option<Py<PyAny>>,
         vectors: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        let sparse = coerce_sparse_param(py, sparse)?;
         let metadata = parse_metadata_dict(metadata.as_ref().map(|dict| dict.bind(py)))?;
         let sparse = parse_sparse_dict(sparse.as_ref().map(|dict| dict.bind(py)))?;
         let vectors = parse_named_vectors_dict(vectors.as_ref().map(|dict| dict.bind(py)))?;
@@ -170,9 +171,10 @@ impl PyDatabase {
         vector: Vec<f32>,
         metadata: Option<Py<PyDict>>,
         namespace: Option<String>,
-        sparse: Option<Py<PyDict>>,
+        sparse: Option<Py<PyAny>>,
         vectors: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        let sparse = coerce_sparse_param(py, sparse)?;
         let metadata = parse_metadata_dict(metadata.as_ref().map(|dict| dict.bind(py)))?;
         let sparse = parse_sparse_dict(sparse.as_ref().map(|dict| dict.bind(py)))?;
         let vectors = parse_named_vectors_dict(vectors.as_ref().map(|dict| dict.bind(py)))?;
@@ -298,7 +300,7 @@ impl PyDatabase {
         filter: Option<Py<PyDict>>,
         namespace: Option<String>,
         all_namespaces: bool,
-        sparse: Option<Py<PyDict>>,
+        sparse: Option<Py<PyAny>>,
         dense_weight: f32,
         sparse_weight: f32,
         fetch_k: usize,
@@ -312,6 +314,7 @@ impl PyDatabase {
         query_vectors: Option<Py<PyDict>>,
         vector_weights: Option<Py<PyDict>>,
     ) -> PyResult<Py<PyList>> {
+        let sparse = coerce_sparse_param(py, sparse)?;
         let query_payload = build_query_payload(
             py,
             query.as_deref(),
@@ -365,7 +368,7 @@ impl PyDatabase {
         filter: Option<Py<PyDict>>,
         namespace: Option<String>,
         all_namespaces: bool,
-        sparse: Option<Py<PyDict>>,
+        sparse: Option<Py<PyAny>>,
         dense_weight: f32,
         sparse_weight: f32,
         fetch_k: usize,
@@ -379,6 +382,7 @@ impl PyDatabase {
         query_vectors: Option<Py<PyDict>>,
         vector_weights: Option<Py<PyDict>>,
     ) -> PyResult<Py<PyDict>> {
+        let sparse = coerce_sparse_param(py, sparse)?;
         let query_payload = build_query_payload(
             py,
             query.as_deref(),
@@ -478,9 +482,10 @@ impl PyTransaction {
         vector: Vec<f32>,
         metadata: Option<Py<PyDict>>,
         namespace: Option<String>,
-        sparse: Option<Py<PyDict>>,
+        sparse: Option<Py<PyAny>>,
         vectors: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        let sparse = coerce_sparse_param(py, sparse)?;
         let metadata = parse_metadata_dict(metadata.as_ref().map(|dict| dict.bind(py)))?;
         let sparse = parse_sparse_dict(sparse.as_ref().map(|dict| dict.bind(py)))?;
         let vectors = parse_named_vectors_dict(vectors.as_ref().map(|dict| dict.bind(py)))?;
@@ -502,9 +507,10 @@ impl PyTransaction {
         vector: Vec<f32>,
         metadata: Option<Py<PyDict>>,
         namespace: Option<String>,
-        sparse: Option<Py<PyDict>>,
+        sparse: Option<Py<PyAny>>,
         vectors: Option<Py<PyDict>>,
     ) -> PyResult<()> {
+        let sparse = coerce_sparse_param(py, sparse)?;
         let metadata = parse_metadata_dict(metadata.as_ref().map(|dict| dict.bind(py)))?;
         let sparse = parse_sparse_dict(sparse.as_ref().map(|dict| dict.bind(py)))?;
         let vectors = parse_named_vectors_dict(vectors.as_ref().map(|dict| dict.bind(py)))?;
@@ -756,6 +762,37 @@ fn parse_metadata_dict(dict: Option<&Bound<'_, PyDict>>) -> PyResult<Metadata> {
     }
 
     Ok(metadata)
+}
+
+/// Validate and coerce the `sparse` parameter. Accepts `None`, a `dict[str, float]`
+/// (returned by `sparse_terms()`), or raises a clear error for any other type.
+fn coerce_sparse_param(py: Python<'_>, sparse: Option<Py<PyAny>>) -> PyResult<Option<Py<PyDict>>> {
+    let Some(sparse) = sparse else {
+        return Ok(None);
+    };
+    let obj = sparse.bind(py);
+    if obj.is_none() {
+        return Ok(None);
+    }
+    if let Ok(dict) = obj.downcast::<PyDict>() {
+        return Ok(Some(dict.clone().unbind()));
+    }
+    if obj.is_instance_of::<PyString>() {
+        return Err(PyTypeError::new_err(
+            "sparse parameter expects dict[str, float] (the return value of \
+             vectlite.sparse_terms()), got str. Use sparse=vectlite.sparse_terms(\"your text\") \
+             instead of sparse=\"your text\"",
+        ));
+    }
+    let type_name = obj
+        .get_type()
+        .name()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| "unknown".to_owned());
+    Err(PyTypeError::new_err(format!(
+        "sparse parameter expects dict[str, float] (the return value of \
+         vectlite.sparse_terms()), got {type_name}",
+    )))
 }
 
 fn parse_sparse_dict(dict: Option<&Bound<'_, PyDict>>) -> PyResult<SparseVector> {

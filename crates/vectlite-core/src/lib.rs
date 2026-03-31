@@ -81,7 +81,9 @@ impl fmt::Display for VectLiteError {
             Self::DimensionMismatch { expected, found } => {
                 write!(
                     f,
-                    "vector dimension mismatch: expected {expected}, found {found}"
+                    "vector dimension mismatch: expected {expected}, found {found}. \
+                     If you changed embedding models, delete the existing .vdb file \
+                     or use a different path to create a new database with dimension {found}"
                 )
             }
             Self::DuplicateId { namespace, id } => {
@@ -1026,7 +1028,11 @@ impl Database {
             return Ok(0);
         }
 
-        self.apply_wal_batch(records.into_iter().map(WalOp::Upsert).collect())?;
+        self.apply_wal_batch_deferred(records.into_iter().map(WalOp::Upsert).collect())?;
+        self.rebuild_sparse_index();
+        self.rebuild_ann();
+        self.ann_loaded_from_disk = false;
+        self.persist_ann_to_disk()?;
         Ok(count)
     }
 
@@ -1048,7 +1054,11 @@ impl Database {
             return Ok(0);
         }
 
-        self.apply_wal_batch(records.into_iter().map(WalOp::Upsert).collect())?;
+        self.apply_wal_batch_deferred(records.into_iter().map(WalOp::Upsert).collect())?;
+        self.rebuild_sparse_index();
+        self.rebuild_ann();
+        self.ann_loaded_from_disk = false;
+        self.persist_ann_to_disk()?;
         Ok(count)
     }
 
@@ -1239,7 +1249,15 @@ impl Database {
                 WriteOperation::Delete { namespace, id } => Ok(WalOp::Delete { namespace, id }),
             })
             .collect::<Result<Vec<_>>>()?;
-        self.apply_wal_batch(ops)
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.apply_wal_batch_deferred(ops)?;
+        self.rebuild_sparse_index();
+        self.rebuild_ann();
+        self.ann_loaded_from_disk = false;
+        self.persist_ann_to_disk()?;
+        Ok(())
     }
 
     fn hybrid_search_internal(
@@ -1298,7 +1316,9 @@ impl Database {
             .unwrap_or_default();
         let sparse_us = sparse_start.elapsed().as_micros() as u64;
 
-        let candidate_keys = if dense_query.is_some() && ann_candidates.is_none() {
+        let candidate_keys = if dense_query.is_none() {
+            Some(sparse_candidates.clone())
+        } else if dense_query.is_some() && ann_candidates.is_none() {
             None
         } else {
             merge_candidate_keys(
@@ -1562,12 +1582,42 @@ impl Database {
             return Ok(());
         }
 
+        let has_sparse = ops.iter().any(|op| match op {
+            WalOp::Upsert(record) => {
+                !record.sparse.is_empty()
+                    || self
+                        .records
+                        .get(&(record.namespace.clone(), record.id.clone()))
+                        .map_or(false, |r| !r.sparse.is_empty())
+            }
+            WalOp::Delete { namespace, id } => self
+                .records
+                .get(&(namespace.clone(), id.clone()))
+                .map_or(false, |r| !r.sparse.is_empty()),
+        });
+
         self.append_wal_batch(&ops)?;
         self.apply_ops_in_memory(ops);
-        self.rebuild_sparse_index();
+
+        if has_sparse {
+            self.rebuild_sparse_index();
+        }
         self.rebuild_ann();
         self.ann_loaded_from_disk = false;
         self.persist_ann_to_disk()?;
+        Ok(())
+    }
+
+    /// Write ops to WAL and apply in memory, but defer index rebuilds.
+    /// The caller is responsible for calling `rebuild_sparse_index()`,
+    /// `rebuild_ann()`, and `persist_ann_to_disk()` after all batches are done.
+    fn apply_wal_batch_deferred(&mut self, ops: Vec<WalOp>) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+
+        self.append_wal_batch(&ops)?;
+        self.apply_ops_in_memory(ops);
         Ok(())
     }
 
@@ -3339,6 +3389,67 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, "doc1");
         assert!(results[0].sparse_score > results[1].sparse_score);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn upsert_without_sparse_rebuilds_sparse_index() {
+        let path = temp_file("sparse-upsert-clear");
+        let mut database = Database::create(&path, 2).expect("create database");
+
+        let mut sparse_auth = SparseVector::new();
+        sparse_auth.insert("auth".to_owned(), 1.0);
+
+        database
+            .upsert_with_sparse_in_namespace(
+                "docs",
+                "doc1",
+                vec![1.0, 0.0],
+                sparse_auth,
+                Metadata::new(),
+            )
+            .expect("insert sparse doc");
+
+        let mut query_sparse = SparseVector::new();
+        query_sparse.insert("auth".to_owned(), 1.0);
+
+        let initial_outcome = database
+            .hybrid_search_in_namespace_with_stats(
+                "docs",
+                None,
+                Some(&query_sparse),
+                HybridSearchOptions {
+                    top_k: 10,
+                    filter: None,
+                    dense_weight: 0.0,
+                    sparse_weight: 1.0,
+                    ..HybridSearchOptions::default()
+                },
+            )
+            .expect("initial sparse search");
+        assert_eq!(initial_outcome.stats.sparse_candidate_count, 1);
+
+        database
+            .upsert_in_namespace("docs", "doc1", vec![1.0, 0.0], Metadata::new())
+            .expect("replace doc without sparse terms");
+
+        let updated_outcome = database
+            .hybrid_search_in_namespace_with_stats(
+                "docs",
+                None,
+                Some(&query_sparse),
+                HybridSearchOptions {
+                    top_k: 10,
+                    filter: None,
+                    dense_weight: 0.0,
+                    sparse_weight: 1.0,
+                    ..HybridSearchOptions::default()
+                },
+            )
+            .expect("sparse search after clearing sparse terms");
+        assert_eq!(updated_outcome.stats.sparse_candidate_count, 0);
+        assert!(updated_outcome.results.is_empty());
 
         cleanup(&path);
     }

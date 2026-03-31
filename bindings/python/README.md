@@ -103,6 +103,35 @@ for result in results:
     print(result["id"], result["score"])
 ```
 
+### Bulk Ingestion (Recommended for Large Imports)
+
+For ingesting more than a few hundred records, use `bulk_ingest()` instead of calling `upsert()` in a loop. It writes records in WAL batches and rebuilds indexes only once at the end, making it orders of magnitude faster.
+
+```python
+records = [
+    {
+        "id": f"doc{i}",
+        "vector": embeddings[i],
+        "metadata": {"source": "corpus", "chunk": i},
+        "sparse": vectlite.sparse_terms(texts[i]),  # optional
+    }
+    for i in range(len(texts))
+]
+
+count = db.bulk_ingest(records, batch_size=5000)
+print(f"Ingested {count} records")
+```
+
+The `records` parameter is a `list[dict]` where each dict has keys:
+- `id` (str, required) -- unique record identifier
+- `vector` (list[float], required) -- dense embedding vector
+- `metadata` (dict, optional) -- arbitrary metadata
+- `sparse` (dict[str, float], optional) -- sparse terms from `sparse_terms()`
+- `vectors` (dict[str, list[float]], optional) -- named vectors
+- `namespace` (str, optional) -- namespace override per record
+
+`upsert_many()` and `insert_many()` also accept the same `list[dict]` format and rebuild indexes once, but don't batch WAL writes internally.
+
 ### Collections
 
 ```python
@@ -183,6 +212,43 @@ print(outcome["results"][0]["explain"])  # Detailed scoring breakdown
 | `$elemMatch` | `{"tags": {"$elemMatch": {"$eq": "rust"}}}` | Match list elements |
 | `$size` | `{"tags": {"$size": 3}}` | List length |
 | dot-path | `{"author.name": "Alice"}` | Nested field access |
+
+## Database Methods Reference
+
+### Write Methods
+
+| Method | Description |
+|--------|-------------|
+| `db.upsert(id, vector, metadata, sparse=..., vectors=...)` | Insert or update a single record |
+| `db.insert(id, vector, metadata, sparse=..., vectors=...)` | Insert a record (raises on duplicate id) |
+| `db.upsert_many(records, namespace=None)` | Upsert a batch of records (single index rebuild) |
+| `db.insert_many(records, namespace=None)` | Insert a batch (raises on duplicate ids) |
+| `db.bulk_ingest(records, namespace=None, batch_size=10000)` | Fastest bulk import with batched WAL writes |
+| `db.delete(id, namespace=None)` | Delete a single record |
+| `db.delete_many(ids, namespace=None)` | Delete multiple records by id |
+
+### Read Methods
+
+| Method | Description |
+|--------|-------------|
+| `db.get(id, namespace=None)` | Get a single record by id |
+| `db.search(query, k=10, ...)` | Search and return a list of results |
+| `db.search_with_stats(query, k=10, ...)` | Search with detailed performance stats |
+| `db.count()` or `len(db)` | Number of records in the database |
+| `db.namespaces()` | List all namespaces |
+| `db.dimension` | Vector dimension (property) |
+| `db.path` | Database file path (property) |
+| `db.read_only` | Whether the database is read-only (property) |
+
+### Maintenance Methods
+
+| Method | Description |
+|--------|-------------|
+| `db.compact()` | Fold WAL into snapshot and persist ANN indexes |
+| `db.flush()` | Alias for `compact()` |
+| `db.snapshot(dest)` | Create a self-contained `.vdb` copy |
+| `db.backup(dest_dir)` | Full backup including ANN sidecar files |
+| `db.transaction()` | Begin an atomic transaction (use as context manager) |
 
 ## How It Works
 

@@ -6,9 +6,22 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Added
+
+- The repository README and Python package README now document `bulk_ingest()`, batch record formats, and a fuller database methods reference including maintenance and diagnostics APIs.
+
 ### Changed
 
+- Python sparse-query parameters now raise a clearer `TypeError` when callers pass a string instead of the `dict[str, float]` returned by `vectlite.sparse_terms()`.
+- Dimension mismatch errors now explain how to recover after changing embedding models by deleting the existing `.vdb` file or creating a new database path.
+- `insert_many()`, `upsert_many()`, and transaction commits now defer index rebuilds until the end of the batch, removing the rebuild-per-operation cost from bulk writes.
+- Internal WAL batch application now skips sparse index rebuilds when an operation does not touch sparse terms.
 - The npm release workflow now falls back to the repository `NPM_TOKEN` secret when present, while still keeping trusted publishing as the default path when no token is configured.
+
+### Fixed
+
+- Upserts that replace a previously sparse record with a record that has no sparse terms now rebuild sparse search state correctly instead of leaving stale sparse candidates behind.
+- Sparse-only searches no longer fall back to returning zero-score full-scan results when no sparse candidates match.
 
 ## [0.1.8] - 2026-03-30
 
