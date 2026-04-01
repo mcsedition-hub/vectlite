@@ -13,6 +13,7 @@ use vectlite::{
 };
 
 create_exception!(vectlite, VectLiteError, PyException);
+create_exception!(vectlite, VectLiteLockError, VectLiteError);
 
 #[pyclass(module = "vectlite", name = "Database")]
 struct PyDatabase {
@@ -150,7 +151,7 @@ impl PyDatabase {
         let metadata = parse_metadata_dict(metadata.as_ref().map(|dict| dict.bind(py)))?;
         let sparse = parse_sparse_dict(sparse.as_ref().map(|dict| dict.bind(py)))?;
         let vectors = parse_named_vectors_dict(vectors.as_ref().map(|dict| dict.bind(py)))?;
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database
             .insert_with_vectors_in_namespace(
                 namespace.unwrap_or_default(),
@@ -178,7 +179,7 @@ impl PyDatabase {
         let metadata = parse_metadata_dict(metadata.as_ref().map(|dict| dict.bind(py)))?;
         let sparse = parse_sparse_dict(sparse.as_ref().map(|dict| dict.bind(py)))?;
         let vectors = parse_named_vectors_dict(vectors.as_ref().map(|dict| dict.bind(py)))?;
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database
             .upsert_with_vectors_in_namespace(
                 namespace.unwrap_or_default(),
@@ -199,7 +200,7 @@ impl PyDatabase {
         namespace: Option<String>,
     ) -> PyResult<usize> {
         let records = parse_record_batch(py, records, namespace.as_deref())?;
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database.insert_many(records).map_err(to_py_error)
     }
 
@@ -211,7 +212,7 @@ impl PyDatabase {
         namespace: Option<String>,
     ) -> PyResult<usize> {
         let records = parse_record_batch(py, records, namespace.as_deref())?;
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database.upsert_many(records).map_err(to_py_error)
     }
 
@@ -224,7 +225,7 @@ impl PyDatabase {
         batch_size: usize,
     ) -> PyResult<usize> {
         let records = parse_record_batch(py, records, namespace.as_deref())?;
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database
             .bulk_ingest(records, batch_size)
             .map_err(to_py_error)
@@ -251,7 +252,7 @@ impl PyDatabase {
 
     #[pyo3(signature = (id, namespace=None))]
     fn delete(&self, id: &str, namespace: Option<String>) -> PyResult<bool> {
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database
             .delete_in_namespace(&namespace.unwrap_or_default(), id)
             .map_err(to_py_error)
@@ -259,19 +260,19 @@ impl PyDatabase {
 
     #[pyo3(signature = (ids, namespace=None))]
     fn delete_many(&self, ids: Vec<String>, namespace: Option<String>) -> PyResult<usize> {
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database
             .delete_many_in_namespace(&namespace.unwrap_or_default(), ids)
             .map_err(to_py_error)
     }
 
     fn flush(&self) -> PyResult<()> {
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database.flush().map_err(to_py_error)
     }
 
     fn compact(&self) -> PyResult<()> {
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database.compact().map_err(to_py_error)
     }
 
@@ -436,8 +437,22 @@ impl PyDatabase {
         Ok(response.into())
     }
 
-    fn count(&self) -> PyResult<usize> {
-        self.__len__()
+    #[pyo3(signature = (namespace=None, filter=None))]
+    fn count(
+        &self,
+        py: Python<'_>,
+        namespace: Option<String>,
+        filter: Option<Py<PyDict>>,
+    ) -> PyResult<usize> {
+        let filter = filter
+            .as_ref()
+            .map(|f| parse_filter_dict(f.bind(py)))
+            .transpose()?;
+        if namespace.is_none() && filter.is_none() {
+            return self.__len__();
+        }
+        let database = self.read()?;
+        Ok(database.count_filtered(namespace.as_deref(), filter.as_ref()))
     }
 
     fn namespaces(&self) -> PyResult<Vec<String>> {
@@ -445,7 +460,70 @@ impl PyDatabase {
         Ok(database.namespaces())
     }
 
+    fn close(&self) -> PyResult<()> {
+        let mut database = self.write()?;
+        database.close().map_err(to_py_error)
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc=None, _tb=None))]
+    fn __exit__(
+        &self,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc: Option<&Bound<'_, PyAny>>,
+        _tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        self.close()?;
+        Ok(false)
+    }
+
+    #[pyo3(signature = (namespace=None, filter=None, limit=0, offset=0))]
+    fn list(
+        &self,
+        py: Python<'_>,
+        namespace: Option<String>,
+        filter: Option<Py<PyDict>>,
+        limit: usize,
+        offset: usize,
+    ) -> PyResult<Py<PyList>> {
+        let filter = filter
+            .as_ref()
+            .map(|f| parse_filter_dict(f.bind(py)))
+            .transpose()?;
+        let records = {
+            let database = self.read()?;
+            database
+                .list(namespace.as_deref(), filter.as_ref(), limit, offset)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let list = PyList::empty(py);
+        for record in &records {
+            list.append(record_to_pydict(py, record)?)?;
+        }
+        Ok(list.into())
+    }
+
+    #[pyo3(signature = (filter, namespace=None))]
+    fn delete_by_filter(
+        &self,
+        py: Python<'_>,
+        filter: Py<PyDict>,
+        namespace: Option<String>,
+    ) -> PyResult<usize> {
+        let filter = parse_filter_dict(filter.bind(py))?;
+        let mut database = self.write_open()?;
+        database
+            .delete_by_filter(namespace.as_deref(), &filter)
+            .map_err(to_py_error)
+    }
+
     fn transaction(&self) -> PyResult<PyTransaction> {
+        drop(self.read()?);
         Ok(PyTransaction {
             inner: Arc::clone(&self.inner),
             staged: Mutex::new(TransactionState::default()),
@@ -630,15 +708,28 @@ impl PyTransaction {
 
 impl PyDatabase {
     fn read(&self) -> PyResult<RwLockReadGuard<'_, CoreDatabase>> {
-        self.inner
+        let database = self
+            .inner
             .read()
-            .map_err(|_| VectLiteError::new_err("database read lock poisoned"))
+            .map_err(|_| VectLiteError::new_err("database read lock poisoned"))?;
+        if database.is_closed() {
+            return Err(to_py_error(closed_database_error()));
+        }
+        Ok(database)
     }
 
     fn write(&self) -> PyResult<RwLockWriteGuard<'_, CoreDatabase>> {
         self.inner
             .write()
             .map_err(|_| VectLiteError::new_err("database write lock poisoned"))
+    }
+
+    fn write_open(&self) -> PyResult<RwLockWriteGuard<'_, CoreDatabase>> {
+        let database = self.write()?;
+        if database.is_closed() {
+            return Err(to_py_error(closed_database_error()));
+        }
+        Ok(database)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -699,21 +790,45 @@ impl PyDatabase {
     }
 }
 
-#[pyfunction(name = "open", signature = (path, dimension=None, read_only=false))]
-fn open_database(path: String, dimension: Option<usize>, read_only: bool) -> PyResult<PyDatabase> {
+#[pyfunction(name = "open", signature = (path, dimension=None, read_only=false, lock_timeout=None))]
+fn open_database(
+    path: String,
+    dimension: Option<usize>,
+    read_only: bool,
+    lock_timeout: Option<f64>,
+) -> PyResult<PyDatabase> {
     let database = if read_only {
         if !Path::new(&path).exists() {
             return Err(VectLiteError::new_err(
                 "cannot open non-existent database in read-only mode",
             ));
         }
-        CoreDatabase::open_read_only(&path).map_err(to_py_error)?
+        match lock_timeout {
+            Some(timeout) => CoreDatabase::open_read_only_with_timeout(&path, Some(timeout))
+                .map_err(to_py_error)?,
+            None => CoreDatabase::open_read_only(&path).map_err(to_py_error)?,
+        }
     } else if Path::new(&path).exists() {
-        match dimension {
-            Some(dimension) => {
+        match (dimension, lock_timeout) {
+            (Some(dimension), Some(timeout)) => {
+                // Try open with timeout, check dimension
+                let db = CoreDatabase::open_with_timeout(&path, timeout).map_err(to_py_error)?;
+                if db.dimension() != dimension {
+                    return Err(to_py_error(vectlite::VectLiteError::DimensionMismatch {
+                        expected: db.dimension(),
+                        found: dimension,
+                    })
+                    .into());
+                }
+                db
+            }
+            (Some(dimension), None) => {
                 CoreDatabase::open_or_create(&path, dimension).map_err(to_py_error)?
             }
-            None => CoreDatabase::open(&path).map_err(to_py_error)?,
+            (None, Some(timeout)) => {
+                CoreDatabase::open_with_timeout(&path, timeout).map_err(to_py_error)?
+            }
+            (None, None) => CoreDatabase::open(&path).map_err(to_py_error)?,
         }
     } else {
         let Some(dimension) = dimension else {
@@ -740,6 +855,7 @@ fn restore_database(source: String, dest: String) -> PyResult<PyDatabase> {
 #[pymodule]
 fn _vectlite(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("VectLiteError", m.py().get_type::<VectLiteError>())?;
+    m.add("VectLiteLockError", m.py().get_type::<VectLiteLockError>())?;
     m.add_class::<PyDatabase>()?;
     m.add_class::<PyTransaction>()?;
     m.add_class::<PyStore>()?;
@@ -1433,5 +1549,12 @@ fn parse_optional_namespace_item(
 }
 
 fn to_py_error(error: vectlite::VectLiteError) -> PyErr {
-    VectLiteError::new_err(error.to_string())
+    match &error {
+        vectlite::VectLiteError::LockContention(_) => VectLiteLockError::new_err(error.to_string()),
+        _ => VectLiteError::new_err(error.to_string()),
+    }
+}
+
+fn closed_database_error() -> vectlite::VectLiteError {
+    vectlite::VectLiteError::InvalidFormat("database is closed".to_owned())
 }

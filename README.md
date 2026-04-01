@@ -48,13 +48,12 @@ vectlite = { path = "crates/vectlite-core" }
 ```python
 import vectlite
 
-db = vectlite.open("knowledge.vdb", dimension=384)
+with vectlite.open("knowledge.vdb", dimension=384) as db:
+    db.upsert("doc1", embedding, {"source": "blog", "title": "Auth Guide"})
+    db.upsert("doc2", embedding2, {"source": "notes", "title": "Billing"})
 
-db.upsert("doc1", embedding, {"source": "blog", "title": "Auth Guide"})
-db.upsert("doc2", embedding2, {"source": "notes", "title": "Billing"})
-
-results = db.search(query_embedding, k=5, filter={"source": "blog"})
-db.compact()
+    results = db.search(query_embedding, k=5, filter={"source": "blog"})
+    print(db.count(filter={"source": "blog"}))
 ```
 
 ## Quick Start (Node.js)
@@ -68,7 +67,8 @@ db.upsert('doc1', embedding, { source: 'blog', title: 'Auth Guide' })
 db.upsert('doc2', embedding2, { source: 'notes', title: 'Billing' })
 
 const results = db.search(queryEmbedding, { k: 5, filter: { source: 'blog' } })
-db.compact()
+console.log(db.count({ filter: { source: 'blog' } }))
+db.close()
 ```
 
 ## Features
@@ -79,6 +79,8 @@ db.compact()
 - **Crash-safe WAL** -- writes land in a write-ahead log, then checkpoint with `compact()`
 - **Transactions** -- atomic batched writes with rollback on exception
 - **File locking** -- advisory locks prevent corruption from concurrent access
+- **Explicit close** -- release locks deterministically with `db.close()` or Python context managers
+- **Lock timeouts** -- bounded retries when opening a locked database
 - **Read-only mode** -- shared locks for safe concurrent readers
 - **Snapshots** -- `db.snapshot(path)` creates a self-contained copy at any time
 - **Backup / Restore** -- full backup with ANN sidecars and restore to a new path
@@ -101,6 +103,8 @@ db.compact()
 - **MongoDB-style operators** -- `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$contains`, `$exists`
 - **Logical combinators** -- `$and`, `$or`, `$not`
 - **Nested access** -- dot-path traversal (`author.name`), `$elemMatch`, `$size`
+- **Filtered counts & listing** -- scan records with `count(...)` and `list(...)` without running a vector search
+- **Delete by filter** -- remove whole slices of data with metadata filters plus optional namespace scoping
 
 ### Reranking & Observability
 
@@ -197,9 +201,21 @@ restored = vectlite.restore("/backups/full/", "restored.vdb")
 ### Read-Only Mode
 
 ```python
-ro = vectlite.open("knowledge.vdb", read_only=True)
+ro = vectlite.open("knowledge.vdb", read_only=True, lock_timeout=5.0)
 results = ro.search(query, k=5)  # Reads work
 ro.upsert(...)                    # Raises VectLiteError
+```
+
+### Listing, Counts, and Lifecycle
+
+```python
+db = vectlite.open("knowledge.vdb", dimension=384, lock_timeout=5.0)
+
+recent_docs = db.list(namespace="docs", filter={"stale": False}, limit=20)
+doc_count = db.count(namespace="docs", filter={"source": "blog"})
+deleted = db.delete_by_filter({"stale": True}, namespace="docs")
+
+db.close()
 ```
 
 ### Analyzers
@@ -276,6 +292,18 @@ async function run() {
   await vectlite.upsertText(db, 'doc1', 'Auth setup guide', embedFn, { source: 'docs' })
   const results = await vectlite.searchText(db, 'how to authenticate', embedFn, { k: 5 })
 }
+```
+
+### Listing, Counts, and Lifecycle
+
+```js
+const db = vectlite.open('knowledge.vdb', { dimension: 384, lockTimeout: 5 })
+
+const docs = db.list({ namespace: 'docs', filter: { stale: false }, limit: 20 })
+const count = db.count({ namespace: 'docs', filter: { source: 'blog' } })
+const deleted = db.deleteByFilter({ stale: true }, { namespace: 'docs' })
+
+db.close()
 ```
 
 ### Search Diagnostics

@@ -31,8 +31,11 @@ db.upsert('doc2', embedding2, { source: 'notes', title: 'Billing' })
 // Search with filters
 const results = db.search(embeddingQuery, { k: 5, filter: { source: 'blog' } })
 
+// Query-free inspection
+console.log(db.count({ filter: { source: 'blog' } }))
+
 // Clean up
-db.compact()
+db.close()
 ```
 
 ## Features
@@ -62,9 +65,13 @@ db.compact()
 
 - **Physical collections** -- `vectlite.openStore()` manages a directory of independent databases
 - **Bulk ingestion** -- `bulkIngest()` with deferred index rebuilds for fast imports
+- **Listing & filtered counts** -- `list()` and `count({ namespace, filter })` without a vector query
+- **Delete by filter** -- `deleteByFilter()` for bulk deletion by metadata filter
 - **Snapshots** -- `db.snapshot(path)` creates a self-contained copy
 - **Backup / Restore** -- `db.backup(dir)` and `vectlite.restore(dir, path)` for full roundtrips
 - **Read-only mode** -- `vectlite.open(path, { readOnly: true })` for safe concurrent readers
+- **Explicit close** -- `db.close()` to release locks deterministically
+- **Lock timeouts** -- `lockTimeout` for bounded lock acquisition waits
 
 ## Usage
 
@@ -145,9 +152,21 @@ const restored = vectlite.restore('/backups/full/', 'restored.vdb')
 ### Read-Only Mode
 
 ```js
-const ro = vectlite.open('knowledge.vdb', { readOnly: true })
+const ro = vectlite.open('knowledge.vdb', { readOnly: true, lockTimeout: 5 })
 const results = ro.search(query, { k: 5 }) // Reads work
 ro.upsert(...)                              // Throws VectLiteError
+```
+
+### Listing, Counting, and Lifecycle
+
+```js
+const db = vectlite.open('knowledge.vdb', { dimension: 384, lockTimeout: 5 })
+
+const records = db.list({ namespace: 'docs', filter: { stale: false }, limit: 20 })
+const count = db.count({ namespace: 'docs', filter: { source: 'blog' } })
+const deleted = db.deleteByFilter({ stale: true }, { namespace: 'docs' })
+
+db.close()
 ```
 
 ### Search Diagnostics
@@ -163,6 +182,46 @@ console.log(outcome.stats.timings)      // { dense_us: 120, sparse_us: 45, ... }
 console.log(outcome.stats.used_ann)     // true
 console.log(outcome.results[0].explain) // Detailed scoring breakdown
 ```
+
+## Database Methods Reference
+
+### Write Methods
+
+| Method | Description |
+|---|---|
+| `db.upsert(id, vector, metadata, options)` | Insert or update a single record |
+| `db.insert(id, vector, metadata, options)` | Insert a record (throws on duplicate id) |
+| `db.upsertMany(records, { namespace })` | Upsert a batch of records |
+| `db.insertMany(records, { namespace })` | Insert a batch |
+| `db.bulkIngest(records, { namespace, batchSize })` | Fastest bulk import with batched WAL writes |
+| `db.delete(id, { namespace })` | Delete a single record |
+| `db.deleteMany(ids, { namespace })` | Delete multiple records by id |
+| `db.deleteByFilter(filter, { namespace })` | Delete all records matching a filter |
+
+### Read Methods
+
+| Method | Description |
+|---|---|
+| `db.get(id, { namespace })` | Get a single record by id |
+| `db.search(query, options)` | Search and return a list of results |
+| `db.searchWithStats(query, options)` | Search with detailed performance stats |
+| `db.count({ namespace, filter })` | Count records, optionally scoped by namespace/filter |
+| `db.list({ namespace, filter, limit, offset })` | List records without issuing a vector query |
+| `db.namespaces()` | List all namespaces |
+| `db.dimension` | Vector dimension (property) |
+| `db.path` | Database file path (property) |
+| `db.readOnly` | Whether the database is read-only (property) |
+
+### Maintenance Methods
+
+| Method | Description |
+|---|---|
+| `db.compact()` | Fold WAL into snapshot and persist ANN indexes |
+| `db.flush()` | Alias for `compact()` |
+| `db.snapshot(dest)` | Create a self-contained `.vdb` copy |
+| `db.backup(destDir)` | Full backup including ANN sidecar files |
+| `db.transaction()` | Begin an atomic transaction |
+| `db.close()` | Flush pending state, release the file lock, and invalidate the handle |
 
 ## Filter Operators
 

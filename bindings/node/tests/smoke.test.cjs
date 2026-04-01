@@ -45,6 +45,36 @@ test('store and text helpers', () => {
   assert.equal(store.collections()[0], 'products')
 })
 
+test('count/list/deleteByFilter/close and lockTimeout are exposed in node wrapper', () => {
+  const dbPath = tempPath('node-wrapper.vdb')
+  const db = vectlite.open(dbPath, { dimension: 2 })
+
+  db.upsert('user-1', [1, 0], { type: 'user', score: 10 }, { namespace: 'users' })
+  db.upsert('user-2', [0.8, 0.2], { type: 'user', score: 3 }, { namespace: 'users' })
+  db.upsert('feedback-1', [0, 1], { type: 'feedback', score: 2 }, { namespace: 'feedback' })
+
+  assert.equal(db.count(), 3)
+  assert.equal(db.count({ namespace: 'users' }), 2)
+  assert.equal(db.count({ filter: { type: 'user' } }), 2)
+  assert.equal(db.count({ namespace: 'users', filter: { score: { $gt: 5 } } }), 1)
+
+  const listed = db.list({ namespace: 'users', filter: { type: 'user' }, limit: 1 })
+  assert.equal(listed.length, 1)
+  assert.equal(listed[0].namespace, 'users')
+
+  assert.equal(db.deleteByFilter({ type: 'feedback' }, { namespace: 'feedback' }), 1)
+  assert.equal(db.count(), 2)
+
+  assert.throws(() => vectlite.open(dbPath, { lockTimeout: 0.05 }), /lock contention/)
+  assert.throws(() => vectlite.open(dbPath, { lockTimeout: -1 }), /lock_timeout/)
+
+  db.close()
+
+  assert.throws(() => db.count(), /database is closed/)
+  assert.throws(() => db.get('user-1'), /database is closed/)
+  assert.throws(() => db.list(), /database is closed/)
+})
+
 test('text helpers support async embedders', async () => {
   const dbPath = tempPath('knowledge-async.vdb')
   const db = vectlite.open(dbPath, { dimension: 2 })

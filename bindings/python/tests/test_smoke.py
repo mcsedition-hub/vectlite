@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 import pytest
@@ -666,3 +667,172 @@ def test_analyzers_ngrams() -> None:
     assert "hel" in tokens
     assert "ell" in tokens
     assert "llo" in tokens
+
+
+def test_close_and_context_manager(tmp_path: Path) -> None:
+    """db.close() releases the lock; context manager auto-closes."""
+    path = tmp_path / "close.vdb"
+
+    # Explicit close
+    db = vectlite.open(str(path), dimension=2)
+    db.upsert("doc1", [1.0, 0.0], {"source": "a"})
+    db.close()
+
+    # After close, the lock is released - we can reopen
+    db2 = vectlite.open(str(path))
+    assert len(db2) == 1
+    db2.close()
+
+    # Context manager auto-closes
+    with vectlite.open(str(path)) as db3:
+        db3.upsert("doc2", [0.0, 1.0], {"source": "b"})
+        assert len(db3) == 2
+
+    # Lock released, can reopen
+    db4 = vectlite.open(str(path))
+    assert len(db4) == 2
+    db4.close()
+
+
+def test_close_raises_on_use_after_close(tmp_path: Path) -> None:
+    """Using a closed database raises an error."""
+    path = tmp_path / "closed_use.vdb"
+    db = vectlite.open(str(path), dimension=2)
+    db.upsert("doc1", [1.0, 0.0], {"source": "docs"})
+    db.close()
+
+    with pytest.raises(vectlite.VectLiteError, match="closed"):
+        db.upsert("doc2", [0.0, 1.0])
+
+    with pytest.raises(vectlite.VectLiteError, match="closed"):
+        db.get("doc1")
+
+    with pytest.raises(vectlite.VectLiteError, match="closed"):
+        db.count()
+
+    with pytest.raises(vectlite.VectLiteError, match="closed"):
+        db.list()
+
+    with pytest.raises(vectlite.VectLiteError, match="closed"):
+        db.search([1.0, 0.0])
+
+
+def test_list_without_vector(tmp_path: Path) -> None:
+    """db.list() returns records without requiring a vector query."""
+    path = tmp_path / "list.vdb"
+    db = vectlite.open(str(path), dimension=2)
+
+    db.upsert("doc1", [1.0, 0.0], {"type": "user", "score": 10}, namespace="users")
+    db.upsert("doc2", [0.0, 1.0], {"type": "feedback", "score": 5}, namespace="feedback")
+    db.upsert("doc3", [0.5, 0.5], {"type": "user", "score": 3}, namespace="users")
+
+    # List all
+    all_records = db.list()
+    assert len(all_records) == 3
+
+    # List by namespace
+    user_records = db.list(namespace="users")
+    assert len(user_records) == 2
+    assert all(r["namespace"] == "users" for r in user_records)
+
+    # List with filter
+    high_score = db.list(filter={"score": {"$gt": 4}})
+    assert len(high_score) == 2
+
+    # List with namespace + filter
+    user_high = db.list(namespace="users", filter={"score": {"$gt": 5}})
+    assert len(user_high) == 1
+    assert user_high[0]["id"] == "doc1"
+
+    # Pagination
+    page1 = db.list(limit=2)
+    page2 = db.list(limit=2, offset=2)
+    assert len(page1) == 2
+    assert len(page2) == 1
+
+
+def test_delete_by_filter(tmp_path: Path) -> None:
+    """db.delete_by_filter() removes matching records."""
+    path = tmp_path / "del_filter.vdb"
+    db = vectlite.open(str(path), dimension=2)
+
+    db.upsert("doc1", [1.0, 0.0], {"type": "feedback"}, namespace="feedback")
+    db.upsert("doc2", [0.0, 1.0], {"type": "feedback"}, namespace="feedback")
+    db.upsert("doc3", [0.5, 0.5], {"type": "user"}, namespace="users")
+    assert len(db) == 3
+
+    # Delete all feedback
+    deleted = db.delete_by_filter({"type": "feedback"}, namespace="feedback")
+    assert deleted == 2
+    assert len(db) == 1
+    assert db.get("doc3", namespace="users") is not None
+
+    # Delete with no matches returns 0
+    deleted = db.delete_by_filter({"type": "nonexistent"})
+    assert deleted == 0
+
+
+def test_count_with_namespace_and_filter(tmp_path: Path) -> None:
+    """db.count() supports namespace and filter parameters."""
+    path = tmp_path / "count.vdb"
+    db = vectlite.open(str(path), dimension=2)
+
+    db.upsert("doc1", [1.0, 0.0], {"type": "user", "score": 10}, namespace="users")
+    db.upsert("doc2", [0.0, 1.0], {"type": "feedback"}, namespace="feedback")
+    db.upsert("doc3", [0.5, 0.5], {"type": "user", "score": 3}, namespace="users")
+
+    # Total count
+    assert db.count() == 3
+
+    # Count by namespace
+    assert db.count(namespace="users") == 2
+    assert db.count(namespace="feedback") == 1
+    assert db.count(namespace="nonexistent") == 0
+
+    # Count with filter
+    assert db.count(filter={"type": "user"}) == 2
+
+    # Count with namespace + filter
+    assert db.count(namespace="users", filter={"score": {"$gt": 5}}) == 1
+
+
+def test_lock_contention_raises_specific_exception(tmp_path: Path) -> None:
+    """Lock contention raises VectLiteLockError (subclass of VectLiteError)."""
+    path = tmp_path / "locktype.vdb"
+    db = vectlite.open(str(path), dimension=2)
+    db.upsert("doc1", [1.0, 0.0])
+
+    # VectLiteLockError should be catchable as both itself and VectLiteError
+    with pytest.raises(vectlite.VectLiteLockError):
+        vectlite.open(str(path))
+
+    with pytest.raises(vectlite.VectLiteError):
+        vectlite.open(str(path))
+
+    del db
+
+
+def test_lock_timeout(tmp_path: Path) -> None:
+    """lock_timeout parameter retries before giving up."""
+    path = tmp_path / "timeout.vdb"
+    db = vectlite.open(str(path), dimension=2)
+    db.upsert("doc1", [1.0, 0.0])
+
+    # With a very short timeout, should still fail (lock is held)
+    with pytest.raises(vectlite.VectLiteLockError):
+        vectlite.open(str(path), lock_timeout=0.1)
+
+    del db
+
+
+def test_lock_timeout_rejects_invalid_values(tmp_path: Path) -> None:
+    """lock_timeout must be finite and non-negative."""
+    path = tmp_path / "invalid-timeout.vdb"
+    db = vectlite.open(str(path), dimension=2)
+    db.close()
+
+    with pytest.raises(vectlite.VectLiteError, match="lock_timeout"):
+        vectlite.open(str(path), lock_timeout=-1.0)
+
+    with pytest.raises(vectlite.VectLiteError, match="lock_timeout"):
+        vectlite.open(str(path), lock_timeout=math.nan)

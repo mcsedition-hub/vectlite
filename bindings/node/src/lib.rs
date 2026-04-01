@@ -133,9 +133,21 @@ impl NativeDatabase {
     }
 
     #[napi]
-    pub fn count(&self) -> Result<u32> {
+    pub fn count(&self, namespace: Option<String>, filter_json: Option<String>) -> Result<u32> {
+        let filter = filter_json
+            .as_ref()
+            .map(|json_str| {
+                let value: serde_json::Value = serde_json::from_str(json_str)
+                    .map_err(|e| err(format!("invalid filter JSON: {e}")))?;
+                json_to_filter(&value)
+            })
+            .transpose()?;
+        if namespace.is_none() && filter.is_none() {
+            let database = self.read()?;
+            return Ok(database.len() as u32);
+        }
         let database = self.read()?;
-        Ok(database.len() as u32)
+        Ok(database.count_filtered(namespace.as_deref(), filter.as_ref()) as u32)
     }
 
     #[napi]
@@ -145,11 +157,63 @@ impl NativeDatabase {
     }
 
     #[napi]
-    pub fn transaction(&self) -> NativeTransaction {
-        NativeTransaction {
+    pub fn close(&self) -> Result<()> {
+        let mut database = self.write()?;
+        database.close().map_err(to_napi_error)
+    }
+
+    #[napi]
+    pub fn list(
+        &self,
+        namespace: Option<String>,
+        filter_json: Option<String>,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<String> {
+        let filter = filter_json
+            .as_ref()
+            .map(|json_str| {
+                let value: serde_json::Value = serde_json::from_str(json_str)
+                    .map_err(|e| err(format!("invalid filter JSON: {e}")))?;
+                json_to_filter(&value)
+            })
+            .transpose()?;
+        let records = {
+            let database = self.read()?;
+            database
+                .list(
+                    namespace.as_deref(),
+                    filter.as_ref(),
+                    limit.unwrap_or(0) as usize,
+                    offset.unwrap_or(0) as usize,
+                )
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let json_records: Vec<Value> = records.iter().map(record_to_json).collect();
+        stringify_value(Value::Array(json_records))
+    }
+
+    #[napi(js_name = "deleteByFilter")]
+    pub fn delete_by_filter(&self, filter_json: String, namespace: Option<String>) -> Result<u32> {
+        let value: serde_json::Value = serde_json::from_str(&filter_json)
+            .map_err(|e| err(format!("invalid filter JSON: {e}")))?;
+        let filter = json_to_filter(&value)?;
+        let mut database = self.write_open()?;
+        database
+            .delete_by_filter(namespace.as_deref(), &filter)
+            .map(|count| count as u32)
+            .map_err(to_napi_error)
+    }
+
+    #[napi]
+    pub fn transaction(&self) -> Result<NativeTransaction> {
+        drop(self.read()?);
+        Ok(NativeTransaction {
             inner: Arc::clone(&self.inner),
             staged: Mutex::new(TransactionState::default()),
-        }
+        })
     }
 
     #[napi]
@@ -166,7 +230,7 @@ impl NativeDatabase {
         let sparse = parse_sparse_json(sparse_json)?;
         let vectors = parse_named_vectors_json(vectors_json)?;
         let vector = js_vector_to_core(vector, "vector")?;
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database
             .insert_with_vectors_in_namespace(
                 namespace.unwrap_or_default(),
@@ -193,7 +257,7 @@ impl NativeDatabase {
         let sparse = parse_sparse_json(sparse_json)?;
         let vectors = parse_named_vectors_json(vectors_json)?;
         let vector = js_vector_to_core(vector, "vector")?;
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database
             .upsert_with_vectors_in_namespace(
                 namespace.unwrap_or_default(),
@@ -209,7 +273,7 @@ impl NativeDatabase {
     #[napi(js_name = "insertMany")]
     pub fn insert_many(&self, records_json: String, namespace: Option<String>) -> Result<u32> {
         let records = parse_record_batch_json(&records_json, namespace.as_deref())?;
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database
             .insert_many(records)
             .map(|count| count as u32)
@@ -219,7 +283,7 @@ impl NativeDatabase {
     #[napi(js_name = "upsertMany")]
     pub fn upsert_many(&self, records_json: String, namespace: Option<String>) -> Result<u32> {
         let records = parse_record_batch_json(&records_json, namespace.as_deref())?;
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database
             .upsert_many(records)
             .map(|count| count as u32)
@@ -234,7 +298,7 @@ impl NativeDatabase {
         batch_size: u32,
     ) -> Result<u32> {
         let records = parse_record_batch_json(&records_json, namespace.as_deref())?;
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database
             .bulk_ingest(records, batch_size as usize)
             .map(|count| count as u32)
@@ -257,7 +321,7 @@ impl NativeDatabase {
 
     #[napi]
     pub fn delete(&self, id: String, namespace: Option<String>) -> Result<bool> {
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database
             .delete_in_namespace(&namespace.unwrap_or_default(), &id)
             .map_err(to_napi_error)
@@ -265,7 +329,7 @@ impl NativeDatabase {
 
     #[napi(js_name = "deleteMany")]
     pub fn delete_many(&self, ids: Vec<String>, namespace: Option<String>) -> Result<u32> {
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database
             .delete_many_in_namespace(&namespace.unwrap_or_default(), ids)
             .map(|count| count as u32)
@@ -274,13 +338,13 @@ impl NativeDatabase {
 
     #[napi]
     pub fn flush(&self) -> Result<()> {
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database.flush().map_err(to_napi_error)
     }
 
     #[napi]
     pub fn compact(&self) -> Result<()> {
-        let mut database = self.write()?;
+        let mut database = self.write_open()?;
         database.compact().map_err(to_napi_error)
     }
 
@@ -478,15 +542,28 @@ impl NativeTransaction {
 
 impl NativeDatabase {
     fn read(&self) -> Result<RwLockReadGuard<'_, CoreDatabase>> {
-        self.inner
+        let database = self
+            .inner
             .read()
-            .map_err(|_| err("database read lock poisoned"))
+            .map_err(|_| err("database read lock poisoned"))?;
+        if database.is_closed() {
+            return Err(to_napi_error(closed_database_error()));
+        }
+        Ok(database)
     }
 
     fn write(&self) -> Result<RwLockWriteGuard<'_, CoreDatabase>> {
         self.inner
             .write()
             .map_err(|_| err("database write lock poisoned"))
+    }
+
+    fn write_open(&self) -> Result<RwLockWriteGuard<'_, CoreDatabase>> {
+        let database = self.write()?;
+        if database.is_closed() {
+            return Err(to_napi_error(closed_database_error()));
+        }
+        Ok(database)
     }
 
     fn execute_search(
@@ -522,18 +599,40 @@ impl NativeDatabase {
 }
 
 #[napi]
-pub fn open(path: String, dimension: Option<u32>, read_only: bool) -> Result<NativeDatabase> {
+pub fn open(
+    path: String,
+    dimension: Option<u32>,
+    read_only: bool,
+    lock_timeout: Option<f64>,
+) -> Result<NativeDatabase> {
     let database = if read_only {
         if !Path::new(&path).exists() {
             return Err(err("cannot open non-existent database in read-only mode"));
         }
-        CoreDatabase::open_read_only(&path).map_err(to_napi_error)?
+        match lock_timeout {
+            Some(timeout) => CoreDatabase::open_read_only_with_timeout(&path, Some(timeout))
+                .map_err(to_napi_error)?,
+            None => CoreDatabase::open_read_only(&path).map_err(to_napi_error)?,
+        }
     } else if Path::new(&path).exists() {
-        match dimension {
-            Some(dimension) => {
+        match (dimension, lock_timeout) {
+            (Some(dimension), Some(timeout)) => {
+                let db = CoreDatabase::open_with_timeout(&path, timeout).map_err(to_napi_error)?;
+                if db.dimension() != dimension as usize {
+                    return Err(to_napi_error(vectlite::VectLiteError::DimensionMismatch {
+                        expected: db.dimension(),
+                        found: dimension as usize,
+                    }));
+                }
+                db
+            }
+            (Some(dimension), None) => {
                 CoreDatabase::open_or_create(&path, dimension as usize).map_err(to_napi_error)?
             }
-            None => CoreDatabase::open(&path).map_err(to_napi_error)?,
+            (None, Some(timeout)) => {
+                CoreDatabase::open_with_timeout(&path, timeout).map_err(to_napi_error)?
+            }
+            (None, None) => CoreDatabase::open(&path).map_err(to_napi_error)?,
         }
     } else {
         let Some(dimension) = dimension else {
@@ -1211,4 +1310,8 @@ fn err(message: impl Into<String>) -> NapiError {
 
 fn to_napi_error(error: vectlite::VectLiteError) -> NapiError {
     err(error.to_string())
+}
+
+fn closed_database_error() -> vectlite::VectLiteError {
+    vectlite::VectLiteError::InvalidFormat("database is closed".to_owned())
 }

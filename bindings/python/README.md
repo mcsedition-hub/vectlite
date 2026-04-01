@@ -21,18 +21,16 @@ Requires Python 3.9+. Pre-built wheels are available for macOS (x86_64, arm64), 
 ```python
 import vectlite
 
-# Create or open a database
-db = vectlite.open("knowledge.vdb", dimension=384)
+with vectlite.open("knowledge.vdb", dimension=384) as db:
+    # Insert records with vectors, metadata, and sparse terms
+    db.upsert("doc1", embedding, {"source": "blog", "title": "Auth Guide"})
+    db.upsert("doc2", embedding2, {"source": "notes", "title": "Billing"})
 
-# Insert records with vectors, metadata, and sparse terms
-db.upsert("doc1", embedding, {"source": "blog", "title": "Auth Guide"})
-db.upsert("doc2", embedding2, {"source": "notes", "title": "Billing"})
+    # Search with filters
+    results = db.search(embedding_query, k=5, filter={"source": "blog"})
 
-# Search with filters
-results = db.search(embedding_query, k=5, filter={"source": "blog"})
-
-# Clean up
-db.compact()
+    # Query-free inspection
+    print(db.count(filter={"source": "blog"}))
 ```
 
 ## Features
@@ -63,9 +61,13 @@ db.compact()
 
 - **Physical collections** -- `vectlite.open_store()` manages a directory of independent databases
 - **Bulk ingestion** -- `bulk_ingest()` with deferred index rebuilds for fast imports
+- **Listing & filtered counts** -- `list()` and `count(namespace=..., filter=...)` without a vector query
+- **Delete by filter** -- remove matching records across a namespace slice in one call
 - **Snapshots** -- `db.snapshot(path)` creates a self-contained copy
 - **Backup / Restore** -- `db.backup(dir)` and `vectlite.restore(dir, path)` for full roundtrips
 - **Read-only mode** -- `vectlite.open(path, read_only=True)` for safe concurrent readers
+- **Explicit close** -- `db.close()` or `with vectlite.open(...) as db:` to release locks deterministically
+- **Lock timeouts** -- `lock_timeout=` retries for bounded lock acquisition waits
 - **Text analyzers** -- configurable tokenizer pipeline with stopwords, stemming, and n-grams
 
 ## Usage
@@ -181,9 +183,21 @@ restored = vectlite.restore("/backups/full/", "restored.vdb")
 ### Read-Only Mode
 
 ```python
-ro = vectlite.open("knowledge.vdb", read_only=True)
+ro = vectlite.open("knowledge.vdb", read_only=True, lock_timeout=5.0)
 results = ro.search(query, k=5)  # Reads work
 ro.upsert(...)                    # Raises VectLiteError
+```
+
+### Listing, Counting, and Lifecycle
+
+```python
+db = vectlite.open("knowledge.vdb", dimension=384, lock_timeout=5.0)
+
+records = db.list(namespace="docs", filter={"stale": False}, limit=20)
+count = db.count(namespace="docs", filter={"source": "blog"})
+deleted = db.delete_by_filter({"stale": True}, namespace="docs")
+
+db.close()
 ```
 
 ### Search Diagnostics
@@ -226,6 +240,7 @@ print(outcome["results"][0]["explain"])  # Detailed scoring breakdown
 | `db.bulk_ingest(records, namespace=None, batch_size=10000)` | Fastest bulk import with batched WAL writes |
 | `db.delete(id, namespace=None)` | Delete a single record |
 | `db.delete_many(ids, namespace=None)` | Delete multiple records by id |
+| `db.delete_by_filter(filter, namespace=None)` | Delete all matching records in one filtered pass |
 
 ### Read Methods
 
@@ -234,7 +249,8 @@ print(outcome["results"][0]["explain"])  # Detailed scoring breakdown
 | `db.get(id, namespace=None)` | Get a single record by id |
 | `db.search(query, k=10, ...)` | Search and return a list of results |
 | `db.search_with_stats(query, k=10, ...)` | Search with detailed performance stats |
-| `db.count()` or `len(db)` | Number of records in the database |
+| `db.count(namespace=None, filter=None)` or `len(db)` | Count records, optionally scoped by namespace/filter |
+| `db.list(namespace=None, filter=None, limit=0, offset=0)` | List records without issuing a vector query |
 | `db.namespaces()` | List all namespaces |
 | `db.dimension` | Vector dimension (property) |
 | `db.path` | Database file path (property) |
@@ -249,6 +265,8 @@ print(outcome["results"][0]["explain"])  # Detailed scoring breakdown
 | `db.snapshot(dest)` | Create a self-contained `.vdb` copy |
 | `db.backup(dest_dir)` | Full backup including ANN sidecar files |
 | `db.transaction()` | Begin an atomic transaction (use as context manager) |
+| `db.close()` | Flush pending state, release the file lock, and invalidate the handle |
+| `with vectlite.open(...):` | Python context-manager form of automatic close |
 
 ## How It Works
 

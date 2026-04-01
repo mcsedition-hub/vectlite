@@ -82,6 +82,16 @@ export interface WriteOptions {
   vectors?: NamedVectors | null
 }
 
+export interface CountOptions {
+  namespace?: string | null
+  filter?: Filter | null
+}
+
+export interface ListOptions extends CountOptions {
+  limit?: number | null
+  offset?: number | null
+}
+
 export interface BulkIngestOptions {
   namespace?: string | null
   batchSize?: number
@@ -108,6 +118,7 @@ export interface SearchOptions {
 export interface OpenOptions {
   dimension?: number | null
   readOnly?: boolean
+  lockTimeout?: number | null
 }
 
 export class VectLiteError extends Error {}
@@ -130,8 +141,10 @@ export class Database {
   readonly dimension: number
   readonly readOnly: boolean
 
-  count(): number
+  count(options?: CountOptions): number
   namespaces(): string[]
+  close(): void
+  list(options?: ListOptions): Record[]
   transaction(): Transaction
   insert(id: string, vector: number[], metadata?: Metadata | null, options?: WriteOptions): void
   upsert(id: string, vector: number[], metadata?: Metadata | null, options?: WriteOptions): void
@@ -141,6 +154,7 @@ export class Database {
   get(id: string, options?: { namespace?: string | null }): Record | null
   delete(id: string, options?: { namespace?: string | null }): boolean
   deleteMany(ids: string[], options?: { namespace?: string | null }): number
+  deleteByFilter(filter: Filter, options?: { namespace?: string | null }): number
   flush(): void
   compact(): void
   snapshot(dest: string): void

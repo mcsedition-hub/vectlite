@@ -6,6 +6,26 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-04-01
+
+### Added
+
+- Python and Node bindings now expose explicit database lifecycle controls with `close()` and context-manager-safe close semantics on Python `Database` objects.
+- Both bindings now support query-free record scanning with `list(...)`, filtered/scoped record counts, and bulk removal by metadata filter.
+- Open calls now support lock wait timeouts across both read-write and read-only entry points (`lock_timeout` in Python, `lockTimeout` in Node).
+
+### Changed
+
+- The repository README plus the Python and Node package READMEs now document the new lifecycle, listing, filtered count, delete-by-filter, and lock-timeout APIs.
+- The Node package version is now aligned with the workspace release version again so npm and PyPI releases can be cut from the same source state with matching `0.1.11` tags.
+
+### Fixed
+
+- `close()` now propagates persistence failures instead of silently swallowing WAL compaction errors before releasing the lock.
+- Closed databases now fail consistently on public result-bearing operations instead of sometimes behaving like empty databases.
+- Invalid lock-timeout inputs such as negative values or `NaN` now raise normal vectlite validation errors instead of risking a panic in Rust.
+- The Node wrapper/types and Python stubs are now kept in sync with the runtime surface for `close`, filtered `count`, `list`, `deleteByFilter` / `delete_by_filter`, and lock-timeout options.
+
 ## [0.1.10] - 2026-03-31
 
 ### Added

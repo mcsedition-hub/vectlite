@@ -8,7 +8,16 @@ from importlib.metadata import version as _pkg_version
 from typing import Any
 
 from . import analyzers, rerankers
-from ._vectlite import Database, Store, Transaction, VectLiteError, open, open_store, restore
+from ._vectlite import (
+    Database,
+    Store,
+    Transaction,
+    VectLiteError,
+    VectLiteLockError,
+    open,
+    open_store,
+    restore,
+)
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -153,6 +162,7 @@ __all__ = [
     "Store",
     "Transaction",
     "VectLiteError",
+    "VectLiteLockError",
     "open",
     "open_store",
     "rerankers",

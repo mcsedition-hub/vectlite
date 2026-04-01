@@ -209,12 +209,29 @@ class Database {
     return wrapError(() => this._native.readOnly)
   }
 
-  count() {
-    return wrapError(() => this._native.count())
+  count(options = {}) {
+    return wrapError(() => this._native.count(options.namespace ?? null, encode(options.filter)))
   }
 
   namespaces() {
     return wrapError(() => this._native.namespaces())
+  }
+
+  close() {
+    return wrapError(() => this._native.close())
+  }
+
+  list(options = {}) {
+    return wrapError(() =>
+      decode(
+        this._native.list(
+          options.namespace ?? null,
+          encode(options.filter),
+          options.limit ?? null,
+          options.offset ?? null,
+        ),
+      ),
+    )
   }
 
   transaction() {
@@ -259,6 +276,10 @@ class Database {
 
   deleteMany(ids, options = {}) {
     return wrapError(() => this._native.deleteMany(ids, options.namespace ?? null))
+  }
+
+  deleteByFilter(filter, options = {}) {
+    return wrapError(() => this._native.deleteByFilter(encode(filter), options.namespace ?? null))
   }
 
   flush() {
@@ -323,7 +344,9 @@ class Store {
 }
 
 function open(path, options = {}) {
-  return wrapError(() => new Database(native.open(path, options.dimension ?? null, options.readOnly ?? false)))
+  return wrapError(() =>
+    new Database(native.open(path, options.dimension ?? null, options.readOnly ?? false, options.lockTimeout ?? null)),
+  )
 }
 
 function openStore(root) {

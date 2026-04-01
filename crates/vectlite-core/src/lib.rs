@@ -810,12 +810,44 @@ impl Database {
         Ok(database)
     }
 
+    /// Open an existing database with a lock timeout in seconds.
+    /// If the lock cannot be acquired within the timeout, returns
+    /// `VectLiteError::LockContention`.
+    pub fn open_with_timeout(path: impl AsRef<Path>, timeout_secs: f64) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let timeout = timeout_duration(timeout_secs, "lock_timeout")?;
+        let lock = acquire_exclusive_lock_with_timeout(&path, Some(timeout))?;
+        let mut file = File::open(&path)?;
+        let mut database = Self::read_from(&path, &mut file)?;
+        database._lock_file = Some(lock);
+        database.read_only = false;
+        database.replay_wal()?;
+        database.rebuild_sparse_index();
+        database.ann_loaded_from_disk = database.try_load_ann_from_disk();
+        if !database.ann_loaded_from_disk {
+            database.rebuild_ann();
+        }
+        Ok(database)
+    }
+
     /// Open an existing database in read-only mode. Acquires a shared lock
     /// so multiple readers can coexist. All write operations will return
     /// `VectLiteError::ReadOnly`.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_with_timeout(path, None)
+    }
+
+    /// Open an existing database in read-only mode, optionally waiting for a
+    /// shared lock to become available.
+    pub fn open_read_only_with_timeout(
+        path: impl AsRef<Path>,
+        timeout_secs: Option<f64>,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let lock = acquire_shared_lock(&path)?;
+        let timeout = timeout_secs
+            .map(|seconds| timeout_duration(seconds, "lock_timeout"))
+            .transpose()?;
+        let lock = acquire_shared_lock_with_timeout(&path, timeout)?;
         let mut file = File::open(&path)?;
         let mut database = Self::read_from(&path, &mut file)?;
         database._lock_file = Some(lock);
@@ -833,7 +865,43 @@ impl Database {
         self.read_only
     }
 
+    /// Returns true if the database has been closed.
+    pub fn is_closed(&self) -> bool {
+        self._lock_file.is_none() && self.records.is_empty() && self.dimension == 0
+    }
+
+    /// Close the database: flush WAL (if writable), release the file lock,
+    /// and clear all in-memory state.  After calling this, any further
+    /// operation will return an error.
+    pub fn close(&mut self) -> Result<()> {
+        if self.is_closed() {
+            return Ok(());
+        }
+        // Flush WAL to main file if writable
+        if !self.read_only {
+            self.compact_inner()?;
+        }
+        // Release the lock by dropping the file handle
+        self._lock_file = None;
+        // Clear in-memory state
+        self.records.clear();
+        self.ann = AnnCatalog::default();
+        self.sparse_index = SparseIndex::default();
+        self.dimension = 0;
+        Ok(())
+    }
+
+    fn check_open(&self) -> Result<()> {
+        if self.is_closed() {
+            return Err(VectLiteError::InvalidFormat(
+                "database is closed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn check_writable(&self) -> Result<()> {
+        self.check_open()?;
         if self.read_only {
             return Err(VectLiteError::ReadOnly);
         }
@@ -869,6 +937,95 @@ impl Database {
 
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+
+    /// Count records, optionally filtered by namespace and/or metadata filter.
+    pub fn count_filtered(
+        &self,
+        namespace: Option<&str>,
+        filter: Option<&MetadataFilter>,
+    ) -> usize {
+        self.records
+            .iter()
+            .filter(|((ns, _), record)| {
+                if let Some(target_ns) = namespace {
+                    if ns != target_ns {
+                        return false;
+                    }
+                }
+                if let Some(filter) = filter {
+                    if !filter.matches(&record.metadata) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .count()
+    }
+
+    /// List records by namespace and/or metadata filter without requiring a
+    /// vector query.  Returns records ordered by (namespace, id).
+    pub fn list(
+        &self,
+        namespace: Option<&str>,
+        filter: Option<&MetadataFilter>,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<&Record> {
+        self.records
+            .iter()
+            .filter(|((ns, _), record)| {
+                if let Some(target_ns) = namespace {
+                    if ns != target_ns {
+                        return false;
+                    }
+                }
+                if let Some(filter) = filter {
+                    if !filter.matches(&record.metadata) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .skip(offset)
+            .take(if limit == 0 { usize::MAX } else { limit })
+            .map(|(_, record)| record)
+            .collect()
+    }
+
+    /// Delete all records matching a filter, optionally within a namespace.
+    /// Returns the number of records deleted.
+    pub fn delete_by_filter(
+        &mut self,
+        namespace: Option<&str>,
+        filter: &MetadataFilter,
+    ) -> Result<usize> {
+        self.check_writable()?;
+        let keys_to_delete: Vec<(String, String)> = self
+            .records
+            .iter()
+            .filter(|((ns, _), record)| {
+                if let Some(target_ns) = namespace {
+                    if ns != target_ns {
+                        return false;
+                    }
+                }
+                filter.matches(&record.metadata)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        let count = keys_to_delete.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let ops: Vec<WalOp> = keys_to_delete
+            .into_iter()
+            .map(|(namespace, id)| WalOp::Delete { namespace, id })
+            .collect();
+        self.apply_wal_batch(ops)?;
+        Ok(count)
     }
 
     pub fn insert(
@@ -1267,6 +1424,7 @@ impl Database {
         options: HybridSearchOptions,
         namespace: Option<&str>,
     ) -> Result<SearchOutcome> {
+        self.check_open()?;
         if let Some(query) = dense_query {
             self.validate_vector(query)?;
         }
@@ -1479,6 +1637,7 @@ impl Database {
     /// self-contained `.vdb` file (WAL is folded in). The current database is
     /// not modified. Works in both read-only and read-write mode.
     pub fn snapshot(&self, dest: impl AsRef<Path>) -> Result<()> {
+        self.check_open()?;
         let dest = dest.as_ref();
         if let Some(parent) = dest.parent() {
             if !parent.as_os_str().is_empty() {
@@ -1499,6 +1658,7 @@ impl Database {
     /// including the `.vdb` file and ANN sidecar files. The backup is
     /// compacted (WAL folded in). Works in both read-only and read-write mode.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
+        self.check_open()?;
         let dest = dest.as_ref();
         fs::create_dir_all(dest)?;
 
@@ -2459,6 +2619,15 @@ fn candidate_count(top_k: usize, total: usize) -> usize {
         .min(total)
 }
 
+fn timeout_duration(timeout_secs: f64, label: &str) -> Result<std::time::Duration> {
+    if !timeout_secs.is_finite() || timeout_secs < 0.0 {
+        return Err(VectLiteError::InvalidFormat(format!(
+            "{label} must be a finite, non-negative number of seconds"
+        )));
+    }
+    Ok(std::time::Duration::from_secs_f64(timeout_secs))
+}
+
 fn wal_path(path: &Path) -> PathBuf {
     let mut wal = path.as_os_str().to_os_string();
     wal.push(".wal");
@@ -2472,6 +2641,13 @@ fn lock_path(path: &Path) -> PathBuf {
 }
 
 fn acquire_exclusive_lock(path: &Path) -> Result<File> {
+    acquire_exclusive_lock_with_timeout(path, None)
+}
+
+fn acquire_exclusive_lock_with_timeout(
+    path: &Path,
+    timeout: Option<std::time::Duration>,
+) -> Result<File> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             fs::create_dir_all(parent)?;
@@ -2483,16 +2659,43 @@ fn acquire_exclusive_lock(path: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .open(lock_path(path))?;
-    file.try_lock_exclusive().map_err(|err| {
-        VectLiteError::LockContention(format!(
-            "could not acquire exclusive lock on '{}': {err}",
-            path.display()
-        ))
-    })?;
+
+    match timeout {
+        None => {
+            file.try_lock_exclusive().map_err(|err| {
+                VectLiteError::LockContention(format!(
+                    "could not acquire exclusive lock on '{}': {err}",
+                    path.display()
+                ))
+            })?;
+        }
+        Some(duration) => {
+            let start = Instant::now();
+            let interval = std::time::Duration::from_millis(50);
+            loop {
+                match file.try_lock_exclusive() {
+                    Ok(()) => break,
+                    Err(err) => {
+                        if start.elapsed() >= duration {
+                            return Err(VectLiteError::LockContention(format!(
+                                "could not acquire exclusive lock on '{}' after {:.1}s: {err}",
+                                path.display(),
+                                duration.as_secs_f64()
+                            )));
+                        }
+                        std::thread::sleep(interval);
+                    }
+                }
+            }
+        }
+    }
     Ok(file)
 }
 
-fn acquire_shared_lock(path: &Path) -> Result<File> {
+fn acquire_shared_lock_with_timeout(
+    path: &Path,
+    timeout: Option<std::time::Duration>,
+) -> Result<File> {
     let lock_file = lock_path(path);
     if !lock_file.exists() {
         // Lock file may not exist yet for read-only opens on existing dbs
@@ -2508,12 +2711,36 @@ fn acquire_shared_lock(path: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .open(&lock_file)?;
-    file.try_lock_shared().map_err(|err| {
-        VectLiteError::LockContention(format!(
-            "could not acquire shared lock on '{}': {err}",
-            path.display()
-        ))
-    })?;
+
+    match timeout {
+        None => {
+            file.try_lock_shared().map_err(|err| {
+                VectLiteError::LockContention(format!(
+                    "could not acquire shared lock on '{}': {err}",
+                    path.display()
+                ))
+            })?;
+        }
+        Some(duration) => {
+            let start = Instant::now();
+            let interval = std::time::Duration::from_millis(50);
+            loop {
+                match file.try_lock_shared() {
+                    Ok(()) => break,
+                    Err(err) => {
+                        if start.elapsed() >= duration {
+                            return Err(VectLiteError::LockContention(format!(
+                                "could not acquire shared lock on '{}' after {:.1}s: {err}",
+                                path.display(),
+                                duration.as_secs_f64()
+                            )));
+                        }
+                        std::thread::sleep(interval);
+                    }
+                }
+            }
+        }
+    }
     Ok(file)
 }
 
@@ -3138,7 +3365,7 @@ fn usize_from_u64(value: u64) -> Result<usize> {
 mod tests {
     use super::{
         Database, HybridSearchOptions, Metadata, MetadataFilter, MetadataValue, NamedVectors,
-        Record, SearchOptions, SparseVector,
+        Record, SearchOptions, SparseVector, VectLiteError,
     };
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3636,6 +3863,69 @@ mod tests {
         assert_eq!(mmr_outcome.stats.fetch_k, 3);
         assert_eq!(mmr_outcome.stats.considered_count, 3);
 
+        cleanup(&path);
+    }
+
+    #[test]
+    fn closed_database_rejects_result_based_operations() {
+        let path = temp_file("closed-db");
+        let snapshot = temp_file("closed-db-snapshot");
+        let mut database = Database::create(&path, 2).expect("create database");
+        database
+            .insert("doc1", vec![1.0, 0.0], Metadata::new())
+            .expect("insert doc1");
+        database.close().expect("close database");
+
+        let search_err = database
+            .search(
+                &[1.0, 0.0],
+                SearchOptions {
+                    top_k: 1,
+                    filter: None,
+                },
+            )
+            .expect_err("search on closed database should fail");
+        assert!(matches!(
+            search_err,
+            VectLiteError::InvalidFormat(message) if message.contains("database is closed")
+        ));
+
+        let snapshot_err = database
+            .snapshot(&snapshot)
+            .expect_err("snapshot on closed database should fail");
+        assert!(matches!(
+            snapshot_err,
+            VectLiteError::InvalidFormat(message) if message.contains("database is closed")
+        ));
+
+        cleanup(&path);
+        cleanup(&snapshot);
+    }
+
+    #[test]
+    fn lock_timeout_must_be_non_negative_and_finite() {
+        let path = temp_file("timeout-validation");
+        let database = Database::create(&path, 2).expect("create database");
+
+        let negative_err = match Database::open_with_timeout(&path, -1.0) {
+            Ok(_) => panic!("negative lock timeout should fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            negative_err,
+            VectLiteError::InvalidFormat(message) if message.contains("lock_timeout")
+        ));
+
+        let nan_err = match Database::open_with_timeout(&path, f64::NAN) {
+            Ok(_) => panic!("NaN lock timeout should fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            nan_err,
+            VectLiteError::InvalidFormat(message) if message.contains("lock_timeout")
+        ));
+
+        drop(database);
         cleanup(&path);
     }
 
