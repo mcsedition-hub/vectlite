@@ -41,6 +41,7 @@ with vectlite.open("knowledge.vdb", dimension=384) as db:
 - **Dense vectors** -- cosine similarity with automatic HNSW indexing for large collections
 - **Sparse vectors** -- BM25-scored inverted index for keyword retrieval
 - **Hybrid search** -- dense + sparse fusion with linear or RRF strategies
+- **Vector quantization** -- scalar (int8, 4x), binary (32x), and product quantization (PQ) with 2-stage rescoring
 - **Rich metadata** -- `str`, `int`, `float`, `bool`, `None`, `list`, `dict` values
 - **Crash-safe WAL** -- writes land in a write-ahead log first, then checkpoint with `compact()`
 - **Transactions** -- atomic batched writes with `db.transaction()`
@@ -210,6 +211,33 @@ print(outcome["stats"]["used_ann"])      # True
 print(outcome["results"][0]["explain"])  # Detailed scoring breakdown
 ```
 
+### Vector Quantization
+
+Reduce memory usage and accelerate search with quantized vectors. All methods use a 2-stage pipeline: fast quantized candidate selection followed by exact float32 rescoring.
+
+```python
+# Scalar quantization (int8) -- 4x memory reduction, minimal recall loss
+db.enable_quantization("scalar")
+
+# Binary quantization -- 32x memory reduction, best for normalized embeddings
+db.enable_quantization("binary", rescore_multiplier=10)
+
+# Product quantization -- configurable compression for very large datasets
+db.enable_quantization("product", num_sub_vectors=16, num_centroids=256)
+
+# Search is transparently accelerated
+results = db.search(query_embedding, k=10)
+
+# Check status
+print(db.is_quantized)         # True
+print(db.quantization_method)  # "scalar", "binary", or "product"
+
+# Disable
+db.disable_quantization()
+```
+
+Quantization parameters persist across reopens in a `.vdb.quant` sidecar file.
+
 ## Filter Operators
 
 | Operator | Example | Description |
@@ -255,6 +283,15 @@ print(outcome["results"][0]["explain"])  # Detailed scoring breakdown
 | `db.dimension` | Vector dimension (property) |
 | `db.path` | Database file path (property) |
 | `db.read_only` | Whether the database is read-only (property) |
+
+### Quantization Methods
+
+| Method | Description |
+|--------|-------------|
+| `db.enable_quantization(method, ...)` | Enable quantization (`"scalar"`, `"binary"`, or `"product"`) |
+| `db.disable_quantization()` | Disable quantization and remove persisted parameters |
+| `db.is_quantized` | Whether quantization is enabled (property) |
+| `db.quantization_method` | Active method name or `None` (property) |
 
 ### Maintenance Methods
 

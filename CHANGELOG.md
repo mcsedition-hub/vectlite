@@ -6,6 +6,31 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-05-10
+
+### Added
+
+- **Vector quantization** with three strategies for trading memory for search speed:
+  - **Scalar quantization (int8)** -- 4x memory reduction with minimal recall loss.
+  - **Binary quantization** -- 32x memory reduction using Hamming distance filtering, best for normalized embeddings.
+  - **Product quantization (PQ)** -- configurable compression via k-means sub-vector clustering for very large datasets.
+- All quantization methods use a 2-stage pipeline: fast quantized candidate selection followed by exact float32 cosine rescoring.
+- Quantization parameters (calibration ranges, PQ codebooks) persist in a `.vdb.quant` sidecar file and auto-load on database open.
+- Quantized indexes automatically rebuild on inserts, upserts, and bulk ingestion.
+- Rust core: `enable_quantization()`, `disable_quantization()`, `is_quantized()`, `quantization_config()` on `Database`.
+- Python binding: `db.enable_quantization(method, ...)`, `db.disable_quantization()`, `db.is_quantized`, `db.quantization_method`.
+- Node binding: `db.enableQuantization(method, optionsJson)`, `db.disableQuantization()`, `db.isQuantized`, `db.quantizationMethod`.
+- New `crates/vectlite-core/src/quantization.rs` module with `ScalarQuantizer`, `BinaryQuantizer`, `ProductQuantizer`, and `QuantizedIndex`.
+- Rust unit tests for all three quantizers including serialization roundtrips.
+- Rust integration tests for enable/disable/persist/error workflows.
+- Python smoke tests for scalar, binary, product quantization, disable, and error cases.
+
+### Changed
+
+- The repository README, Python package README, and Node package README now document quantization features, usage examples, and API reference tables.
+- `hybrid_search_internal()` now uses quantized candidates as an alternative to HNSW when quantization is enabled.
+- The storage format table in the repository README now includes the `.vdb.quant` sidecar file.
+
 ## [0.1.11] - 2026-04-01
 
 ### Added

@@ -92,6 +92,7 @@ db.close()
 - **Dense vectors** -- cosine similarity with automatic HNSW indexing
 - **Sparse vectors** -- BM25-scored inverted index for keyword retrieval
 - **Hybrid search** -- dense + sparse fusion via linear combination or reciprocal rank fusion (RRF)
+- **Vector quantization** -- scalar (int8, 4x), binary (32x), and product quantization (PQ) with 2-stage rescoring
 - **Named vectors** -- multiple vector spaces per record (`"title"`, `"body"`, ...)
 - **Multi-vector queries** -- weighted search across vector spaces in a single call
 - **MMR diversification** -- tunable relevance vs. diversity trade-off
@@ -233,6 +234,33 @@ print(outcome["stats"]["timings"])       # {"dense_us": 120, "sparse_us": 45, ..
 print(outcome["results"][0]["explain"])  # Detailed scoring breakdown
 ```
 
+### Vector Quantization
+
+Reduce memory usage and accelerate search with quantized vectors. All methods use a 2-stage pipeline: fast quantized candidate selection followed by exact float32 rescoring.
+
+```python
+# Scalar quantization (int8) -- 4x memory reduction, minimal recall loss
+db.enable_quantization("scalar")
+
+# Binary quantization -- 32x memory reduction, best for normalized embeddings
+db.enable_quantization("binary", rescore_multiplier=10)
+
+# Product quantization -- configurable compression for very large datasets
+db.enable_quantization("product", num_sub_vectors=16, num_centroids=256)
+
+# Search works exactly the same -- quantization accelerates it transparently
+results = db.search(query_embedding, k=10)
+
+# Check quantization status
+print(db.is_quantized)         # True
+print(db.quantization_method)  # "scalar", "binary", or "product"
+
+# Disable quantization
+db.disable_quantization()
+```
+
+Quantization parameters persist across reopens in a `.vdb.quant` sidecar file. The quantized index auto-rebuilds on inserts and upserts.
+
 ## Node.js API
 
 ### Hybrid Search
@@ -320,6 +348,26 @@ console.log(outcome.stats.used_ann)     // true
 console.log(outcome.results[0].explain) // Detailed scoring breakdown
 ```
 
+### Vector Quantization
+
+```js
+// Scalar quantization (int8) -- 4x memory reduction
+db.enableQuantization('scalar')
+
+// Binary quantization -- 32x memory reduction
+db.enableQuantization('binary', JSON.stringify({ rescoreMultiplier: 10 }))
+
+// Product quantization
+db.enableQuantization('product', JSON.stringify({ numSubVectors: 16, numCentroids: 256 }))
+
+// Check status
+console.log(db.isQuantized)         // true
+console.log(db.quantizationMethod)  // "scalar", "binary", or "product"
+
+// Disable
+db.disableQuantization()
+```
+
 ## Rust API
 
 ```rust
@@ -380,9 +428,10 @@ Each database consists of:
 | `*.vdb` | Binary snapshot: magic header, version, dimension, records |
 | `*.vdb.wal` | Write-ahead log for crash-safe recovery |
 | `*.vdb.ann.*` | HNSW sidecar files (acceleration artifacts, regenerated if missing) |
+| `*.vdb.quant` | Quantization parameters (calibration ranges, PQ codebooks) |
 | `*.vdb.lock` | Advisory lock file for concurrency control |
 
-The snapshot + WAL are the source of truth. ANN sidecars are acceleration artifacts. Small collections (<128 records) use exact dense search.
+The snapshot + WAL are the source of truth. ANN and quantization sidecars are acceleration artifacts that are regenerated if missing. Small collections (<128 records) use exact dense search.
 
 ## Language Roadmap
 

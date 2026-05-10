@@ -836,3 +836,129 @@ def test_lock_timeout_rejects_invalid_values(tmp_path: Path) -> None:
 
     with pytest.raises(vectlite.VectLiteError, match="lock_timeout"):
         vectlite.open(str(path), lock_timeout=math.nan)
+
+
+# ---------------------------------------------------------------------------
+# Quantization tests
+# ---------------------------------------------------------------------------
+
+
+def test_scalar_quantization(tmp_path: Path) -> None:
+    """Scalar quantization accelerates search and persists across reopens."""
+    path = tmp_path / "quant_scalar.vdb"
+    db = vectlite.open(str(path), dimension=32)
+
+    # Insert 50 records
+    records = []
+    for i in range(50):
+        v = [0.0] * 32
+        v[i % 32] = 1.0
+        v[(i + 1) % 32] = 0.5
+        records.append({"id": f"doc{i}", "vector": v})
+    db.upsert_many(records)
+
+    # Enable scalar quantization
+    db.enable_quantization("scalar", rescore_multiplier=5)
+    assert db.is_quantized is True
+    assert db.quantization_method == "scalar"
+
+    # Search should return correct results
+    query = [0.0] * 32
+    query[0] = 1.0
+    results = db.search(query, k=5)
+    assert len(results) > 0
+    assert results[0]["id"] == "doc0"
+
+    # Close and reopen: quantization should persist
+    db.close()
+    db2 = vectlite.open(str(path))
+    assert db2.is_quantized is True
+    assert db2.quantization_method == "scalar"
+    results2 = db2.search(query, k=5)
+    assert results2[0]["id"] == "doc0"
+    db2.close()
+
+
+def test_binary_quantization(tmp_path: Path) -> None:
+    """Binary quantization with Hamming distance + rescoring."""
+    path = tmp_path / "quant_binary.vdb"
+    db = vectlite.open(str(path), dimension=64)
+
+    for i in range(100):
+        v = [1.0 if (i + j) % 3 == 0 else -1.0 for j in range(64)]
+        db.upsert(f"doc{i}", v)
+
+    db.enable_quantization("binary")
+    assert db.quantization_method == "binary"
+
+    query = [1.0 if j % 3 == 0 else -1.0 for j in range(64)]
+    results = db.search(query, k=5)
+    assert results[0]["id"] == "doc0"
+    db.close()
+
+
+def test_product_quantization(tmp_path: Path) -> None:
+    """Product quantization compresses vectors into centroid codes."""
+    path = tmp_path / "quant_pq.vdb"
+    db = vectlite.open(str(path), dimension=32)
+
+    for i in range(100):
+        v = [((i * 7 + j * 13) % 100) / 100.0 for j in range(32)]
+        db.upsert(f"doc{i}", v)
+
+    db.enable_quantization(
+        "product",
+        num_sub_vectors=4,
+        num_centroids=16,
+        training_iterations=5,
+    )
+    assert db.quantization_method == "product"
+
+    query = [(j * 13 % 100) / 100.0 for j in range(32)]
+    results = db.search(query, k=5)
+    assert results[0]["id"] == "doc0"
+    db.close()
+
+
+def test_disable_quantization(tmp_path: Path) -> None:
+    """Disabling quantization removes sidecar and stops quantized search."""
+    path = tmp_path / "quant_disable.vdb"
+    db = vectlite.open(str(path), dimension=8)
+
+    for i in range(10):
+        db.upsert(f"doc{i}", [float(i + j) for j in range(8)])
+
+    db.enable_quantization("scalar")
+    assert db.is_quantized is True
+
+    db.disable_quantization()
+    assert db.is_quantized is False
+    assert db.quantization_method is None
+
+    # Search still works without quantization
+    results = db.search([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], k=3)
+    assert len(results) > 0
+    db.close()
+
+
+def test_quantization_empty_database_raises(tmp_path: Path) -> None:
+    """Enabling quantization on empty database raises an error."""
+    path = tmp_path / "quant_empty.vdb"
+    db = vectlite.open(str(path), dimension=4)
+
+    with pytest.raises(vectlite.VectLiteError):
+        db.enable_quantization("scalar")
+
+    db.close()
+
+
+def test_quantization_invalid_method_raises(tmp_path: Path) -> None:
+    """Using an invalid quantization method raises ValueError."""
+    path = tmp_path / "quant_invalid.vdb"
+    db = vectlite.open(str(path), dimension=4)
+    db.upsert("doc1", [1.0, 0.0, 0.0, 0.0])
+
+    with pytest.raises(ValueError, match="unknown quantization method"):
+        db.enable_quantization("invalid_method")
+
+    db.close()

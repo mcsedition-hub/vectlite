@@ -6,6 +6,10 @@ use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyList, PyModule, PyString};
+use vectlite::quantization::{
+    BinaryQuantizationConfig, ProductQuantizationConfig, QuantizationConfig,
+    ScalarQuantizationConfig,
+};
 use vectlite::{
     Database as CoreDatabase, FusionStrategy, HybridSearchOptions, Metadata, MetadataFilter,
     MetadataValue, NamedVectors, Record, SearchOutcome, SearchResult, SparseVector,
@@ -274,6 +278,62 @@ impl PyDatabase {
     fn compact(&self) -> PyResult<()> {
         let mut database = self.write_open()?;
         database.compact().map_err(to_py_error)
+    }
+
+    // -------------------------------------------------------------------
+    // Quantization
+    // -------------------------------------------------------------------
+
+    /// Enable quantization on the database.
+    ///
+    /// Args:
+    ///     method: One of "scalar", "binary", or "product".
+    ///     rescore_multiplier: How many candidates to rescore (multiplier of top_k).
+    ///     num_sub_vectors: (PQ only) Number of sub-vector partitions.
+    ///     num_centroids: (PQ only) Number of centroids per sub-vector (max 256).
+    ///     training_iterations: (PQ only) K-means iterations.
+    #[pyo3(signature = (method="scalar", rescore_multiplier=None, num_sub_vectors=None, num_centroids=None, training_iterations=None))]
+    fn enable_quantization(
+        &self,
+        method: &str,
+        rescore_multiplier: Option<usize>,
+        num_sub_vectors: Option<usize>,
+        num_centroids: Option<usize>,
+        training_iterations: Option<usize>,
+    ) -> PyResult<()> {
+        let config = parse_quantization_config(
+            method,
+            rescore_multiplier,
+            num_sub_vectors,
+            num_centroids,
+            training_iterations,
+        )?;
+        let mut database = self.write_open()?;
+        database.enable_quantization(config).map_err(to_py_error)
+    }
+
+    /// Disable quantization and remove persisted parameters.
+    fn disable_quantization(&self) -> PyResult<()> {
+        let mut database = self.write_open()?;
+        database.disable_quantization().map_err(to_py_error)
+    }
+
+    /// Returns True if quantization is enabled.
+    #[getter]
+    fn is_quantized(&self) -> PyResult<bool> {
+        let database = self.read()?;
+        Ok(database.is_quantized())
+    }
+
+    /// Returns the quantization method name if enabled, else None.
+    #[getter]
+    fn quantization_method(&self) -> PyResult<Option<String>> {
+        let database = self.read()?;
+        Ok(database.quantization_config().map(|config| match config {
+            QuantizationConfig::Scalar(_) => "scalar".to_owned(),
+            QuantizationConfig::Binary(_) => "binary".to_owned(),
+            QuantizationConfig::Product(_) => "product".to_owned(),
+        }))
     }
 
     #[getter]
@@ -1557,4 +1617,30 @@ fn to_py_error(error: vectlite::VectLiteError) -> PyErr {
 
 fn closed_database_error() -> vectlite::VectLiteError {
     vectlite::VectLiteError::InvalidFormat("database is closed".to_owned())
+}
+
+fn parse_quantization_config(
+    method: &str,
+    rescore_multiplier: Option<usize>,
+    num_sub_vectors: Option<usize>,
+    num_centroids: Option<usize>,
+    training_iterations: Option<usize>,
+) -> PyResult<QuantizationConfig> {
+    match method {
+        "scalar" | "int8" => Ok(QuantizationConfig::Scalar(ScalarQuantizationConfig {
+            rescore_multiplier: rescore_multiplier.unwrap_or(5),
+        })),
+        "binary" => Ok(QuantizationConfig::Binary(BinaryQuantizationConfig {
+            rescore_multiplier: rescore_multiplier.unwrap_or(10),
+        })),
+        "product" | "pq" => Ok(QuantizationConfig::Product(ProductQuantizationConfig {
+            num_sub_vectors: num_sub_vectors.unwrap_or(16),
+            num_centroids: num_centroids.unwrap_or(256),
+            training_iterations: training_iterations.unwrap_or(20),
+            rescore_multiplier: rescore_multiplier.unwrap_or(10),
+        })),
+        other => Err(PyValueError::new_err(format!(
+            "unknown quantization method '{other}'. Expected: 'scalar', 'binary', or 'product'"
+        ))),
+    }
 }

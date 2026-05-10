@@ -1094,14 +1094,14 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "vectlite-cli"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "vectlite-core",
 ]
 
 [[package]]
 name = "vectlite-core"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "fs2",
  "hnsw_rs",
@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "vectlite-node"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "napi",
  "napi-build",
@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "vectlite-python"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "pyo3",
  "vectlite-core",

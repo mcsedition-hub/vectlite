@@ -46,6 +46,7 @@ db.close()
 - **Dense vectors** -- cosine similarity with automatic HNSW indexing for large collections
 - **Sparse vectors** -- BM25-scored inverted index for keyword retrieval
 - **Hybrid search** -- dense + sparse fusion with linear or RRF strategies
+- **Vector quantization** -- scalar (int8, 4x), binary (32x), and product quantization (PQ) with 2-stage rescoring
 - **Rich metadata** -- string, number, boolean, null, array, and nested object values
 - **Crash-safe WAL** -- writes land in a write-ahead log first, then checkpoint with `compact()`
 - **Transactions** -- atomic batched writes with `db.transaction()`
@@ -183,6 +184,33 @@ console.log(outcome.stats.used_ann)     // true
 console.log(outcome.results[0].explain) // Detailed scoring breakdown
 ```
 
+### Vector Quantization
+
+Reduce memory usage and accelerate search with quantized vectors. All methods use a 2-stage pipeline: fast quantized candidate selection followed by exact float32 rescoring.
+
+```js
+// Scalar quantization (int8) -- 4x memory reduction, minimal recall loss
+db.enableQuantization('scalar')
+
+// Binary quantization -- 32x memory reduction, best for normalized embeddings
+db.enableQuantization('binary', JSON.stringify({ rescoreMultiplier: 10 }))
+
+// Product quantization -- configurable compression for very large datasets
+db.enableQuantization('product', JSON.stringify({ numSubVectors: 16, numCentroids: 256 }))
+
+// Search works exactly the same -- quantization accelerates it transparently
+const results = db.search(queryEmbedding, { k: 10 })
+
+// Check quantization status
+console.log(db.isQuantized)         // true
+console.log(db.quantizationMethod)  // "scalar", "binary", or "product"
+
+// Disable quantization
+db.disableQuantization()
+```
+
+Quantization parameters persist across reopens in a `.vdb.quant` sidecar file. The quantized index auto-rebuilds on inserts and upserts.
+
 ## Database Methods Reference
 
 ### Write Methods
@@ -211,6 +239,15 @@ console.log(outcome.results[0].explain) // Detailed scoring breakdown
 | `db.dimension` | Vector dimension (property) |
 | `db.path` | Database file path (property) |
 | `db.readOnly` | Whether the database is read-only (property) |
+
+### Quantization Methods
+
+| Method | Description |
+|---|---|
+| `db.enableQuantization(method, optionsJson)` | Enable quantization (`'scalar'`, `'binary'`, or `'product'`) |
+| `db.disableQuantization()` | Disable quantization and remove persisted parameters |
+| `db.isQuantized` | Whether quantization is enabled (property) |
+| `db.quantizationMethod` | Active method name or `null` (property) |
 
 ### Maintenance Methods
 

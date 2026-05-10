@@ -1,3 +1,5 @@
+pub mod quantization;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fmt;
@@ -8,6 +10,8 @@ use std::time::Instant;
 
 use fs2::FileExt;
 use hnsw_rs::prelude::*;
+
+use quantization::{QuantizationConfig, QuantizedIndex};
 
 const MAGIC: &[u8; 4] = b"VDB1";
 const VERSION: u16 = 4;
@@ -687,6 +691,8 @@ impl Store {
         let _ = fs::remove_file(&wal);
         let manifest = ann_manifest_path(&path);
         let _ = fs::remove_file(&manifest);
+        let quant = quantization_params_path(&path);
+        let _ = fs::remove_file(&quant);
         // Remove any .hnsw.* sidecar files
         if let Some(parent) = path.parent() {
             if let Some(stem) = path.file_name().and_then(|n| n.to_str()) {
@@ -738,6 +744,12 @@ pub struct Database {
     /// Holds the lock file open for the lifetime of the database.
     /// Dropping this releases the advisory lock.
     _lock_file: Option<File>,
+    /// Optional quantized index for accelerated search.
+    quantized: Option<QuantizedIndex>,
+    /// Configuration used to build the quantized index (persisted).
+    quantization_config: Option<QuantizationConfig>,
+    /// Ordered keys mapping quantized index positions to record keys.
+    quantized_keys: Vec<RecordKey>,
 }
 
 #[derive(Default)]
@@ -788,6 +800,9 @@ impl Database {
             ann_loaded_from_disk: false,
             read_only: false,
             _lock_file: Some(lock),
+            quantized: None,
+            quantization_config: None,
+            quantized_keys: Vec::new(),
         };
 
         database.flush()?;
@@ -807,6 +822,7 @@ impl Database {
         if !database.ann_loaded_from_disk {
             database.rebuild_ann();
         }
+        database.try_load_quantization();
         Ok(database)
     }
 
@@ -827,6 +843,7 @@ impl Database {
         if !database.ann_loaded_from_disk {
             database.rebuild_ann();
         }
+        database.try_load_quantization();
         Ok(database)
     }
 
@@ -858,6 +875,7 @@ impl Database {
         if !database.ann_loaded_from_disk {
             database.rebuild_ann();
         }
+        database.try_load_quantization();
         Ok(database)
     }
 
@@ -887,6 +905,9 @@ impl Database {
         self.records.clear();
         self.ann = AnnCatalog::default();
         self.sparse_index = SparseIndex::default();
+        self.quantized = None;
+        self.quantization_config = None;
+        self.quantized_keys.clear();
         self.dimension = 0;
         Ok(())
     }
@@ -1190,6 +1211,7 @@ impl Database {
         self.rebuild_ann();
         self.ann_loaded_from_disk = false;
         self.persist_ann_to_disk()?;
+        self.rebuild_quantized_index();
         Ok(count)
     }
 
@@ -1216,6 +1238,7 @@ impl Database {
         self.rebuild_ann();
         self.ann_loaded_from_disk = false;
         self.persist_ann_to_disk()?;
+        self.rebuild_quantized_index();
         Ok(count)
     }
 
@@ -1414,6 +1437,7 @@ impl Database {
         self.rebuild_ann();
         self.ann_loaded_from_disk = false;
         self.persist_ann_to_disk()?;
+        self.rebuild_quantized_index();
         Ok(())
     }
 
@@ -1464,8 +1488,22 @@ impl Database {
         let vector_name = options.vector_name.as_deref();
 
         let dense_start = Instant::now();
-        let ann_candidates = dense_query
-            .and_then(|query| self.ann_candidate_keys(namespace, vector_name, query, fetch_k));
+        // Use quantized index for candidate selection if available (2-stage pipeline).
+        // The quantized index operates on the default vector only and globally (not per-namespace).
+        let quantized_candidates =
+            if vector_name.is_none() || vector_name == Some(DEFAULT_VECTOR_NAME) {
+                dense_query.and_then(|query| self.quantized_candidate_keys(query, fetch_k))
+            } else {
+                None
+            };
+        let ann_candidates = if quantized_candidates.is_some() {
+            // Skip HNSW if quantized index provided candidates
+            None
+        } else {
+            dense_query
+                .and_then(|query| self.ann_candidate_keys(namespace, vector_name, query, fetch_k))
+        };
+        let effective_dense_candidates = quantized_candidates.or(ann_candidates);
         let dense_us = dense_start.elapsed().as_micros() as u64;
 
         let sparse_start = Instant::now();
@@ -1476,17 +1514,17 @@ impl Database {
 
         let candidate_keys = if dense_query.is_none() {
             Some(sparse_candidates.clone())
-        } else if dense_query.is_some() && ann_candidates.is_none() {
+        } else if dense_query.is_some() && effective_dense_candidates.is_none() {
             None
         } else {
             merge_candidate_keys(
-                ann_candidates.as_deref(),
+                effective_dense_candidates.as_deref(),
                 Some(sparse_candidates.as_slice()),
             )
         };
         let mut stats = SearchStats {
-            used_ann: ann_candidates.is_some(),
-            ann_candidate_count: ann_candidates.as_ref().map_or(0, Vec::len),
+            used_ann: effective_dense_candidates.is_some(),
+            ann_candidate_count: effective_dense_candidates.as_ref().map_or(0, Vec::len),
             fetch_k,
             sparse_candidate_count: sparse_candidates.len(),
             ann_loaded_from_disk: self.ann_loaded_from_disk,
@@ -1504,7 +1542,7 @@ impl Database {
         );
         stats.considered_count = results.len();
 
-        if ann_candidates.is_some() && results.len() < fetch_k {
+        if effective_dense_candidates.is_some() && results.len() < fetch_k {
             stats.exact_fallback = true;
             results = self.collect_results(dense_query, sparse_query, &options, namespace, None);
             stats.considered_count = results.len();
@@ -1596,6 +1634,7 @@ impl Database {
             self.rebuild_ann();
             self.ann_loaded_from_disk = false;
             self.persist_ann_to_disk()?;
+            self.rebuild_quantized_index();
         }
 
         Ok(total)
@@ -1604,6 +1643,142 @@ impl Database {
     pub fn compact(&mut self) -> Result<()> {
         self.check_writable()?;
         self.compact_inner()
+    }
+
+    // -----------------------------------------------------------------------
+    // Quantization API
+    // -----------------------------------------------------------------------
+
+    /// Enable quantization on this database. Trains the quantizer on all current
+    /// vectors and persists the configuration. Subsequent searches will use the
+    /// quantized index for fast candidate selection followed by exact rescoring.
+    pub fn enable_quantization(&mut self, config: QuantizationConfig) -> Result<()> {
+        self.check_writable()?;
+        if self.records.is_empty() {
+            return Err(VectLiteError::InvalidFormat(
+                "cannot enable quantization on an empty database".to_owned(),
+            ));
+        }
+        self.quantization_config = Some(config);
+        self.rebuild_quantized_index();
+        self.persist_quantization_params()?;
+        Ok(())
+    }
+
+    /// Disable quantization and remove persisted parameters.
+    pub fn disable_quantization(&mut self) -> Result<()> {
+        self.check_writable()?;
+        self.quantized = None;
+        self.quantization_config = None;
+        self.quantized_keys.clear();
+        // Remove the sidecar file
+        let params_path = quantization_params_path(&self.path);
+        if params_path.exists() {
+            fs::remove_file(&params_path)?;
+        }
+        Ok(())
+    }
+
+    /// Returns true if quantization is enabled.
+    pub fn is_quantized(&self) -> bool {
+        self.quantized.is_some()
+    }
+
+    /// Returns the quantization configuration if enabled.
+    pub fn quantization_config(&self) -> Option<&QuantizationConfig> {
+        self.quantization_config.as_ref()
+    }
+
+    /// Rebuild the quantized index from current records.
+    fn rebuild_quantized_index(&mut self) {
+        let config = match &self.quantization_config {
+            Some(config) => config.clone(),
+            None => return,
+        };
+
+        if self.records.is_empty() {
+            self.quantized = None;
+            self.quantized_keys.clear();
+            return;
+        }
+
+        let mut keys = Vec::with_capacity(self.records.len());
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(self.records.len());
+
+        for (key, record) in &self.records {
+            keys.push(key.clone());
+            vectors.push(record.vector.clone());
+        }
+
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let index = QuantizedIndex::build(&refs, self.dimension, &config);
+
+        self.quantized = Some(index);
+        self.quantized_keys = keys;
+    }
+
+    /// Persist quantization parameters to a sidecar file.
+    fn persist_quantization_params(&self) -> Result<()> {
+        let params_path = quantization_params_path(&self.path);
+        if let Some(index) = &self.quantized {
+            let mut file = File::create(&params_path)?;
+            index.write_params(&mut file).map_err(VectLiteError::Io)?;
+            file.sync_all()?;
+        } else {
+            if params_path.exists() {
+                fs::remove_file(&params_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Try to load quantization parameters from disk and rebuild codes.
+    fn try_load_quantization(&mut self) -> bool {
+        let params_path = quantization_params_path(&self.path);
+        if !params_path.exists() {
+            return false;
+        }
+
+        let file = match File::open(&params_path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut reader = BufReader::new(file);
+        let mut index = match QuantizedIndex::read_params(&mut reader) {
+            Ok(idx) => idx,
+            Err(_) => return false,
+        };
+
+        // Rebuild codes from current records
+        let mut keys = Vec::with_capacity(self.records.len());
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(self.records.len());
+        for (key, record) in &self.records {
+            keys.push(key.clone());
+            vectors.push(record.vector.clone());
+        }
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        index.rebuild_codes(&refs);
+
+        self.quantization_config = Some(index.config());
+        self.quantized = Some(index);
+        self.quantized_keys = keys;
+        true
+    }
+
+    /// Use the quantized index to get candidate record keys for rescoring.
+    fn quantized_candidate_keys(&self, query: &[f32], top_k: usize) -> Option<Vec<RecordKey>> {
+        let index = self.quantized.as_ref()?;
+        if index.count() == 0 {
+            return None;
+        }
+
+        let candidate_indices = index.search_candidates(query, top_k);
+        Some(
+            candidate_indices
+                .into_iter()
+                .filter_map(|idx| self.quantized_keys.get(idx).cloned())
+                .collect(),
+        )
     }
 
     fn compact_inner(&mut self) -> Result<()> {
@@ -1765,6 +1940,7 @@ impl Database {
         self.rebuild_ann();
         self.ann_loaded_from_disk = false;
         self.persist_ann_to_disk()?;
+        self.rebuild_quantized_index();
         Ok(())
     }
 
@@ -1964,6 +2140,9 @@ impl Database {
             ann_loaded_from_disk: false,
             read_only: false,
             _lock_file: None,
+            quantized: None,
+            quantization_config: None,
+            quantized_keys: Vec::new(),
         })
     }
 
@@ -2638,6 +2817,12 @@ fn lock_path(path: &Path) -> PathBuf {
     let mut lock = path.as_os_str().to_os_string();
     lock.push(".lock");
     PathBuf::from(lock)
+}
+
+fn quantization_params_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_os_string();
+    p.push(".quant");
+    PathBuf::from(p)
 }
 
 fn acquire_exclusive_lock(path: &Path) -> Result<File> {
@@ -3942,5 +4127,234 @@ mod tests {
 
     fn cleanup(path: &Path) {
         let _ = std::fs::remove_file(path);
+        // Also clean up sidecar files
+        let mut quant = path.as_os_str().to_os_string();
+        quant.push(".quant");
+        let _ = std::fs::remove_file(PathBuf::from(&quant));
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push(".wal");
+        let _ = std::fs::remove_file(PathBuf::from(&wal));
+        let mut lock = path.as_os_str().to_os_string();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(PathBuf::from(&lock));
+    }
+
+    // -----------------------------------------------------------------------
+    // Quantization integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scalar_quantization_enables_search_and_persists() {
+        use super::quantization::{QuantizationConfig, ScalarQuantizationConfig};
+
+        let path = temp_file("quant-scalar");
+        let dim = 32;
+
+        {
+            let mut db = Database::create(&path, dim).expect("create");
+            // Insert enough records for meaningful search
+            for i in 0..50 {
+                let mut v = vec![0.0_f32; dim];
+                v[i % dim] = 1.0;
+                v[(i + 1) % dim] = 0.5;
+                db.upsert(format!("doc{i}"), v, Metadata::new())
+                    .expect("upsert");
+            }
+
+            // Enable scalar quantization
+            db.enable_quantization(QuantizationConfig::Scalar(ScalarQuantizationConfig {
+                rescore_multiplier: 5,
+            }))
+            .expect("enable quant");
+
+            assert!(db.is_quantized());
+
+            // Search should work with quantization
+            let query = {
+                let mut q = vec![0.0_f32; dim];
+                q[0] = 1.0;
+                q
+            };
+            let results = db
+                .search(
+                    &query,
+                    SearchOptions {
+                        top_k: 5,
+                        filter: None,
+                    },
+                )
+                .expect("search");
+            assert!(!results.is_empty());
+            // The most similar vector (doc0 has [1,0.5,0,...]) should be first
+            assert_eq!(results[0].id, "doc0");
+        }
+
+        // Reopen and verify quantization persists
+        {
+            let db = Database::open(&path).expect("reopen");
+            assert!(db.is_quantized());
+            assert!(matches!(
+                db.quantization_config(),
+                Some(QuantizationConfig::Scalar(_))
+            ));
+
+            let query = {
+                let mut q = vec![0.0_f32; dim];
+                q[0] = 1.0;
+                q
+            };
+            let results = db
+                .search(
+                    &query,
+                    SearchOptions {
+                        top_k: 5,
+                        filter: None,
+                    },
+                )
+                .expect("search after reopen");
+            assert!(!results.is_empty());
+            assert_eq!(results[0].id, "doc0");
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn binary_quantization_enables_search() {
+        use super::quantization::{BinaryQuantizationConfig, QuantizationConfig};
+
+        let path = temp_file("quant-binary");
+        let dim = 64;
+
+        let mut db = Database::create(&path, dim).expect("create");
+        for i in 0..100 {
+            let mut v = vec![0.0_f32; dim];
+            // Set some positive dimensions for the binary representation
+            for j in 0..dim {
+                v[j] = if (i + j) % 3 == 0 { 1.0 } else { -1.0 };
+            }
+            db.upsert(format!("doc{i}"), v, Metadata::new())
+                .expect("upsert");
+        }
+
+        db.enable_quantization(QuantizationConfig::Binary(BinaryQuantizationConfig {
+            rescore_multiplier: 10,
+        }))
+        .expect("enable quant");
+
+        assert!(db.is_quantized());
+
+        // Search: query matches doc0's pattern
+        let query: Vec<f32> = (0..dim)
+            .map(|j| if j % 3 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let results = db
+            .search(
+                &query,
+                SearchOptions {
+                    top_k: 5,
+                    filter: None,
+                },
+            )
+            .expect("search");
+        assert!(!results.is_empty());
+        // doc0 should be the best match (identical pattern)
+        assert_eq!(results[0].id, "doc0");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn product_quantization_enables_search() {
+        use super::quantization::{ProductQuantizationConfig, QuantizationConfig};
+
+        let path = temp_file("quant-pq");
+        let dim = 32;
+
+        let mut db = Database::create(&path, dim).expect("create");
+        for i in 0..100 {
+            let v: Vec<f32> = (0..dim)
+                .map(|j| ((i * 7 + j * 13) % 100) as f32 / 100.0)
+                .collect();
+            db.upsert(format!("doc{i}"), v, Metadata::new())
+                .expect("upsert");
+        }
+
+        db.enable_quantization(QuantizationConfig::Product(ProductQuantizationConfig {
+            num_sub_vectors: 4,
+            num_centroids: 16,
+            training_iterations: 5,
+            rescore_multiplier: 10,
+        }))
+        .expect("enable quant");
+
+        assert!(db.is_quantized());
+
+        // Search with the same vector as doc0
+        let query: Vec<f32> = (0..dim).map(|j| (j * 13 % 100) as f32 / 100.0).collect();
+        let results = db
+            .search(
+                &query,
+                SearchOptions {
+                    top_k: 5,
+                    filter: None,
+                },
+            )
+            .expect("search");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].id, "doc0");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn disable_quantization_removes_sidecar() {
+        use super::quantization::{QuantizationConfig, ScalarQuantizationConfig};
+
+        let path = temp_file("quant-disable");
+        let dim = 8;
+
+        let mut db = Database::create(&path, dim).expect("create");
+        for i in 0..10 {
+            let v: Vec<f32> = (0..dim).map(|j| (i + j) as f32).collect();
+            db.upsert(format!("doc{i}"), v, Metadata::new())
+                .expect("upsert");
+        }
+
+        db.enable_quantization(QuantizationConfig::Scalar(
+            ScalarQuantizationConfig::default(),
+        ))
+        .expect("enable");
+        assert!(db.is_quantized());
+
+        // Verify sidecar exists
+        let quant_path = {
+            let mut p = path.as_os_str().to_os_string();
+            p.push(".quant");
+            PathBuf::from(p)
+        };
+        assert!(quant_path.exists());
+
+        db.disable_quantization().expect("disable");
+        assert!(!db.is_quantized());
+        assert!(!quant_path.exists());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn quantization_empty_database_returns_error() {
+        use super::quantization::{QuantizationConfig, ScalarQuantizationConfig};
+
+        let path = temp_file("quant-empty");
+        let mut db = Database::create(&path, 4).expect("create");
+
+        let result = db.enable_quantization(QuantizationConfig::Scalar(
+            ScalarQuantizationConfig::default(),
+        ));
+        assert!(result.is_err());
+        assert!(!db.is_quantized());
+
+        cleanup(&path);
     }
 }

@@ -6,6 +6,10 @@ use napi::Error as NapiError;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use serde_json::{Map, Number, Value, json};
+use vectlite::quantization::{
+    BinaryQuantizationConfig, ProductQuantizationConfig, QuantizationConfig,
+    ScalarQuantizationConfig,
+};
 use vectlite::{
     Database as CoreDatabase, FusionStrategy, HybridSearchOptions, Metadata, MetadataFilter,
     MetadataValue, NamedVectors, Record, SearchOutcome, SearchResult, SparseVector,
@@ -346,6 +350,58 @@ impl NativeDatabase {
     pub fn compact(&self) -> Result<()> {
         let mut database = self.write_open()?;
         database.compact().map_err(to_napi_error)
+    }
+
+    // -------------------------------------------------------------------
+    // Quantization
+    // -------------------------------------------------------------------
+
+    /// Enable quantization on the database.
+    /// `method`: "scalar", "binary", or "product"
+    /// `options_json`: JSON with optional keys: rescore_multiplier, num_sub_vectors, num_centroids, training_iterations
+    #[napi(js_name = "enableQuantization")]
+    pub fn enable_quantization(
+        &self,
+        method: Option<String>,
+        options_json: Option<String>,
+    ) -> Result<()> {
+        let method = method.as_deref().unwrap_or("scalar");
+        let (rescore_multiplier, num_sub_vectors, num_centroids, training_iterations) =
+            parse_quantization_options(options_json.as_deref())?;
+        let config = build_quantization_config(
+            method,
+            rescore_multiplier,
+            num_sub_vectors,
+            num_centroids,
+            training_iterations,
+        )?;
+        let mut database = self.write_open()?;
+        database.enable_quantization(config).map_err(to_napi_error)
+    }
+
+    /// Disable quantization and remove persisted parameters.
+    #[napi(js_name = "disableQuantization")]
+    pub fn disable_quantization(&self) -> Result<()> {
+        let mut database = self.write_open()?;
+        database.disable_quantization().map_err(to_napi_error)
+    }
+
+    /// Returns true if quantization is enabled.
+    #[napi(getter, js_name = "isQuantized")]
+    pub fn is_quantized(&self) -> Result<bool> {
+        let database = self.read()?;
+        Ok(database.is_quantized())
+    }
+
+    /// Returns the quantization method name if enabled, else null.
+    #[napi(getter, js_name = "quantizationMethod")]
+    pub fn quantization_method(&self) -> Result<Option<String>> {
+        let database = self.read()?;
+        Ok(database.quantization_config().map(|config| match config {
+            QuantizationConfig::Scalar(_) => "scalar".to_owned(),
+            QuantizationConfig::Binary(_) => "binary".to_owned(),
+            QuantizationConfig::Product(_) => "product".to_owned(),
+        }))
     }
 
     #[napi]
@@ -1314,4 +1370,71 @@ fn to_napi_error(error: vectlite::VectLiteError) -> NapiError {
 
 fn closed_database_error() -> vectlite::VectLiteError {
     vectlite::VectLiteError::InvalidFormat("database is closed".to_owned())
+}
+
+fn parse_quantization_options(
+    options_json: Option<&str>,
+) -> Result<(Option<usize>, Option<usize>, Option<usize>, Option<usize>)> {
+    let Some(json_str) = options_json else {
+        return Ok((None, None, None, None));
+    };
+    let value: Value = serde_json::from_str(json_str)
+        .map_err(|e| err(format!("invalid quantization options JSON: {e}")))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| err("quantization options must be a JSON object"))?;
+
+    let rescore_multiplier = obj
+        .get("rescoreMultiplier")
+        .or_else(|| obj.get("rescore_multiplier"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let num_sub_vectors = obj
+        .get("numSubVectors")
+        .or_else(|| obj.get("num_sub_vectors"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let num_centroids = obj
+        .get("numCentroids")
+        .or_else(|| obj.get("num_centroids"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let training_iterations = obj
+        .get("trainingIterations")
+        .or_else(|| obj.get("training_iterations"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+
+    Ok((
+        rescore_multiplier,
+        num_sub_vectors,
+        num_centroids,
+        training_iterations,
+    ))
+}
+
+fn build_quantization_config(
+    method: &str,
+    rescore_multiplier: Option<usize>,
+    num_sub_vectors: Option<usize>,
+    num_centroids: Option<usize>,
+    training_iterations: Option<usize>,
+) -> Result<QuantizationConfig> {
+    match method {
+        "scalar" | "int8" => Ok(QuantizationConfig::Scalar(ScalarQuantizationConfig {
+            rescore_multiplier: rescore_multiplier.unwrap_or(5),
+        })),
+        "binary" => Ok(QuantizationConfig::Binary(BinaryQuantizationConfig {
+            rescore_multiplier: rescore_multiplier.unwrap_or(10),
+        })),
+        "product" | "pq" => Ok(QuantizationConfig::Product(ProductQuantizationConfig {
+            num_sub_vectors: num_sub_vectors.unwrap_or(16),
+            num_centroids: num_centroids.unwrap_or(256),
+            training_iterations: training_iterations.unwrap_or(20),
+            rescore_multiplier: rescore_multiplier.unwrap_or(10),
+        })),
+        other => Err(err(format!(
+            "unknown quantization method '{other}'. Expected: 'scalar', 'binary', or 'product'"
+        ))),
+    }
 }
