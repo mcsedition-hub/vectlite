@@ -579,6 +579,330 @@ impl ProductQuantizer {
 }
 
 // ---------------------------------------------------------------------------
+// Two-Bit Quantization (ColBERTv2-style)
+// ---------------------------------------------------------------------------
+
+/// Configuration for 2-bit multi-vector quantization (ColBERTv2-style).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TwoBitQuantizationConfig {
+    /// Number of top candidate docs from quantized search to rescore with
+    /// exact float32 MaxSim. Default: 4x top_k (minimum 50).
+    pub rescore_multiplier: usize,
+}
+
+impl Default for TwoBitQuantizationConfig {
+    fn default() -> Self {
+        Self {
+            rescore_multiplier: 4,
+        }
+    }
+}
+
+/// Two-bit quantizer: maps each dimension to 2 bits (4 levels) using
+/// per-dimension quartile boundaries. ~16x compression vs float32.
+/// Designed for ColBERT-style token-level vectors.
+#[derive(Clone, Debug)]
+pub struct TwoBitQuantizer {
+    pub dimension: usize,
+    /// Per-dimension boundary values: [q25, q50, q75] for each dimension.
+    /// Shape: dimension * 3.
+    pub boundaries: Vec<f32>,
+    /// Quantized codes: 2 bits per dimension, packed into bytes.
+    /// Each vector uses ceil(dimension / 4) bytes.
+    pub codes: Vec<u8>,
+    /// Number of quantized vectors.
+    pub count: usize,
+    /// Bytes per quantized vector.
+    pub bytes_per_vector: usize,
+    pub config: TwoBitQuantizationConfig,
+}
+
+impl TwoBitQuantizer {
+    /// Train a 2-bit quantizer by computing per-dimension quartiles.
+    pub fn train(
+        vectors: &[&[f32]],
+        dimension: usize,
+        config: TwoBitQuantizationConfig,
+    ) -> Self {
+        assert!(!vectors.is_empty(), "need at least one vector to train");
+
+        // Collect values per dimension and compute quartile boundaries
+        let mut boundaries = Vec::with_capacity(dimension * 3);
+        for d in 0..dimension {
+            let mut values: Vec<f32> = vectors.iter().map(|v| v[d]).collect();
+            values.sort_unstable_by(|a, b| a.total_cmp(b));
+            let n = values.len();
+            let q25 = values[n / 4];
+            let q50 = values[n / 2];
+            let q75 = values[(3 * n) / 4];
+            boundaries.push(q25);
+            boundaries.push(q50);
+            boundaries.push(q75);
+        }
+
+        let bytes_per_vector = (dimension + 3) / 4;
+        let mut codes = Vec::with_capacity(vectors.len() * bytes_per_vector);
+        for vector in vectors {
+            codes.extend_from_slice(&quantize_two_bit(vector, &boundaries, bytes_per_vector));
+        }
+
+        Self {
+            dimension,
+            boundaries,
+            codes,
+            count: vectors.len(),
+            bytes_per_vector,
+            config,
+        }
+    }
+
+    /// Quantize a single vector to 2-bit codes.
+    pub fn quantize_vector(&self, vector: &[f32]) -> Vec<u8> {
+        quantize_two_bit(vector, &self.boundaries, self.bytes_per_vector)
+    }
+
+    /// Compute approximate dot product between a 2-bit quantized query and
+    /// a stored quantized vector. Returns a score where higher = more similar.
+    pub fn approx_dot(&self, query_codes: &[u8], idx: usize) -> i32 {
+        let offset = idx * self.bytes_per_vector;
+        let stored = &self.codes[offset..offset + self.bytes_per_vector];
+        two_bit_approx_dot(query_codes, stored, self.dimension)
+    }
+
+    /// Search for top-k candidates using approximate 2-bit dot products.
+    /// Returns (index, approx_score) pairs sorted best-first.
+    pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(usize, i32)> {
+        let rescore_count = (top_k * self.config.rescore_multiplier)
+            .max(50)
+            .min(self.count);
+        let query_codes = self.quantize_vector(query);
+
+        let mut scores: Vec<(usize, i32)> = (0..self.count)
+            .map(|idx| (idx, self.approx_dot(&query_codes, idx)))
+            .collect();
+
+        scores.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        scores.truncate(rescore_count);
+        scores
+    }
+
+    /// Rebuild codes from vectors.
+    pub fn rebuild_codes(&mut self, vectors: &[&[f32]]) {
+        self.codes.clear();
+        self.codes.reserve(vectors.len() * self.bytes_per_vector);
+        for vector in vectors {
+            self.codes
+                .extend_from_slice(&quantize_two_bit(vector, &self.boundaries, self.bytes_per_vector));
+        }
+        self.count = vectors.len();
+    }
+
+    /// Serialize parameters (boundaries only, codes rebuilt on load).
+    pub fn write_params(&self, writer: &mut impl Write) -> std::io::Result<()> {
+        // Tag byte: 4 = two_bit
+        writer.write_all(&[4u8])?;
+        write_usize(writer, self.dimension)?;
+        write_usize(writer, self.config.rescore_multiplier)?;
+        // Write boundaries (dimension * 3 floats)
+        for &b in &self.boundaries {
+            writer.write_all(&b.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Deserialize parameters.
+    pub fn read_params(reader: &mut impl Read) -> std::io::Result<Self> {
+        let dimension = read_usize(reader)?;
+        let rescore_multiplier = read_usize(reader)?;
+        let mut boundaries = vec![0.0_f32; dimension * 3];
+        for b in &mut boundaries {
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf)?;
+            *b = f32::from_le_bytes(buf);
+        }
+        let bytes_per_vector = (dimension + 3) / 4;
+        Ok(Self {
+            dimension,
+            boundaries,
+            codes: Vec::new(),
+            count: 0,
+            bytes_per_vector,
+            config: TwoBitQuantizationConfig { rescore_multiplier },
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-vector quantized index (for ColBERT token-level search)
+// ---------------------------------------------------------------------------
+
+/// Configuration for multi-vector quantization.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MultiVectorQuantizationConfig {
+    TwoBit(TwoBitQuantizationConfig),
+}
+
+/// A quantized index for multi-vector (late interaction) search.
+/// Stores all token vectors from all documents in a flat quantized array,
+/// with a mapping from document index to token range.
+#[derive(Clone, Debug)]
+pub struct MultiVectorQuantizedIndex {
+    pub quantizer: TwoBitQuantizer,
+    /// For each document: (start_index, count) into the quantized vector array.
+    pub doc_ranges: Vec<(usize, usize)>,
+}
+
+impl MultiVectorQuantizedIndex {
+    /// Build a multi-vector quantized index from per-document token vectors.
+    /// `doc_token_vectors[i]` is a slice of token-level vectors for document i.
+    pub fn build(
+        doc_token_vectors: &[&[Vec<f32>]],
+        token_dimension: usize,
+        config: &MultiVectorQuantizationConfig,
+    ) -> Self {
+        // Flatten all token vectors for training
+        let all_tokens: Vec<&[f32]> = doc_token_vectors
+            .iter()
+            .flat_map(|tokens| tokens.iter().map(|v| v.as_slice()))
+            .collect();
+
+        let MultiVectorQuantizationConfig::TwoBit(cfg) = config;
+
+        let quantizer = if all_tokens.is_empty() {
+            // Empty case: create minimal quantizer
+            TwoBitQuantizer {
+                dimension: token_dimension,
+                boundaries: vec![0.0; token_dimension * 3],
+                codes: Vec::new(),
+                count: 0,
+                bytes_per_vector: (token_dimension + 3) / 4,
+                config: cfg.clone(),
+            }
+        } else {
+            TwoBitQuantizer::train(&all_tokens, token_dimension, cfg.clone())
+        };
+
+        // Build doc_ranges
+        let mut doc_ranges = Vec::with_capacity(doc_token_vectors.len());
+        let mut offset = 0;
+        for tokens in doc_token_vectors {
+            doc_ranges.push((offset, tokens.len()));
+            offset += tokens.len();
+        }
+
+        Self {
+            quantizer,
+            doc_ranges,
+        }
+    }
+
+    /// Compute approximate MaxSim score for a document given query token codes.
+    /// For each query token, finds the max approximate dot with any document token.
+    pub fn approx_maxsim(&self, query_codes: &[Vec<u8>], doc_idx: usize) -> i32 {
+        let (start, count) = self.doc_ranges[doc_idx];
+        if count == 0 || query_codes.is_empty() {
+            return 0;
+        }
+        let mut total = 0i32;
+        for q_code in query_codes {
+            let mut best = i32::MIN;
+            for i in start..start + count {
+                let score = two_bit_approx_dot(
+                    q_code,
+                    &self.quantizer.codes[i * self.quantizer.bytes_per_vector
+                        ..(i + 1) * self.quantizer.bytes_per_vector],
+                    self.quantizer.dimension,
+                );
+                if score > best {
+                    best = score;
+                }
+            }
+            total += best;
+        }
+        total
+    }
+
+    /// Search: returns candidate document indices sorted by approximate MaxSim.
+    pub fn search(&self, query_tokens: &[&[f32]], top_k: usize) -> Vec<usize> {
+        let rescore_count = (top_k * self.quantizer.config.rescore_multiplier)
+            .max(50)
+            .min(self.doc_ranges.len());
+        if query_tokens.is_empty() || self.doc_ranges.is_empty() {
+            return Vec::new();
+        }
+
+        let query_codes: Vec<Vec<u8>> = query_tokens
+            .iter()
+            .map(|t| self.quantizer.quantize_vector(t))
+            .collect();
+
+        let mut scores: Vec<(usize, i32)> = (0..self.doc_ranges.len())
+            .map(|doc_idx| (doc_idx, self.approx_maxsim(&query_codes, doc_idx)))
+            .collect();
+
+        scores.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        scores.truncate(rescore_count);
+        scores.into_iter().map(|(idx, _)| idx).collect()
+    }
+
+    /// Rebuild from document token vectors (after loading parameters from disk).
+    pub fn rebuild(
+        &mut self,
+        doc_token_vectors: &[&[Vec<f32>]],
+    ) {
+        let all_tokens: Vec<&[f32]> = doc_token_vectors
+            .iter()
+            .flat_map(|tokens| tokens.iter().map(|v| v.as_slice()))
+            .collect();
+        self.quantizer.rebuild_codes(&all_tokens);
+
+        self.doc_ranges.clear();
+        let mut offset = 0;
+        for tokens in doc_token_vectors {
+            self.doc_ranges.push((offset, tokens.len()));
+            offset += tokens.len();
+        }
+    }
+
+    /// Serialize parameters.
+    pub fn write_params(&self, writer: &mut impl Write) -> std::io::Result<()> {
+        self.quantizer.write_params(writer)?;
+        // Write doc_ranges
+        write_usize(writer, self.doc_ranges.len())?;
+        for &(start, count) in &self.doc_ranges {
+            write_usize(writer, start)?;
+            write_usize(writer, count)?;
+        }
+        Ok(())
+    }
+
+    /// Deserialize parameters.
+    pub fn read_params(reader: &mut impl Read) -> std::io::Result<Self> {
+        // Consume the tag byte written by TwoBitQuantizer::write_params
+        let mut tag = [0u8; 1];
+        reader.read_exact(&mut tag)?;
+        if tag[0] != 4 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("expected two_bit tag (4), got {}", tag[0]),
+            ));
+        }
+        let quantizer = TwoBitQuantizer::read_params(reader)?;
+        let num_docs = read_usize(reader)?;
+        let mut doc_ranges = Vec::with_capacity(num_docs);
+        for _ in 0..num_docs {
+            let start = read_usize(reader)?;
+            let count = read_usize(reader)?;
+            doc_ranges.push((start, count));
+        }
+        Ok(Self {
+            quantizer,
+            doc_ranges,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unified quantization index
 // ---------------------------------------------------------------------------
 
@@ -738,6 +1062,45 @@ fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
         dist += (ai ^ bi).count_ones();
     }
     dist
+}
+
+/// Quantize a float vector to 2-bit codes (4 levels per dimension).
+/// Level mapping: val <= q25 → 0, val <= q50 → 1, val <= q75 → 2, else → 3.
+/// Packed 4 dimensions per byte (least-significant bits first).
+fn quantize_two_bit(vector: &[f32], boundaries: &[f32], bytes_per_vector: usize) -> Vec<u8> {
+    let mut result = vec![0u8; bytes_per_vector];
+    for (i, &val) in vector.iter().enumerate() {
+        let b_offset = i * 3;
+        let level = if val <= boundaries[b_offset] {
+            0u8
+        } else if val <= boundaries[b_offset + 1] {
+            1u8
+        } else if val <= boundaries[b_offset + 2] {
+            2u8
+        } else {
+            3u8
+        };
+        let byte_idx = i / 4;
+        let bit_offset = (i % 4) * 2;
+        result[byte_idx] |= level << bit_offset;
+    }
+    result
+}
+
+/// Approximate dot product between two 2-bit quantized vectors.
+/// Uses level values 0,1,2,3 as proxies for the original float magnitudes.
+/// Higher score = more similar.
+#[inline]
+fn two_bit_approx_dot(a: &[u8], b: &[u8], dimension: usize) -> i32 {
+    let mut sum = 0i32;
+    for i in 0..dimension {
+        let byte_idx = i / 4;
+        let bit_offset = (i % 4) * 2;
+        let a_level = ((a[byte_idx] >> bit_offset) & 0x03) as i32;
+        let b_level = ((b[byte_idx] >> bit_offset) & 0x03) as i32;
+        sum += a_level * b_level;
+    }
+    sum
 }
 
 /// Squared L2 distance between two vectors.
@@ -1083,5 +1446,142 @@ mod tests {
         // Bit 6: -0.1 -> 0
         // Bit 7: 0.9 > 0 -> 1
         assert_eq!(binary[0], 0b10100101);
+    }
+
+    #[test]
+    fn two_bit_quantization_basic() {
+        let vectors = random_vectors(100, 64, 42);
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+
+        let config = TwoBitQuantizationConfig {
+            rescore_multiplier: 4,
+        };
+        let quantizer = TwoBitQuantizer::train(&refs, 64, config);
+
+        assert_eq!(quantizer.dimension, 64);
+        assert_eq!(quantizer.count, 100);
+        assert_eq!(quantizer.bytes_per_vector, 16); // 64 dims * 2 bits / 8 = 16
+        assert_eq!(quantizer.boundaries.len(), 64 * 3);
+
+        // Search should return candidates including the query itself
+        let results = quantizer.search(&vectors[0], 10);
+        assert!(!results.is_empty());
+        assert!(results.iter().take(5).any(|(idx, _)| *idx == 0));
+    }
+
+    #[test]
+    fn two_bit_quantize_and_approx_dot() {
+        // Manually test quantization of a small vector
+        let boundaries = vec![
+            -0.5, 0.0, 0.5, // dim 0: quartiles
+            -0.5, 0.0, 0.5, // dim 1
+            -0.5, 0.0, 0.5, // dim 2
+            -0.5, 0.0, 0.5, // dim 3
+        ];
+        let bytes_per_vector = 1; // 4 dims * 2 bits = 8 bits = 1 byte
+
+        // Vector with values that map to different quantization levels
+        let v1 = [-1.0, -0.25, 0.25, 1.0]; // levels: 0, 1, 2, 3
+        let v2 = [-1.0, -0.25, 0.25, 1.0]; // levels: 0, 1, 2, 3
+
+        let q1 = quantize_two_bit(&v1, &boundaries, bytes_per_vector);
+        let q2 = quantize_two_bit(&v2, &boundaries, bytes_per_vector);
+
+        // Same vectors should have the maximum approx dot product
+        let dot = two_bit_approx_dot(&q1, &q2, 4);
+        assert!(dot > 0); // 0*0 + 1*1 + 2*2 + 3*3 = 0 + 1 + 4 + 9 = 14
+        assert_eq!(dot, 14);
+    }
+
+    #[test]
+    fn two_bit_serialization_roundtrip() {
+        use std::io::Read;
+
+        let vectors = random_vectors(50, 32, 99);
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+
+        let config = TwoBitQuantizationConfig {
+            rescore_multiplier: 6,
+        };
+        let original = TwoBitQuantizer::train(&refs, 32, config);
+
+        let mut buf = Vec::new();
+        original.write_params(&mut buf).unwrap();
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        // Consume the tag byte written by write_params
+        let mut tag = [0u8; 1];
+        cursor.read_exact(&mut tag).unwrap();
+        assert_eq!(tag[0], 4);
+        let restored = TwoBitQuantizer::read_params(&mut cursor).unwrap();
+
+        assert_eq!(original.dimension, restored.dimension);
+        assert_eq!(original.boundaries.len(), restored.boundaries.len());
+        for (a, b) in original.boundaries.iter().zip(restored.boundaries.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
+        assert_eq!(original.config.rescore_multiplier, restored.config.rescore_multiplier);
+    }
+
+    #[test]
+    fn multi_vector_quantized_index_basic() {
+        // Create 5 "documents", each with 3-5 token vectors of dimension 16
+        let mut doc_tokens: Vec<Vec<Vec<f32>>> = Vec::new();
+        for doc_idx in 0..5 {
+            let n_tokens = 3 + (doc_idx % 3); // 3, 4, 5, 3, 4 tokens
+            let tokens = random_vectors(n_tokens, 16, 100 + doc_idx as u64);
+            doc_tokens.push(tokens);
+        }
+
+        let doc_refs: Vec<&[Vec<f32>]> = doc_tokens.iter().map(|v| v.as_slice()).collect();
+        let config = MultiVectorQuantizationConfig::TwoBit(TwoBitQuantizationConfig {
+            rescore_multiplier: 4,
+        });
+
+        let index = MultiVectorQuantizedIndex::build(&doc_refs, 16, &config);
+
+        assert_eq!(index.doc_ranges.len(), 5);
+        // Total token count: 3+4+5+3+4 = 19
+        let total_tokens: usize = index.doc_ranges.iter().map(|(_, count)| count).sum();
+        assert_eq!(total_tokens, 19);
+
+        // Search with a query that matches document 0's tokens
+        let query_tokens: Vec<&[f32]> = doc_tokens[0].iter().map(Vec::as_slice).collect();
+        let results = index.search(&query_tokens, 3);
+        assert!(!results.is_empty());
+        // Document 0 should be among top results (its own tokens should
+        // score highest MaxSim against themselves)
+        assert!(results.iter().take(3).any(|&idx| idx == 0));
+    }
+
+    #[test]
+    fn multi_vector_quantized_index_serialization_roundtrip() {
+        let mut doc_tokens: Vec<Vec<Vec<f32>>> = Vec::new();
+        for i in 0..3 {
+            doc_tokens.push(random_vectors(4, 8, 200 + i));
+        }
+        let doc_refs: Vec<&[Vec<f32>]> = doc_tokens.iter().map(|v| v.as_slice()).collect();
+
+        let config = MultiVectorQuantizationConfig::TwoBit(TwoBitQuantizationConfig {
+            rescore_multiplier: 2,
+        });
+        let original = MultiVectorQuantizedIndex::build(&doc_refs, 8, &config);
+
+        let mut buf = Vec::new();
+        original.write_params(&mut buf).unwrap();
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let restored = MultiVectorQuantizedIndex::read_params(&mut cursor).unwrap();
+
+        assert_eq!(original.doc_ranges, restored.doc_ranges);
+        assert_eq!(original.quantizer.dimension, restored.quantizer.dimension);
+        assert_eq!(
+            original.quantizer.boundaries.len(),
+            restored.quantizer.boundaries.len()
+        );
+        assert_eq!(
+            original.quantizer.config.rescore_multiplier,
+            restored.quantizer.config.rescore_multiplier,
+        );
     }
 }

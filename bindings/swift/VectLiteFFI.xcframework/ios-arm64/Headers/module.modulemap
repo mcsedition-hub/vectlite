@@ -1,0 +1,4 @@
+module vectliteFFI {
+    header "vectliteFFI.h"
+    export *
+}

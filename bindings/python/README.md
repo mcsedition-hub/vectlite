@@ -38,10 +38,12 @@ with vectlite.open("knowledge.vdb", dimension=384) as db:
 ### Core
 
 - **Single-file storage** -- one `.vdb` file per database, portable and easy to back up
-- **Dense vectors** -- cosine similarity with automatic HNSW indexing for large collections
+- **Distance metrics** -- cosine (default), euclidean (L2), dot product, manhattan (L1) with SIMD acceleration
+- **Dense vectors** -- automatic HNSW indexing with metric-aware distance functions
 - **Sparse vectors** -- BM25-scored inverted index for keyword retrieval
 - **Hybrid search** -- dense + sparse fusion with linear or RRF strategies
 - **Vector quantization** -- scalar (int8, 4x), binary (32x), and product quantization (PQ) with 2-stage rescoring
+- **Multi-vector / ColBERT** -- late interaction search with per-token MaxSim scoring and 2-bit quantization (~16x compression)
 - **Rich metadata** -- `str`, `int`, `float`, `bool`, `None`, `list`, `dict` values
 - **Crash-safe WAL** -- writes land in a write-ahead log first, then checkpoint with `compact()`
 - **Transactions** -- atomic batched writes with `db.transaction()`
@@ -57,6 +59,7 @@ with vectlite.open("knowledge.vdb", dimension=384) as db:
 - **Namespaces** -- logical isolation with per-namespace or cross-namespace search
 - **Rerankers** -- built-in `text_match()`, `metadata_boost()`, `cross_encoder()`, `bi_encoder()`, composable with `compose()`
 - **Observability** -- `search_with_stats()` returns timings, BM25 term scores, ANN stats, and per-result `explain` payloads
+- **Payload indexes** -- keyword and numeric indexes on metadata fields accelerate filtered queries on large collections
 
 ### Data Management
 
@@ -64,14 +67,40 @@ with vectlite.open("knowledge.vdb", dimension=384) as db:
 - **Bulk ingestion** -- `bulk_ingest()` with deferred index rebuilds for fast imports
 - **Listing & filtered counts** -- `list()` and `count(namespace=..., filter=...)` without a vector query
 - **Delete by filter** -- remove matching records across a namespace slice in one call
+- **Partial metadata updates** -- `update_metadata()` merges a patch without re-writing the vector or rebuilding indexes
 - **Snapshots** -- `db.snapshot(path)` creates a self-contained copy
 - **Backup / Restore** -- `db.backup(dir)` and `vectlite.restore(dir, path)` for full roundtrips
 - **Read-only mode** -- `vectlite.open(path, read_only=True)` for safe concurrent readers
 - **Explicit close** -- `db.close()` or `with vectlite.open(...) as db:` to release locks deterministically
 - **Lock timeouts** -- `lock_timeout=` retries for bounded lock acquisition waits
 - **Text analyzers** -- configurable tokenizer pipeline with stopwords, stemming, and n-grams
+- **TTL / Expiry** -- `set_ttl()` / `clear_ttl()` or `ttl=` on insert/upsert; expired records auto-filtered from reads and GC'd on compact
+- **Cursor-based pagination** -- `list_cursor()` for efficient iteration over large collections
+- **LangChain integration** -- `vectlite.langchain.VectLiteVectorStore` (requires `langchain-core`)
+- **LlamaIndex integration** -- `vectlite.llamaindex.VectLiteVectorStore` (requires `llama-index-core`)
+- **Built-in embedders** -- `vectlite.embedders.openai()`, `.cohere()`, `.voyage()`, `.fastembed()`, `.sentence_transformer()`, `.ollama()`
+- **ONNX reranker** -- `vectlite.rerankers.onnx_cross_encoder()` for zero-PyTorch reranking with onnxruntime
+- **CLI** -- `vectlite stats`, `count`, `list`, `dump`, `search`, `compact`, `verify`, `bench`, `import-jsonl`, `import-csv`
+- **Schema validation** -- `vectlite.schema.Schema({"price": "number"})` with typed fields, strict mode, and sidecar persistence
 
 ## Usage
+
+### Distance Metrics
+
+```python
+# Default is cosine similarity
+db = vectlite.open("knowledge.vdb", dimension=384)
+
+# Choose a different metric at creation time
+db = vectlite.open("knowledge.vdb", dimension=384, metric="euclidean")  # L2 distance
+db = vectlite.open("knowledge.vdb", dimension=384, metric="dotproduct") # inner product
+db = vectlite.open("knowledge.vdb", dimension=384, metric="manhattan")  # L1 distance
+
+# Aliases: "l2", "dot", "ip", "l1"
+print(db.metric)  # "euclidean"
+```
+
+The metric is persisted in the database file. Scores are always oriented so that **higher is better**.
 
 ### Hybrid Search with Reranking
 
@@ -172,6 +201,24 @@ terms = analyzer.sparse_terms("How to authenticate users with SSO")
 # Use with upsert: db.upsert("doc1", emb, meta, sparse=terms)
 ```
 
+### Payload Indexes
+
+Create keyword or numeric indexes on metadata fields to accelerate filtered queries on large collections. Indexes are automatically used by `search()`, `count()`, and `list()`.
+
+```python
+# Create indexes on frequently-filtered fields
+db.create_index("source", "keyword")   # string equality, $in
+db.create_index("score", "numeric")    # range queries: $gt, $gte, $lt, $lte
+
+# Filtered queries now use indexes automatically
+count = db.count(filter={"source": "blog"})
+results = db.search(query, k=10, filter={"score": {"$gte": 0.8}})
+
+# Inspect and manage indexes
+print(db.list_indexes())  # [("source", "keyword"), ("score", "numeric")]
+db.drop_index("score")
+```
+
 ### Snapshots & Backup
 
 ```python
@@ -197,6 +244,9 @@ db = vectlite.open("knowledge.vdb", dimension=384, lock_timeout=5.0)
 records = db.list(namespace="docs", filter={"stale": False}, limit=20)
 count = db.count(namespace="docs", filter={"source": "blog"})
 deleted = db.delete_by_filter({"stale": True}, namespace="docs")
+
+# Partial metadata update (merge patch -- only touches specified keys)
+db.update_metadata("doc1", {"status": "reviewed", "score": 0.95})
 
 db.close()
 ```
@@ -238,6 +288,259 @@ db.disable_quantization()
 
 Quantization parameters persist across reopens in a `.vdb.quant` sidecar file.
 
+### Multi-Vector / ColBERT Search
+
+Store token-level embeddings (ColBERT, ColPali) and search with MaxSim late interaction scoring.
+
+```python
+# Upsert with per-token ColBERT embeddings
+db.upsert_multi_vectors(
+    "doc1",
+    dense_vector,
+    {"colbert": [token_vec_1, token_vec_2, ...]},
+    metadata={"source": "paper"},
+)
+
+# MaxSim search
+results = db.search_multi_vector("colbert", query_token_vectors, k=10)
+
+# Enable 2-bit quantization (~16x compression)
+db.enable_multi_vector_quantization("colbert")
+
+# Check and disable
+print(db.is_multi_vector_quantized("colbert"))  # True
+db.disable_multi_vector_quantization("colbert")
+```
+
+### TTL / Expiry
+
+Records can automatically expire after a time-to-live. Expired records are transparently filtered from all reads and permanently removed on `compact()`.
+
+```python
+# Set TTL on insert/upsert (seconds)
+db.upsert("session1", embedding, {"user": "alice"}, ttl=3600)  # expires in 1 hour
+
+# Set/clear TTL on existing records
+db.set_ttl("doc1", 86400)    # expire in 24 hours
+db.clear_ttl("doc1")          # remove expiry, record lives forever
+
+# Expired records are invisible to get/list/count/search
+record = db.get("session1")   # None after TTL elapses
+
+# compact() garbage-collects expired records from disk
+db.compact()
+```
+
+### Cursor-Based Pagination
+
+Efficiently iterate over large collections without offset overhead.
+
+```python
+# Paginate 100 records at a time
+cursor = None
+while True:
+    page, cursor = db.list_cursor(limit=100, cursor=cursor)
+    for record in page:
+        process(record)
+    if cursor is None:
+        break
+
+# Works with namespace and filter
+page, cursor = db.list_cursor(namespace="docs", filter={"source": "blog"}, limit=50)
+```
+
+### Built-in Embedding Providers
+
+Ready-to-use embedding functions for `upsert_text()` and `search_text()`. Each provider lazy-imports its SDK.
+
+```python
+from vectlite import embedders
+
+# OpenAI
+embed = embedders.openai("text-embedding-3-small")
+
+# Cohere
+embed = embedders.cohere("embed-english-v3.0")
+
+# Voyage AI
+embed = embedders.voyage("voyage-3")
+
+# Local with FastEmbed (ONNX, no API calls)
+embed = embedders.fastembed("BAAI/bge-small-en-v1.5")
+
+# Local with SentenceTransformers (PyTorch)
+embed = embedders.sentence_transformer("sentence-transformers/all-MiniLM-L6-v2")
+
+# Local Ollama server
+embed = embedders.ollama("nomic-embed-text")
+
+# Use with text helpers
+vectlite.upsert_text(db, "doc1", "Hello world", embed)
+results = vectlite.search_text(db, "greeting", embed, k=5)
+```
+
+### ONNX Cross-Encoder Reranker
+
+Zero-PyTorch reranking using `onnxruntime`. Same `RerankHook` interface as `cross_encoder()`.
+
+```python
+reranker = vectlite.rerankers.onnx_cross_encoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+results = db.search(query, k=20, rerank=reranker)
+```
+
+Requires: `pip install onnxruntime tokenizers huggingface-hub`
+
+### Schema Validation
+
+Define typed schemas for metadata with clear error messages on type mismatch.
+
+```python
+from vectlite import schema
+
+# Define a schema
+s = schema.Schema({
+    "price": "number",
+    "title": "string",
+    "tags": "array<string>",
+    "author": {
+        "name": "string",
+        "age": "number",
+    },
+}, strict=True)  # strict=True rejects unknown fields
+
+# Validate manually
+s.validate({"price": 9.99, "title": "Hello"})          # OK
+s.validate({"price": "free"})                            # raises SchemaError
+
+# Auto-validate on every write
+validated_db = schema.validated(db, s)
+validated_db.upsert("doc1", vector, {"price": 9.99})    # OK
+validated_db.upsert("doc2", vector, {"price": "free"})  # raises SchemaError
+
+# Persist schema alongside the database
+s.save(db)                  # writes .vdb.schema.json
+loaded = schema.load(db)    # reads it back
+```
+
+Supported types: `string`, `number`, `integer`, `boolean`, `null`, `any`, `array`, `array<string>`, `array<number>`, `object`, nested objects.
+
+### LangChain Integration
+
+```python
+from vectlite.langchain import VectLiteVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+store = VectLiteVectorStore(
+    path="my.vdb",
+    embedding=OpenAIEmbeddings(),
+    dimension=1536,
+)
+
+# Add documents
+store.add_texts(["Hello world", "How to authenticate"])
+
+# Search
+results = store.similarity_search("greeting", k=3)
+results_with_scores = store.similarity_search_with_score("greeting", k=3)
+
+# Use with VectorStoreIndex, RetrievalQA, etc.
+```
+
+Requires: `pip install langchain-core`
+
+### LlamaIndex Integration
+
+```python
+from vectlite.llamaindex import VectLiteVectorStore
+from llama_index.core import StorageContext, VectorStoreIndex
+
+store = VectLiteVectorStore(path="my.vdb", dimension=1536)
+storage_ctx = StorageContext.from_defaults(vector_store=store)
+index = VectorStoreIndex.from_documents(documents, storage_context=storage_ctx)
+
+query_engine = index.as_query_engine()
+response = query_engine.query("How do I authenticate?")
+```
+
+Requires: `pip install llama-index-core`
+
+### CLI
+
+Full command-line interface. Install with `pip install vectlite`, then:
+
+```bash
+# Database stats
+vectlite stats my.vdb
+
+# Count records
+vectlite count my.vdb --namespace blog
+
+# List records
+vectlite list my.vdb --limit 10 --filter '{"source": "blog"}'
+
+# Dump all records as JSONL
+vectlite dump my.vdb > backup.jsonl
+
+# Search
+vectlite search my.vdb --query '[1.0, 0.0, 0.5]' --k 5
+
+# Import data
+vectlite import-jsonl my.vdb data.jsonl --dimension 384
+vectlite import-csv my.vdb data.csv --dimension 384 --vector-col embedding
+
+# Maintenance
+vectlite compact my.vdb
+vectlite verify my.vdb
+
+# Benchmark
+vectlite bench my.vdb --queries 1000 --k 10
+```
+
+Also available as `python -m vectlite`.
+
+### OpenTelemetry Integration
+
+vectlite ships with optional OpenTelemetry tracing. When enabled, every
+`search_text` and `search_text_with_stats` call is wrapped in a span carrying
+semantic DB attributes and search-specific metrics. `opentelemetry-api` is
+imported lazily -- it is **not** a runtime dependency.
+
+```python
+import vectlite
+
+# Auto-detect: resolves a tracer from opentelemetry.trace if installed
+tracer = vectlite.configure_opentelemetry()
+
+# Or supply your own tracer
+vectlite.configure_opentelemetry({"tracer": my_tracer})
+
+# Custom tracer name (default: "vectlite")
+vectlite.configure_opentelemetry({"tracer_name": "my-app"})
+
+# Disable
+vectlite.configure_opentelemetry(False)
+```
+
+When a tracer is active, each `search_text` / `search_text_with_stats` call
+creates a `vectlite.search` span with these attributes:
+
+| Attribute | Description |
+|---|---|
+| `db.system` | Always `"vectlite"` |
+| `db.operation.name` | Always `"search"` |
+| `vectlite.search.k` | Requested result count |
+| `vectlite.search.namespace` | Target namespace |
+| `vectlite.search.has_dense` | Whether a dense query vector was provided |
+| `vectlite.search.has_sparse` | Whether sparse terms were provided |
+| `vectlite.search.fusion` | Fusion strategy (`"linear"` or `"rrf"`) |
+| `vectlite.search.used_ann` | Whether HNSW was used (set after completion) |
+| `vectlite.search.result_count` | Number of results returned (set after completion) |
+| `vectlite.search.total_us` | Total search time in microseconds (set after completion) |
+
+If a search raises, the span records the exception and sets an error status
+before re-raising.
+
 ## Filter Operators
 
 | Operator | Example | Description |
@@ -269,6 +572,9 @@ Quantization parameters persist across reopens in a `.vdb.quant` sidecar file.
 | `db.delete(id, namespace=None)` | Delete a single record |
 | `db.delete_many(ids, namespace=None)` | Delete multiple records by id |
 | `db.delete_by_filter(filter, namespace=None)` | Delete all matching records in one filtered pass |
+| `db.update_metadata(id, metadata, namespace=None)` | Merge a metadata patch into an existing record (no vector rewrite) |
+| `db.set_ttl(id, ttl_secs, namespace=None)` | Set a time-to-live on a record (seconds from now) |
+| `db.clear_ttl(id, namespace=None)` | Remove expiry from a record |
 
 ### Read Methods
 
@@ -279,10 +585,20 @@ Quantization parameters persist across reopens in a `.vdb.quant` sidecar file.
 | `db.search_with_stats(query, k=10, ...)` | Search with detailed performance stats |
 | `db.count(namespace=None, filter=None)` or `len(db)` | Count records, optionally scoped by namespace/filter |
 | `db.list(namespace=None, filter=None, limit=0, offset=0)` | List records without issuing a vector query |
+| `db.list_cursor(namespace=None, filter=None, limit=100, cursor=None)` | Cursor-based pagination (returns `(records, next_cursor)`) |
 | `db.namespaces()` | List all namespaces |
 | `db.dimension` | Vector dimension (property) |
 | `db.path` | Database file path (property) |
+| `db.metric` | Distance metric name: `"cosine"`, `"euclidean"`, `"dotproduct"`, or `"manhattan"` (property) |
 | `db.read_only` | Whether the database is read-only (property) |
+
+### Index Methods
+
+| Method | Description |
+|--------|-------------|
+| `db.create_index(field, index_type)` | Create a payload index (`"keyword"` or `"numeric"`) on a metadata field |
+| `db.drop_index(field)` | Remove an index |
+| `db.list_indexes()` | List all active indexes as `[(field, type), ...]` |
 
 ### Quantization Methods
 

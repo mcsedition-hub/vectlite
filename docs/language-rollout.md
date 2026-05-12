@@ -79,11 +79,11 @@ Likely order:
 
 At that point, add a thin FFI boundary instead of letting framework code bind directly to Rust internals.
 
-## Swift And Kotlin Last
+## Swift And Kotlin
 
-Native mobile wrappers should land after the FFI contract is proven by framework work:
+Native wrappers now share the UniFFI layer in `bindings/uniffi`:
 
-- Swift Package / XCFramework on iOS
-- Android `.so` + Kotlin wrapper on Android
+- Swift Package / XCFramework in `bindings/swift`
+- Kotlin/JVM package in `bindings/kotlin`
 
-That keeps the mobile surface thin and avoids redesigning the core twice.
+Keep the mobile surface thin: the Swift and Kotlin packages should wrap the same UDL contract instead of binding directly to Rust internals.

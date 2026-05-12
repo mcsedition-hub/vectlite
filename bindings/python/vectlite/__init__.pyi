@@ -11,13 +11,14 @@ Filter = dict[str, object]
 RerankHook = Callable[[dict[str, Any], list[dict[str, Any]]], list[dict[str, Any]]]
 
 
-class Record(TypedDict):
+class Record(TypedDict, total=False):
     namespace: str
     id: str
     vector: list[float]
     vectors: dict[str, list[float]]
     sparse: dict[str, float]
     metadata: Metadata
+    expires_at: float | None
 
 
 class ExplainDetails(TypedDict, total=False):
@@ -66,6 +67,8 @@ class SearchStats(TypedDict):
     ann_loaded_from_disk: bool
     wal_entries_replayed: int
     fusion: str
+    effective_dimension: int
+    matryoshka_truncated: bool
     rerank_applied: bool
     rerank_count: int
     timings: SearchTimings
@@ -88,6 +91,7 @@ class Transaction:
         namespace: str | None = None,
         sparse: dict[str, float] | None = None,
         vectors: dict[str, list[float]] | None = None,
+        ttl: float | None = None,
     ) -> None: ...
     def upsert(
         self,
@@ -97,6 +101,7 @@ class Transaction:
         namespace: str | None = None,
         sparse: dict[str, float] | None = None,
         vectors: dict[str, list[float]] | None = None,
+        ttl: float | None = None,
     ) -> None: ...
     def insert_many(self, records: list[Record], namespace: str | None = None) -> int: ...
     def upsert_many(self, records: list[Record], namespace: str | None = None) -> int: ...
@@ -114,6 +119,8 @@ class Database:
     @property
     def dimension(self) -> int: ...
     @property
+    def metric(self) -> str: ...
+    @property
     def read_only(self) -> bool: ...
     def __enter__(self) -> Database: ...
     def __exit__(self, exc_type: object | None, exc: object | None, tb: object | None) -> bool: ...
@@ -128,6 +135,13 @@ class Database:
         limit: int = 0,
         offset: int = 0,
     ) -> list[Record]: ...
+    def list_cursor(
+        self,
+        namespace: str | None = None,
+        filter: Filter | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> tuple[list[Record], str | None]: ...
     def transaction(self) -> Transaction: ...
     def insert(
         self,
@@ -137,6 +151,7 @@ class Database:
         namespace: str | None = None,
         sparse: dict[str, float] | None = None,
         vectors: dict[str, list[float]] | None = None,
+        ttl: float | None = None,
     ) -> None: ...
     def upsert(
         self,
@@ -146,6 +161,7 @@ class Database:
         namespace: str | None = None,
         sparse: dict[str, float] | None = None,
         vectors: dict[str, list[float]] | None = None,
+        ttl: float | None = None,
     ) -> None: ...
     def insert_many(self, records: list[Record], namespace: str | None = None) -> int: ...
     def upsert_many(self, records: list[Record], namespace: str | None = None) -> int: ...
@@ -159,6 +175,12 @@ class Database:
     def delete(self, id: str, namespace: str | None = None) -> bool: ...
     def delete_many(self, ids: list[str], namespace: str | None = None) -> int: ...
     def delete_by_filter(self, filter: Filter, namespace: str | None = None) -> int: ...
+    def update_metadata(self, id: str, metadata: Metadata, namespace: str | None = None) -> bool: ...
+    def set_ttl(self, id: str, ttl: float, namespace: str | None = None) -> bool: ...
+    def clear_ttl(self, id: str, namespace: str | None = None) -> bool: ...
+    def create_index(self, field: str, index_type: str) -> bool: ...
+    def drop_index(self, field: str) -> bool: ...
+    def list_indexes(self) -> list[tuple[str, str]]: ...
     def flush(self) -> None: ...
     def compact(self) -> None: ...
     def snapshot(self, dest: str) -> None: ...
@@ -178,6 +200,7 @@ class Database:
         vector_name: str | None = None,
         fusion: str = "linear",
         rrf_k: int = 60,
+        truncate_dim: int | None = None,
         explain: bool = False,
         rerank: RerankHook | None = None,
         rerank_k: int = 0,
@@ -199,6 +222,7 @@ class Database:
         vector_name: str | None = None,
         fusion: str = "linear",
         rrf_k: int = 60,
+        truncate_dim: int | None = None,
         explain: bool = False,
         rerank: RerankHook | None = None,
         rerank_k: int = 0,
@@ -229,6 +253,7 @@ def open(
     dimension: int | None = None,
     read_only: bool = False,
     lock_timeout: float | None = None,
+    metric: str | None = None,
 ) -> Database: ...
 def open_store(root: str) -> Store: ...
 def restore(source: str, dest: str) -> Database: ...
@@ -280,4 +305,7 @@ def search_text_with_stats(
     rerank: RerankHook | None = None,
     rerank_k: int = 0,
 ) -> SearchResponse: ...
+def configure_opentelemetry(
+    options: dict[str, Any] | bool | None = None,
+) -> Any: ...
 def sparse_terms(text: str) -> dict[str, float]: ...

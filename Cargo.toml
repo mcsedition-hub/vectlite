@@ -4,10 +4,11 @@ members = [
     "crates/vectlite-cli",
     "bindings/python",
     "bindings/node",
+    "bindings/uniffi",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.12"
+version = "0.9.0"
 edition = "2024"
 license = "MIT"

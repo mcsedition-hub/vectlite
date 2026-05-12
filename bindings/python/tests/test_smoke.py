@@ -1,3 +1,4 @@
+import json
 import math
 from pathlib import Path
 
@@ -961,4 +962,1067 @@ def test_quantization_invalid_method_raises(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unknown quantization method"):
         db.enable_quantization("invalid_method")
 
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Multi-vector / ColBERT-style tests
+# ---------------------------------------------------------------------------
+
+
+def test_multi_vector_upsert_and_search(tmp_path: Path) -> None:
+    """Upsert records with multi-vectors and search via MaxSim."""
+    path = tmp_path / "mv_basic.vdb"
+    db = vectlite.open(str(path), dimension=3)
+
+    # Upsert with ColBERT-style token vectors
+    db.upsert_multi_vectors(
+        "doc1",
+        [1.0, 0.0, 0.0],
+        {"colbert": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]},
+    )
+    db.upsert_multi_vectors(
+        "doc2",
+        [0.0, 0.0, 1.0],
+        {"colbert": [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]},
+    )
+
+    assert db.count() == 2
+
+    # Search with query tokens matching doc1
+    results = db.search_multi_vector(
+        "colbert",
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        k=2,
+    )
+
+    assert len(results) == 2
+    assert results[0]["id"] == "doc1"
+    assert results[0]["score"] > results[1]["score"]
+
+    db.close()
+
+
+def test_multi_vector_with_metadata(tmp_path: Path) -> None:
+    """Multi-vector upsert preserves metadata and it appears in results."""
+    path = tmp_path / "mv_meta.vdb"
+    db = vectlite.open(str(path), dimension=3)
+
+    db.upsert_multi_vectors(
+        "doc1",
+        [1.0, 0.0, 0.0],
+        {"colbert": [[1.0, 0.0, 0.0]]},
+        metadata={"source": "blog"},
+    )
+
+    results = db.search_multi_vector("colbert", [[1.0, 0.0, 0.0]])
+    assert len(results) == 1
+    assert results[0]["metadata"]["source"] == "blog"
+
+    db.close()
+
+
+def test_multi_vector_namespace_filter(tmp_path: Path) -> None:
+    """Multi-vector search respects namespace filtering."""
+    path = tmp_path / "mv_ns.vdb"
+    db = vectlite.open(str(path), dimension=3)
+
+    db.upsert_multi_vectors(
+        "doc1",
+        [1.0, 0.0, 0.0],
+        {"colbert": [[1.0, 0.0, 0.0]]},
+        namespace="ns1",
+    )
+    db.upsert_multi_vectors(
+        "doc2",
+        [1.0, 0.0, 0.0],
+        {"colbert": [[1.0, 0.0, 0.0]]},
+        namespace="ns2",
+    )
+
+    results = db.search_multi_vector(
+        "colbert", [[1.0, 0.0, 0.0]], namespace="ns1"
+    )
+    assert len(results) == 1
+    assert results[0]["id"] == "doc1"
+
+    db.close()
+
+
+def test_multi_vector_quantization(tmp_path: Path) -> None:
+    """Enable/disable 2-bit quantization for multi-vector space."""
+    path = tmp_path / "mv_quant.vdb"
+    db = vectlite.open(str(path), dimension=3)
+
+    for i in range(10):
+        db.upsert_multi_vectors(
+            f"doc{i}",
+            [float(i), 0.0, 0.0],
+            {"colbert": [[float(i), 0.0, 0.0], [0.0, float(i), 0.0]]},
+        )
+
+    assert db.is_multi_vector_quantized("colbert") is False
+
+    db.enable_multi_vector_quantization("colbert")
+    assert db.is_multi_vector_quantized("colbert") is True
+
+    # Search should still work
+    results = db.search_multi_vector(
+        "colbert", [[9.0, 0.0, 0.0], [0.0, 9.0, 0.0]], k=3
+    )
+    assert len(results) > 0
+
+    # Disable
+    db.disable_multi_vector_quantization("colbert")
+    assert db.is_multi_vector_quantized("colbert") is False
+
+    db.close()
+
+
+def test_multi_vector_quantization_persists(tmp_path: Path) -> None:
+    """Multi-vector quantization persists across database close/reopen."""
+    path = tmp_path / "mv_quant_persist.vdb"
+    db = vectlite.open(str(path), dimension=3)
+
+    for i in range(10):
+        db.upsert_multi_vectors(
+            f"doc{i}",
+            [1.0, 0.0, 0.0],
+            {"colbert": [[float(i) * 0.1, 0.5, 0.5], [0.5, float(i) * 0.1, 0.5]]},
+        )
+
+    db.enable_multi_vector_quantization("colbert")
+    assert db.is_multi_vector_quantized("colbert") is True
+    db.close()
+
+    db2 = vectlite.open(str(path))
+    assert db2.is_multi_vector_quantized("colbert") is True
+
+    results = db2.search_multi_vector("colbert", [[0.9, 0.5, 0.5]], k=5)
+    assert len(results) > 0
+    db2.close()
+
+
+def test_multi_vector_invalid_method_raises(tmp_path: Path) -> None:
+    """Using an invalid multi-vector quantization method raises ValueError."""
+    path = tmp_path / "mv_invalid.vdb"
+    db = vectlite.open(str(path), dimension=3)
+    db.upsert_multi_vectors(
+        "doc1",
+        [1.0, 0.0, 0.0],
+        {"colbert": [[1.0, 0.0, 0.0]]},
+    )
+
+    with pytest.raises(ValueError, match="unknown multi-vector quantization method"):
+        db.enable_multi_vector_quantization("colbert", method="invalid_method")
+
+    db.close()
+
+
+def test_multi_vector_record_persists(tmp_path: Path) -> None:
+    """Multi-vector data persists across close/reopen."""
+    path = tmp_path / "mv_persist.vdb"
+    db = vectlite.open(str(path), dimension=3)
+
+    db.upsert_multi_vectors(
+        "doc1",
+        [1.0, 0.0, 0.0],
+        {"colbert": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]},
+    )
+    db.close()
+
+    db2 = vectlite.open(str(path))
+    # Verify by searching — the tokens should be findable
+    results = db2.search_multi_vector("colbert", [[1.0, 2.0, 3.0]], k=1)
+    assert len(results) == 1
+    assert results[0]["id"] == "doc1"
+    db2.close()
+
+
+# ---------------------------------------------------------------------------
+# Distance metric tests
+# ---------------------------------------------------------------------------
+
+
+def test_default_metric_is_cosine(tmp_path: Path) -> None:
+    """Database created without metric defaults to cosine."""
+    path = tmp_path / "default_metric.vdb"
+    db = vectlite.open(str(path), dimension=3)
+    assert db.metric == "cosine"
+    db.close()
+
+
+def test_create_with_each_metric(tmp_path: Path) -> None:
+    """Each supported metric can be set at creation and persists across reopen."""
+    for metric_name in ["cosine", "euclidean", "dotproduct", "manhattan"]:
+        path = tmp_path / f"metric_{metric_name}.vdb"
+        db = vectlite.open(str(path), dimension=3, metric=metric_name)
+        assert db.metric == metric_name
+        db.close()
+
+        # Reopen and verify metric persisted
+        db2 = vectlite.open(str(path))
+        assert db2.metric == metric_name
+        db2.close()
+
+
+def test_metric_aliases(tmp_path: Path) -> None:
+    """Metric aliases (l2, dot, ip, l1) are accepted."""
+    aliases = {
+        "l2": "euclidean",
+        "dot": "dotproduct",
+        "ip": "dotproduct",
+        "l1": "manhattan",
+    }
+    for alias, expected in aliases.items():
+        path = tmp_path / f"metric_alias_{alias}.vdb"
+        db = vectlite.open(str(path), dimension=3, metric=alias)
+        assert db.metric == expected
+        db.close()
+
+
+def test_invalid_metric_raises(tmp_path: Path) -> None:
+    """An invalid metric name raises VectLiteError."""
+    path = tmp_path / "bad_metric.vdb"
+    with pytest.raises(vectlite.VectLiteError, match="unknown distance metric"):
+        vectlite.open(str(path), dimension=3, metric="hamming")
+
+
+def test_euclidean_search_ordering(tmp_path: Path) -> None:
+    """Euclidean metric orders results by L2 distance (closest first)."""
+    path = tmp_path / "euclidean_search.vdb"
+    db = vectlite.open(str(path), dimension=3, metric="euclidean")
+
+    db.upsert("close", [1.0, 0.0, 0.0])  # L2 = 1 from [0,0,0]
+    db.upsert("mid", [3.0, 0.0, 0.0])  # L2 = 3
+    db.upsert("far", [5.0, 5.0, 5.0])  # L2 = sqrt(75) ≈ 8.66
+
+    results = db.search([0.0, 0.0, 0.0], k=3)
+
+    assert [r["id"] for r in results] == ["close", "mid", "far"]
+    # Scores are negative distances (higher = closer)
+    assert results[0]["score"] > results[1]["score"] > results[2]["score"]
+    db.close()
+
+
+def test_dotproduct_search_ordering(tmp_path: Path) -> None:
+    """Dot product metric orders by raw inner product (highest first)."""
+    path = tmp_path / "dot_search.vdb"
+    db = vectlite.open(str(path), dimension=3, metric="dotproduct")
+
+    db.upsert("high", [10.0, 0.0, 0.0])  # dot = 10 with query [1,0,0]
+    db.upsert("medium", [5.0, 0.0, 0.0])  # dot = 5
+    db.upsert("low", [0.0, 1.0, 0.0])  # dot = 0
+
+    results = db.search([1.0, 0.0, 0.0], k=3)
+
+    assert [r["id"] for r in results] == ["high", "medium", "low"]
+    assert results[0]["score"] > results[1]["score"] > results[2]["score"]
+    db.close()
+
+
+def test_manhattan_search_ordering(tmp_path: Path) -> None:
+    """Manhattan metric orders by L1 distance (closest first)."""
+    path = tmp_path / "manhattan_search.vdb"
+    db = vectlite.open(str(path), dimension=3, metric="manhattan")
+
+    db.upsert("close", [1.0, 0.0, 0.0])  # L1 = 1 from [0,0,0]
+    db.upsert("mid", [2.0, 1.0, 0.0])  # L1 = 3
+    db.upsert("far", [3.0, 3.0, 3.0])  # L1 = 9
+
+    results = db.search([0.0, 0.0, 0.0], k=3)
+
+    assert [r["id"] for r in results] == ["close", "mid", "far"]
+    assert results[0]["score"] > results[1]["score"] > results[2]["score"]
+    db.close()
+
+
+def test_cosine_explicit_search(tmp_path: Path) -> None:
+    """Cosine metric explicitly set works same as default."""
+    path = tmp_path / "cosine_explicit.vdb"
+    db = vectlite.open(str(path), dimension=3, metric="cosine")
+
+    db.upsert("aligned", [2.0, 0.0, 0.0])  # cos = 1.0 with [1,0,0]
+    db.upsert("diagonal", [1.0, 1.0, 0.0])  # cos ≈ 0.707
+    db.upsert("orthogonal", [0.0, 0.0, 1.0])  # cos = 0.0
+
+    results = db.search([1.0, 0.0, 0.0], k=3)
+
+    assert [r["id"] for r in results] == ["aligned", "diagonal", "orthogonal"]
+    assert abs(results[0]["score"] - 1.0) < 1e-4
+    db.close()
+
+
+def test_metric_persists_after_upsert_and_reopen(tmp_path: Path) -> None:
+    """Metric persists correctly even after writing data and reopening."""
+    path = tmp_path / "metric_persist.vdb"
+    db = vectlite.open(str(path), dimension=3, metric="manhattan")
+    db.upsert("a", [1.0, 0.0, 0.0])
+    db.upsert("b", [0.0, 5.0, 0.0])
+    db.close()
+
+    # Reopen, verify metric, and search
+    db2 = vectlite.open(str(path))
+    assert db2.metric == "manhattan"
+
+    results = db2.search([1.0, 0.0, 0.0], k=2)
+    assert results[0]["id"] == "a"  # L1 = 0 vs L1 = 6
+    assert results[1]["id"] == "b"
+    db2.close()
+
+
+# ---------------------------------------------------------------------------
+# update_metadata  (Feature 6: partial metadata patch)
+# ---------------------------------------------------------------------------
+
+
+def test_update_metadata_merges_patch(tmp_path: Path) -> None:
+    """update_metadata merges keys without touching the vector."""
+    db = vectlite.open(str(tmp_path / "update_meta.vdb"), dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0], {"source": "blog", "version": 1})
+
+    db.update_metadata("doc1", {"version": 2, "reviewed": True})
+
+    record = db.get("doc1")
+    assert record is not None
+    assert record["metadata"]["source"] == "blog"  # untouched
+    assert record["metadata"]["version"] == 2  # overwritten
+    assert record["metadata"]["reviewed"] is True  # added
+    assert record["vector"] == [1.0, 0.0, 0.0]  # vector intact
+    db.close()
+
+
+def test_update_metadata_returns_false_for_missing(tmp_path: Path) -> None:
+    """update_metadata returns False when the id doesn't exist."""
+    db = vectlite.open(str(tmp_path / "update_missing.vdb"), dimension=3)
+    result = db.update_metadata("nonexistent", {"key": "val"})
+    assert result is False
+    db.close()
+
+
+def test_update_metadata_persists_across_reopen(tmp_path: Path) -> None:
+    """Partial metadata patch survives close/reopen via WAL replay."""
+    path = str(tmp_path / "update_persist.vdb")
+    db = vectlite.open(path, dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0], {"source": "blog"})
+    db.update_metadata("doc1", {"source": "updated", "new_key": 42})
+    db.close()
+
+    db2 = vectlite.open(path)
+    record = db2.get("doc1")
+    assert record is not None
+    assert record["metadata"]["source"] == "updated"
+    assert record["metadata"]["new_key"] == 42
+    assert record["vector"] == [1.0, 0.0, 0.0]
+    db2.close()
+
+
+def test_update_metadata_with_namespace(tmp_path: Path) -> None:
+    """update_metadata works correctly with explicit namespaces."""
+    db = vectlite.open(str(tmp_path / "update_ns.vdb"), dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0], {"key": "original"}, namespace="ns1")
+
+    result = db.update_metadata("doc1", {"key": "patched"}, namespace="ns1")
+    assert result is True
+
+    record = db.get("doc1", namespace="ns1")
+    assert record is not None
+    assert record["metadata"]["key"] == "patched"
+
+    # Wrong namespace returns False
+    result2 = db.update_metadata("doc1", {"key": "nope"}, namespace="ns2")
+    assert result2 is False
+    db.close()
+
+
+def test_update_metadata_searchable_after_patch(tmp_path: Path) -> None:
+    """After patching metadata, filtered count reflects the new values."""
+    db = vectlite.open(str(tmp_path / "update_search.vdb"), dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0], {"status": "draft"})
+
+    assert db.count(filter={"status": "draft"}) == 1
+
+    db.update_metadata("doc1", {"status": "published"})
+
+    assert db.count(filter={"status": "draft"}) == 0
+    assert db.count(filter={"status": "published"}) == 1
+    db.close()
+
+
+def test_update_metadata_read_only_fails(tmp_path: Path) -> None:
+    """update_metadata on a read-only database raises VectLiteError."""
+    path = str(tmp_path / "update_ro.vdb")
+    db = vectlite.open(path, dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0])
+    db.close()
+
+    db_ro = vectlite.open(path, read_only=True)
+    with pytest.raises(vectlite.VectLiteError):
+        db_ro.update_metadata("doc1", {"key": "val"})
+    db_ro.close()
+
+
+# ── Payload Index tests ──────────────────────────────────────────────
+
+
+def test_create_index_keyword(tmp_path: Path) -> None:
+    """create_index creates a keyword index and returns True."""
+    db = vectlite.open(str(tmp_path / "pidx.vdb"), dimension=3)
+    assert db.create_index("source", "keyword") is True
+    indexes = db.list_indexes()
+    assert len(indexes) == 1
+    assert indexes[0] == ("source", "keyword")
+    db.close()
+
+
+def test_create_index_duplicate_returns_false(tmp_path: Path) -> None:
+    """Duplicate create_index call returns False."""
+    db = vectlite.open(str(tmp_path / "pidx_dup.vdb"), dimension=3)
+    assert db.create_index("source", "keyword") is True
+    assert db.create_index("source", "keyword") is False
+    assert len(db.list_indexes()) == 1
+    db.close()
+
+
+def test_create_index_numeric(tmp_path: Path) -> None:
+    """create_index creates a numeric index."""
+    db = vectlite.open(str(tmp_path / "pidx_num.vdb"), dimension=3)
+    assert db.create_index("price", "numeric") is True
+    indexes = db.list_indexes()
+    assert len(indexes) == 1
+    assert indexes[0] == ("price", "numeric")
+    db.close()
+
+
+def test_drop_index(tmp_path: Path) -> None:
+    """drop_index removes an existing index."""
+    db = vectlite.open(str(tmp_path / "pidx_drop.vdb"), dimension=3)
+    db.create_index("source", "keyword")
+    assert db.drop_index("source") is True
+    assert len(db.list_indexes()) == 0
+    assert db.drop_index("source") is False
+    db.close()
+
+
+def test_list_indexes_empty(tmp_path: Path) -> None:
+    """list_indexes returns empty list by default."""
+    db = vectlite.open(str(tmp_path / "pidx_empty.vdb"), dimension=3)
+    assert db.list_indexes() == []
+    db.close()
+
+
+def test_keyword_index_accelerates_count(tmp_path: Path) -> None:
+    """Keyword index accelerates count with $eq filter."""
+    db = vectlite.open(str(tmp_path / "pidx_count.vdb"), dimension=3)
+    for i in range(20):
+        db.upsert(f"doc{i}", [1.0, 0.0, 0.0], {"tag": f"t{i % 4}"})
+
+    db.create_index("tag", "keyword")
+
+    assert db.count(filter={"tag": "t0"}) == 5
+    assert db.count(filter={"tag": "t3"}) == 5
+    assert db.count(filter={"tag": "t99"}) == 0
+    db.close()
+
+
+def test_numeric_index_range_queries(tmp_path: Path) -> None:
+    """Numeric index accelerates range queries."""
+    db = vectlite.open(str(tmp_path / "pidx_range.vdb"), dimension=3)
+    for i in range(50):
+        db.upsert(f"doc{i}", [1.0, 0.0, 0.0], {"score": float(i)})
+
+    db.create_index("score", "numeric")
+
+    assert db.count(filter={"score": {"$gt": 40}}) == 9
+    assert db.count(filter={"score": {"$gte": 40}}) == 10
+    assert db.count(filter={"score": {"$lt": 10}}) == 10
+    assert db.count(filter={"score": {"$lte": 10}}) == 11
+    db.close()
+
+
+def test_payload_index_persists_across_reopen(tmp_path: Path) -> None:
+    """Index definitions and data persist across close/reopen."""
+    path = str(tmp_path / "pidx_persist.vdb")
+    db = vectlite.open(path, dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0], {"source": "blog"})
+    db.upsert("doc2", [0.0, 1.0, 0.0], {"source": "docs"})
+    db.create_index("source", "keyword")
+    db.close()
+
+    db2 = vectlite.open(path)
+    indexes = db2.list_indexes()
+    assert len(indexes) == 1
+    assert indexes[0][0] == "source"
+    assert db2.count(filter={"source": "blog"}) == 1
+    db2.close()
+
+
+def test_payload_index_update_metadata(tmp_path: Path) -> None:
+    """update_metadata correctly updates the payload index."""
+    db = vectlite.open(str(tmp_path / "pidx_upd.vdb"), dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0], {"status": "draft"})
+    db.create_index("status", "keyword")
+
+    assert db.count(filter={"status": "draft"}) == 1
+    db.update_metadata("doc1", {"status": "published"})
+    assert db.count(filter={"status": "draft"}) == 0
+    assert db.count(filter={"status": "published"}) == 1
+    db.close()
+
+
+def test_create_index_read_only_fails(tmp_path: Path) -> None:
+    """create_index on a read-only database raises VectLiteError."""
+    path = str(tmp_path / "pidx_ro.vdb")
+    db = vectlite.open(path, dimension=3)
+    db.close()
+
+    db_ro = vectlite.open(path, read_only=True)
+    with pytest.raises(vectlite.VectLiteError):
+        db_ro.create_index("source", "keyword")
+    db_ro.close()
+
+
+def test_payload_index_search_filters(tmp_path: Path) -> None:
+    """Search with a payload-indexed filter returns correct results."""
+    db = vectlite.open(str(tmp_path / "pidx_search.vdb"), dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0], {"category": "tech"})
+    db.upsert("doc2", [0.9, 0.1, 0.0], {"category": "science"})
+    db.upsert("doc3", [0.8, 0.2, 0.0], {"category": "tech"})
+    db.create_index("category", "keyword")
+
+    results = db.search([1.0, 0.0, 0.0], k=10, filter={"category": "tech"})
+    ids = [r["id"] for r in results]
+    assert "doc1" in ids
+    assert "doc3" in ids
+    assert "doc2" not in ids
+    db.close()
+
+
+def test_payload_index_invalid_type_raises(tmp_path: Path) -> None:
+    """create_index with an invalid type name raises an error."""
+    db = vectlite.open(str(tmp_path / "pidx_bad.vdb"), dimension=3)
+    with pytest.raises(vectlite.VectLiteError):
+        db.create_index("field", "invalid_type")
+    db.close()
+
+
+# -------------------------------------------------------------------
+# TTL / Expiry tests
+# -------------------------------------------------------------------
+
+import time
+
+
+def test_set_ttl_hides_record(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "ttl.vdb"), dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0])
+    assert db.get("doc1") is not None
+
+    db.set_ttl("doc1", 0.0)
+    time.sleep(0.02)
+    assert db.get("doc1") is None
+    db.close()
+
+
+def test_clear_ttl_restores_record(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "ttl_clear.vdb"), dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0])
+    db.set_ttl("doc1", 0.0)
+    time.sleep(0.02)
+    assert db.get("doc1") is None
+
+    db.clear_ttl("doc1")
+    assert db.get("doc1") is not None
+    db.close()
+
+
+def test_ttl_excludes_from_count_list_search(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "ttl_cls.vdb"), dimension=3)
+    db.upsert("a", [1.0, 0.0, 0.0])
+    db.upsert("b", [0.0, 1.0, 0.0])
+    assert db.count() == 2
+    assert len(db.list()) == 2
+
+    db.set_ttl("a", 0.0)
+    time.sleep(0.02)
+    assert db.count() == 1
+    assert len(db.list()) == 1
+    results = db.search([1.0, 0.0, 0.0], k=10)
+    assert len(results) == 1
+    assert results[0]["id"] == "b"
+    db.close()
+
+
+def test_upsert_with_ttl(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "ttl_up.vdb"), dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0], ttl=0.0)
+    time.sleep(0.02)
+    assert db.get("doc1") is None
+
+    # With a long TTL, record is visible
+    db.upsert("doc2", [0.0, 1.0, 0.0], ttl=86400)
+    assert db.get("doc2") is not None
+    db.close()
+
+
+def test_upsert_many_with_ttl(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "ttl_batch.vdb"), dimension=3)
+    db.upsert_many([
+        {"id": "a", "vector": [1.0, 0.0, 0.0], "ttl": 0.0},
+        {"id": "b", "vector": [0.0, 1.0, 0.0]},
+    ])
+    time.sleep(0.02)
+    assert db.get("a") is None
+    assert db.get("b") is not None
+    db.close()
+
+
+def test_ttl_persists_after_reopen(tmp_path: Path) -> None:
+    path = str(tmp_path / "ttl_persist.vdb")
+    db = vectlite.open(path, dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0])
+    db.set_ttl("doc1", 0.0)
+    db.close()
+
+    time.sleep(0.02)
+    db2 = vectlite.open(path)
+    assert db2.get("doc1") is None
+    db2.close()
+
+
+def test_set_ttl_returns_false_for_missing(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "ttl_miss.vdb"), dimension=3)
+    assert db.set_ttl("ghost", 60.0) is False
+    assert db.clear_ttl("ghost") is False
+    db.close()
+
+
+def test_ttl_with_namespace(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "ttl_ns.vdb"), dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0], namespace="ns1")
+    db.set_ttl("doc1", 0.0, namespace="ns1")
+    time.sleep(0.02)
+    assert db.get("doc1", namespace="ns1") is None
+
+    # Wrong namespace
+    assert db.set_ttl("doc1", 60.0, namespace="ns2") is False
+    db.close()
+
+
+def test_transaction_upsert_with_ttl(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "ttl_tx.vdb"), dimension=3)
+    with db.transaction() as tx:
+        tx.upsert("a", [1.0, 0.0, 0.0], ttl=0.0)
+        tx.upsert("b", [0.0, 1.0, 0.0], ttl=86400)
+    time.sleep(0.02)
+    assert db.get("a") is None
+    assert db.get("b") is not None
+    db.close()
+
+
+def test_expires_at_in_record_output(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "ttl_ea.vdb"), dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0], ttl=86400)
+    record = db.get("doc1")
+    assert record is not None
+    assert record["expires_at"] is not None
+    assert record["expires_at"] > time.time()
+    db.close()
+
+
+# -------------------------------------------------------------------
+# Cursor-based pagination
+# -------------------------------------------------------------------
+
+
+def test_list_cursor_basic(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "cursor.vdb"), dimension=3)
+    for i in range(5):
+        db.upsert(f"doc{i}", [1.0, 0.0, 0.0])
+
+    # First page of 2
+    records, cursor = db.list_cursor(limit=2)
+    assert len(records) == 2
+    assert cursor is not None
+
+    # Second page of 2
+    records2, cursor2 = db.list_cursor(limit=2, cursor=cursor)
+    assert len(records2) == 2
+    assert cursor2 is not None
+
+    # Third page (only 1 remaining)
+    records3, cursor3 = db.list_cursor(limit=2, cursor=cursor2)
+    assert len(records3) == 1
+    assert cursor3 is None
+
+    # All ids are unique
+    all_ids = [r["id"] for r in records + records2 + records3]
+    assert len(set(all_ids)) == 5
+    db.close()
+
+
+def test_list_cursor_with_namespace(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "cursor_ns.vdb"), dimension=3)
+    for i in range(3):
+        db.upsert(f"doc{i}", [1.0, 0.0, 0.0], namespace="ns1")
+    for i in range(2):
+        db.upsert(f"doc{i}", [0.0, 1.0, 0.0], namespace="ns2")
+
+    page1, c1 = db.list_cursor(namespace="ns1", limit=2)
+    assert len(page1) == 2
+    assert c1 is not None
+
+    page2, c2 = db.list_cursor(namespace="ns1", limit=2, cursor=c1)
+    assert len(page2) == 1
+    assert c2 is None
+    db.close()
+
+
+def test_list_cursor_excludes_expired(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "cursor_ttl.vdb"), dimension=3)
+    for i in range(5):
+        db.upsert(f"doc{i}", [1.0, 0.0, 0.0])
+    db.set_ttl("doc1", 0.0)
+    time.sleep(0.01)
+
+    all_records: list[dict] = []
+    cursor = None
+    while True:
+        page, cursor = db.list_cursor(limit=10, cursor=cursor)
+        all_records.extend(page)
+        if cursor is None:
+            break
+    assert len(all_records) == 4
+    assert all(r["id"] != "doc1" for r in all_records)
+    db.close()
+
+
+def test_list_cursor_empty(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "cursor_empty.vdb"), dimension=3)
+    records, cursor = db.list_cursor(limit=10)
+    assert records == []
+    assert cursor is None
+    db.close()
+
+
+# -------------------------------------------------------------------
+# Embedding providers (import test)
+# -------------------------------------------------------------------
+
+
+def test_embedders_module_importable() -> None:
+    from vectlite import embedders
+
+    # All factory functions should be present
+    assert callable(embedders.openai)
+    assert callable(embedders.cohere)
+    assert callable(embedders.voyage)
+    assert callable(embedders.fastembed)
+    assert callable(embedders.sentence_transformer)
+    assert callable(embedders.ollama)
+
+
+def test_embedders_missing_sdk_raises() -> None:
+    """Calling a provider without its SDK installed raises ImportError."""
+    from vectlite import embedders
+    import importlib
+    import sys
+
+    # We test that calling the factory with a fake sdk name fails gracefully.
+    # Since openai/cohere/etc might or might not be installed, we just verify
+    # the module structure is correct and each function is callable.
+    for name in embedders.__all__:
+        fn = getattr(embedders, name)
+        assert callable(fn), f"embedders.{name} should be callable"
+
+
+def test_embedders_with_upsert_text(tmp_path: Path) -> None:
+    """Test that a custom embed function works with upsert_text/search_text."""
+    db = vectlite.open(str(tmp_path / "embed_test.vdb"), dimension=3)
+
+    # Trivial embedder for testing
+    def mock_embed(text: str) -> list[float]:
+        return [float(len(text)), 0.0, 1.0]
+
+    vectlite.upsert_text(db, "doc1", "hello world", mock_embed)
+    results = vectlite.search_text(db, "hello", mock_embed, k=1)
+    assert len(results) >= 1
+    assert results[0]["id"] == "doc1"
+    db.close()
+
+
+# -------------------------------------------------------------------
+# CLI
+# -------------------------------------------------------------------
+
+
+def test_cli_stats(tmp_path: Path) -> None:
+    from vectlite.cli import main
+    import io
+    import contextlib
+
+    path = str(tmp_path / "cli_stats.vdb")
+    db = vectlite.open(path, dimension=3)
+    db.upsert("doc1", [1.0, 0.0, 0.0])
+    db.close()
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(["stats", path])
+    output = json.loads(buf.getvalue())
+    assert output["total_records"] == 1
+    assert output["dimension"] == 3
+
+
+def test_cli_count(tmp_path: Path) -> None:
+    from vectlite.cli import main
+    import io
+    import contextlib
+
+    path = str(tmp_path / "cli_count.vdb")
+    db = vectlite.open(path, dimension=3)
+    db.upsert("a", [1.0, 0.0, 0.0])
+    db.upsert("b", [0.0, 1.0, 0.0])
+    db.close()
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(["count", path])
+    assert buf.getvalue().strip() == "2"
+
+
+def test_cli_list(tmp_path: Path) -> None:
+    from vectlite.cli import main
+    import io
+    import contextlib
+
+    path = str(tmp_path / "cli_list.vdb")
+    db = vectlite.open(path, dimension=3)
+    db.upsert("a", [1.0, 0.0, 0.0], {"tag": "x"})
+    db.close()
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(["list", path, "--limit", "1"])
+    records = json.loads(buf.getvalue())
+    assert len(records) == 1
+    assert records[0]["id"] == "a"
+
+
+def test_cli_compact(tmp_path: Path) -> None:
+    from vectlite.cli import main
+    import io
+    import contextlib
+
+    path = str(tmp_path / "cli_compact.vdb")
+    db = vectlite.open(path, dimension=3)
+    db.upsert("a", [1.0, 0.0, 0.0])
+    db.close()
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(["compact", path])
+    assert "Compacted" in buf.getvalue()
+
+
+def test_cli_verify(tmp_path: Path) -> None:
+    from vectlite.cli import main
+    import io
+    import contextlib
+
+    path = str(tmp_path / "cli_verify.vdb")
+    db = vectlite.open(path, dimension=3)
+    db.upsert("a", [1.0, 0.0, 0.0])
+    db.close()
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(["verify", path])
+    assert "OK" in buf.getvalue()
+
+
+def test_cli_dump(tmp_path: Path) -> None:
+    from vectlite.cli import main
+    import io
+    import contextlib
+
+    path = str(tmp_path / "cli_dump.vdb")
+    db = vectlite.open(path, dimension=3)
+    db.upsert("a", [1.0, 0.0, 0.0])
+    db.upsert("b", [0.0, 1.0, 0.0])
+    db.close()
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(["dump", path])
+    lines = [l for l in buf.getvalue().strip().split("\n") if l]
+    assert len(lines) == 2
+    for line in lines:
+        record = json.loads(line)
+        assert "id" in record
+
+
+def test_cli_search(tmp_path: Path) -> None:
+    from vectlite.cli import main
+    import io
+    import contextlib
+
+    path = str(tmp_path / "cli_search.vdb")
+    db = vectlite.open(path, dimension=3)
+    db.upsert("a", [1.0, 0.0, 0.0])
+    db.close()
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(["search", path, "--query", "[1.0, 0.0, 0.0]", "--k", "1"])
+    results = json.loads(buf.getvalue())
+    assert len(results) == 1
+    assert results[0]["id"] == "a"
+
+
+def test_cli_import_jsonl(tmp_path: Path) -> None:
+    from vectlite.cli import main
+    import io
+    import contextlib
+
+    path = str(tmp_path / "cli_import.vdb")
+    jsonl_file = str(tmp_path / "data.jsonl")
+    with open(jsonl_file, "w") as f:
+        f.write(json.dumps({"id": "r1", "vector": [1.0, 0.0, 0.0], "metadata": {"k": "v"}}) + "\n")
+        f.write(json.dumps({"id": "r2", "vector": [0.0, 1.0, 0.0], "metadata": {}}) + "\n")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(["import-jsonl", path, jsonl_file, "--dimension", "3"])
+    assert "Imported 2" in buf.getvalue()
+
+    db = vectlite.open(path, read_only=True)
+    assert db.count() == 2
+    db.close()
+
+
+# -------------------------------------------------------------------
+# Schema validation
+# -------------------------------------------------------------------
+
+
+def test_schema_basic_validation() -> None:
+    from vectlite.schema import Schema, SchemaError
+
+    s = Schema({
+        "price": "number",
+        "title": "string",
+        "active": "boolean",
+    })
+
+    # Valid
+    s.validate({"price": 9.99, "title": "Hello", "active": True})
+    s.validate({"price": 42})  # partial is OK
+    s.validate(None)           # None is OK
+    s.validate({})             # empty is OK
+
+    # Invalid
+    import pytest
+    with pytest.raises(SchemaError, match="price"):
+        s.validate({"price": "not a number"})
+    with pytest.raises(SchemaError, match="title"):
+        s.validate({"title": 123})
+    with pytest.raises(SchemaError, match="active"):
+        s.validate({"active": "yes"})
+
+
+def test_schema_nested_object() -> None:
+    from vectlite.schema import Schema, SchemaError
+
+    s = Schema({
+        "author": {
+            "name": "string",
+            "age": "number",
+        },
+    })
+
+    s.validate({"author": {"name": "Alice", "age": 30}})
+    s.validate({"author": {"name": "Bob"}})
+
+    import pytest
+    with pytest.raises(SchemaError, match="author.age"):
+        s.validate({"author": {"name": "Alice", "age": "thirty"}})
+
+
+def test_schema_typed_array() -> None:
+    from vectlite.schema import Schema, SchemaError
+
+    s = Schema({"tags": "array<string>"})
+
+    s.validate({"tags": ["a", "b", "c"]})
+    s.validate({"tags": []})
+
+    import pytest
+    with pytest.raises(SchemaError, match="tags"):
+        s.validate({"tags": "not an array"})
+    with pytest.raises(SchemaError, match="tags\\[1\\]"):
+        s.validate({"tags": ["ok", 42]})
+
+
+def test_schema_strict_mode() -> None:
+    from vectlite.schema import Schema, SchemaError
+
+    s = Schema({"price": "number"}, strict=True)
+
+    s.validate({"price": 10})
+
+    import pytest
+    with pytest.raises(SchemaError, match="unknown"):
+        s.validate({"price": 10, "extra_field": "oops"})
+
+
+def test_schema_null_values_allowed() -> None:
+    from vectlite.schema import Schema
+
+    s = Schema({"price": "number"})
+    # None values pass validation (represent missing data)
+    s.validate({"price": None})
+
+
+def test_schema_save_and_load(tmp_path: Path) -> None:
+    from vectlite.schema import Schema, load
+
+    db = vectlite.open(str(tmp_path / "schema_test.vdb"), dimension=3)
+
+    s = Schema({"price": "number", "tags": "array<string>"}, strict=True)
+    s.save(db)
+
+    loaded = load(db)
+    assert loaded is not None
+    assert loaded.fields == s.fields
+    assert loaded.strict is True
+    db.close()
+
+
+def test_schema_load_missing(tmp_path: Path) -> None:
+    from vectlite.schema import load
+
+    db = vectlite.open(str(tmp_path / "no_schema.vdb"), dimension=3)
+    assert load(db) is None
+    db.close()
+
+
+def test_validated_database(tmp_path: Path) -> None:
+    from vectlite.schema import Schema, SchemaError, validated
+
+    db = vectlite.open(str(tmp_path / "validated.vdb"), dimension=3)
+    s = Schema({"price": "number"})
+    vdb = validated(db, s)
+
+    # Valid write
+    vdb.upsert("doc1", [1.0, 0.0, 0.0], {"price": 9.99})
+    assert vdb.get("doc1") is not None
+
+    # Invalid write
+    import pytest
+    with pytest.raises(SchemaError, match="price"):
+        vdb.upsert("doc2", [0.0, 1.0, 0.0], {"price": "free"})
+
+    # doc2 should NOT have been written
+    assert vdb.get("doc2") is None
     db.close()

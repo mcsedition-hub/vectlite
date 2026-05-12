@@ -402,4 +402,169 @@ def bi_encoder(
     return rerank
 
 
-__all__ = ["bi_encoder", "compose", "cross_encoder", "metadata_boost", "text_match"]
+def onnx_cross_encoder(
+    model_name_or_path: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    *,
+    text_key: str = "text",
+    batch_size: int = 32,
+    max_length: int = 512,
+) -> RerankHook:
+    """Create a reranker that uses an ONNX cross-encoder model for zero-PyTorch reranking.
+
+    Uses ``onnxruntime`` for inference and ``tokenizers`` (HuggingFace) for
+    tokenization.  This is significantly lighter than the PyTorch-based
+    :func:`cross_encoder` and works well in constrained environments.
+
+    Install dependencies::
+
+        pip install onnxruntime tokenizers huggingface-hub
+
+    The first call downloads and caches the ONNX model from HuggingFace Hub.
+
+    Args:
+        model_name_or_path: HuggingFace model name or local path to an ONNX model
+            directory.  The directory must contain ``model.onnx`` (or will be
+            auto-downloaded) and ``tokenizer.json``.
+        text_key: Metadata field containing the document text.
+        batch_size: Batch size for inference.
+        max_length: Maximum token length for the tokenizer.
+    """
+    try:
+        import onnxruntime as ort  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise ImportError(
+            "onnxruntime is required for onnx_cross_encoder reranker. "
+            "Install with: pip install onnxruntime"
+        ) from exc
+
+    try:
+        from tokenizers import Tokenizer  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise ImportError(
+            "tokenizers is required for onnx_cross_encoder reranker. "
+            "Install with: pip install tokenizers"
+        ) from exc
+
+    import os
+    import numpy as np  # type: ignore[import-untyped]
+
+    # Resolve model path — download from HuggingFace Hub if needed
+    model_dir: str
+    if os.path.isdir(model_name_or_path):
+        model_dir = model_name_or_path
+    else:
+        try:
+            from huggingface_hub import snapshot_download  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise ImportError(
+                "huggingface-hub is required to download ONNX models. "
+                "Install with: pip install huggingface-hub"
+            ) from exc
+        model_dir = snapshot_download(
+            model_name_or_path,
+            allow_patterns=["*.onnx", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"],
+        )
+
+    onnx_path = os.path.join(model_dir, "model.onnx")
+    if not os.path.isfile(onnx_path):
+        # Some repos use onnx/model.onnx
+        alt = os.path.join(model_dir, "onnx", "model.onnx")
+        if os.path.isfile(alt):
+            onnx_path = alt
+        else:
+            raise FileNotFoundError(
+                f"No model.onnx found in {model_dir}. "
+                "You may need to export the model to ONNX format first."
+            )
+
+    tokenizer_path = os.path.join(model_dir, "tokenizer.json")
+    if not os.path.isfile(tokenizer_path):
+        raise FileNotFoundError(f"No tokenizer.json found in {model_dir}.")
+
+    session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    tokenizer = Tokenizer.from_file(tokenizer_path)
+    tokenizer.enable_truncation(max_length=max_length)
+    tokenizer.enable_padding(length=max_length)
+
+    def _score_pairs(pairs: list[tuple[str, str]]) -> list[float]:
+        """Score (query, document) pairs using the ONNX model."""
+        all_scores: list[float] = []
+        for start in range(0, len(pairs), batch_size):
+            batch = pairs[start : start + batch_size]
+            encoded = tokenizer.encode_batch(
+                [(q, d) for q, d in batch]
+            )
+
+            input_ids = np.array([e.ids for e in encoded], dtype=np.int64)
+            attention_mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
+            token_type_ids = np.array([e.type_ids for e in encoded], dtype=np.int64)
+
+            feeds: dict[str, Any] = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+            }
+            # Some models don't use token_type_ids
+            input_names = {inp.name for inp in session.get_inputs()}
+            if "token_type_ids" in input_names:
+                feeds["token_type_ids"] = token_type_ids
+
+            outputs = session.run(None, feeds)
+            logits = outputs[0]  # shape: (batch, num_labels) or (batch,)
+
+            if logits.ndim == 2:
+                # For binary classifiers: use the positive class logit or apply sigmoid
+                if logits.shape[1] == 1:
+                    scores = logits[:, 0].tolist()
+                else:
+                    # Use softmax on the last column (positive class)
+                    scores = logits[:, -1].tolist()
+            else:
+                scores = logits.tolist()
+
+            all_scores.extend(scores)
+        return all_scores
+
+    def rerank(query: dict[str, Any], results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        query_text = query.get("text", "")
+        if not isinstance(query_text, str) or not query_text:
+            return _copy_results(results)
+
+        pairs: list[tuple[str, str]] = []
+        for result in results:
+            metadata = result.get("metadata")
+            doc_text = ""
+            if isinstance(metadata, Mapping):
+                candidate = metadata.get(text_key)
+                if isinstance(candidate, str):
+                    doc_text = candidate
+            pairs.append((query_text, doc_text))
+
+        scores = _score_pairs(pairs)
+
+        scored: list[tuple[float, int, dict[str, Any]]] = []
+        for index, raw_result in enumerate(results):
+            result = dict(raw_result)
+            ce_score = float(scores[index])
+            base_score = float(result.get("rerank_score", result.get("score", 0.0)))
+            rerank_score = base_score + ce_score
+            result["rerank_score"] = rerank_score
+            _append_explain(
+                result,
+                {
+                    "name": "onnx_cross_encoder",
+                    "model": model_name_or_path,
+                    "ce_score": ce_score,
+                    "base_score": base_score,
+                    "score": rerank_score,
+                },
+            )
+            scored.append((rerank_score, index, result))
+
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [result for _, _, result in scored]
+
+    rerank.__name__ = "onnx_cross_encoder"
+    return rerank
+
+
+__all__ = ["bi_encoder", "compose", "cross_encoder", "metadata_boost", "onnx_cross_encoder", "text_match"]

@@ -6,6 +6,148 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-11
+
+### Added
+
+- **Optional OpenTelemetry tracing** for search operations (Python and Node.js).
+  - `configure_opentelemetry()` (Python) / `configureOpenTelemetry()` (Node) enables span-based tracing.
+  - Each search call creates a `vectlite.search` span with `db.system`, `db.operation.name`, and search-specific attributes (k, namespace, fusion, result counts, timings).
+  - `opentelemetry-api` (Python) / `@opentelemetry/api` (Node) is loaded lazily -- never a required runtime dependency.
+  - Supports custom tracers, custom tracer names, and explicit disable via `False` / `{ enabled: false }`.
+- **Experimental Swift and Kotlin bindings** via a shared UniFFI layer.
+  - New `bindings/uniffi` crate with a UDL interface for the core database, store, search, metadata, indexes, TTL, quantization, bulk ingest, backup/restore, and transactions.
+  - Swift package in `bindings/swift` with a UniFFI-generated wrapper, `VectLiteFFI.xcframework`, an XCFramework build script, and smoke tests.
+  - Kotlin/JVM Gradle package in `bindings/kotlin` compiling the generated UniFFI Kotlin source, loading the native library through JNA, and running smoke tests against the Rust FFI library.
+
+## [0.1.17] - 2026-05-11
+
+### Added
+
+- **TTL / Expiry** -- records can now automatically expire after a time-to-live.
+  - `db.set_ttl(id, ttl_secs)` sets a TTL on an existing record; `db.clear_ttl(id)` removes it.
+  - `ttl` parameter on `insert()` / `upsert()` (Python, Node) and transaction writes.
+  - Expired records are transparently filtered from `get()`, `list()`, `count()`, and `search()` at read time.
+  - `compact()` garbage-collects expired records permanently.
+  - `expires_at` field returned in record output (epoch seconds, or `null` / `None`).
+  - WAL `SetTtl` operation (tag 4) with snapshot persistence.
+- **Cursor-based pagination** -- efficient iteration over large collections without offset overhead.
+  - Rust core: `Database::list_cursor(namespace, filter, limit, after)` returns `(Vec<Record>, Option<String>)`.
+  - Python: `db.list_cursor(namespace, filter, limit, cursor)` returns `(list[Record], str | None)`.
+  - Node: `db.listCursor({ namespace, filter, limit, cursor })` returns `{ records, cursor }`.
+  - Respects TTL filtering and metadata filters.
+- **Async Node API** -- non-blocking versions of heavy operations for Node.js.
+  - `db.searchAsync()`, `db.searchWithStatsAsync()`, `db.flushAsync()`, `db.compactAsync()`, `db.bulkIngestAsync()`.
+  - Backed by `napi::Task` (runs on libuv threadpool), no tokio dependency.
+- **LangChain integration** -- `vectlite.langchain.VectLiteVectorStore` implements the LangChain VectorStore protocol.
+  - `add_texts()`, `add_documents()`, `similarity_search()`, `similarity_search_with_score()`, `similarity_search_by_vector()`, `delete()`, `from_texts()`.
+  - Requires `langchain-core >= 0.2` (optional dependency).
+- **LlamaIndex integration** -- `vectlite.llamaindex.VectLiteVectorStore` implements the LlamaIndex VectorStore protocol.
+  - `add()`, `delete()`, `query()` methods compatible with `VectorStoreIndex` and `StorageContext`.
+  - Requires `llama-index-core >= 0.10` (optional dependency).
+- **Built-in embedding providers** -- `vectlite.embedders` module with ready-to-use factory functions.
+  - `embedders.openai()`, `embedders.cohere()`, `embedders.voyage()`, `embedders.fastembed()`, `embedders.sentence_transformer()`, `embedders.ollama()`.
+  - Each returns a `Callable[[str], list[float]]` compatible with `upsert_text()` and `search_text()`.
+  - All providers lazy-import their SDK (zero hard dependencies).
+- **ONNX cross-encoder reranker** -- `rerankers.onnx_cross_encoder()` for zero-PyTorch reranking.
+  - Uses `onnxruntime` + `tokenizers` for lightweight cross-encoder inference.
+  - Auto-downloads models from HuggingFace Hub; same `RerankHook` interface as `cross_encoder()`.
+- **Rich CLI** -- full command-line interface via `vectlite` command or `python -m vectlite`.
+  - Subcommands: `stats`, `count`, `list`, `dump`, `search`, `compact`, `verify`, `bench`, `import-jsonl`, `import-csv`.
+  - `vectlite stats my.vdb` -- database stats (dimension, metric, record counts, file sizes, indexes).
+  - `vectlite bench my.vdb --queries 1000` -- search benchmark with QPS and latency stats.
+  - `vectlite dump my.vdb` -- export all records as JSONL via cursor pagination.
+  - `vectlite import-jsonl my.vdb data.jsonl` / `vectlite import-csv my.vdb data.csv` -- bulk import.
+- **Schema validation** -- optional typed metadata schemas with clear error messages.
+  - `schema.Schema({"price": "number", "tags": "array<string>"})` defines field types.
+  - Types: `string`, `number`, `integer`, `boolean`, `null`, `any`, `array`, `array<T>`, `object`, nested objects.
+  - `schema.validated(db, s)` wraps a database to auto-validate on every write.
+  - Schemas persist in `.vdb.schema.json` sidecar files via `save()` / `load()`.
+  - `strict=True` rejects unknown fields.
+
+## [0.1.16] - 2026-05-11
+
+### Added
+
+- **Payload indexes** -- create keyword and numeric indexes on metadata fields to accelerate filtered queries 10-100x on large collections.
+  - `db.create_index(field, type)` creates an index (`"keyword"` for string equality/`$in`, `"numeric"` for range queries `$gt`/`$gte`/`$lt`/`$lte`).
+  - `db.drop_index(field)` removes an index.
+  - `db.list_indexes()` returns all active indexes.
+  - Indexes are automatically used by `search()`, `count()`, and `list()` to narrow candidates before full filter evaluation.
+  - AND filters intersect index results; OR filters union when all sub-filters are indexed.
+  - Indexes are incrementally maintained on `upsert()`, `delete()`, and `update_metadata()`.
+  - Index definitions persist across close/reopen in a `.vdb.pidx` sidecar file; data is rebuilt from records on open.
+  - Sidecar files are included in `backup()` operations.
+- Rust core: `Database::create_index()`, `Database::drop_index()`, `Database::list_indexes()`.
+- Python binding: `db.create_index(field, index_type)`, `db.drop_index(field)`, `db.list_indexes()`.
+- Node binding: `db.createIndex(field, indexType)`, `db.dropIndex(field)`, `db.listIndexes()`.
+
+## [0.1.15] - 2026-05-11
+
+### Added
+
+- **Partial metadata updates** -- new `update_metadata()` method that merges a patch into an existing record's metadata without re-writing the vector or rebuilding indexes.
+  - Keys present in the patch overwrite existing keys; keys not in the patch remain untouched.
+  - Skips all index rebuilds (ANN, sparse, quantized, multi-vector) when a WAL batch contains only metadata updates.
+  - Returns `true` if the record was found and updated, `false` if the id does not exist.
+  - Works with namespaces via `update_metadata_in_namespace()` (Rust) or `namespace` parameter (Python/Node).
+- Rust core: `Database::update_metadata()`, `Database::update_metadata_in_namespace()`.
+- Python binding: `db.update_metadata(id, metadata, namespace=None)`.
+- Node binding: `db.updateMetadata(id, metadata, { namespace })`.
+- New WAL operation (`UpdateMetadata`, tag 3) with full serialization/deserialization support.
+
+## [0.1.14] - 2026-05-11
+
+### Added
+
+- **Multiple distance metrics** -- databases can now be created with `cosine` (default), `euclidean` (L2), `dotproduct` (inner product), or `manhattan` (L1) distance metrics.
+  - The metric is persisted in the database file and automatically loaded on reopen. Older databases (format version <= 5) default to cosine.
+  - Aliases are accepted: `l2` for euclidean, `dot` / `ip` / `inner_product` / `dot_product` for dotproduct, `l1` for manhattan.
+  - Scores are normalized so that **higher is always better** across all metrics; distance metrics (euclidean, manhattan) are negated.
+- **SIMD-accelerated scoring** via the `simsimd` crate for cosine, euclidean (L2), and dot product distance computations, with automatic scalar fallbacks.
+  - Manhattan distance uses a scalar implementation (simsimd does not provide L1).
+- Rust core: `Database::create_with_metric()`, `Database::open_or_create_with_metric()`, `Database::metric()`, and the `DistanceMetric` enum with `score()`, `from_name()`, `name()`, `is_similarity()`.
+- Python binding: `vectlite.open(path, metric="euclidean")` and `db.metric` property.
+- Node binding: `vectlite.open(path, { metric: 'euclidean' })` and `db.metric` property.
+- HNSW indexes now use metric-specific distance functions (`DistCosine`, `DistL2`, `DistDot`, `DistL1` from hnsw_rs).
+- Rust unit tests for `DistanceMetric` enum (tag/name roundtrip, aliases, score correctness, SIMD vs scalar parity).
+- Rust integration tests for metric persistence, search ordering with each metric, and create/reopen cycles.
+- Python smoke tests for metric creation, aliases, persistence, invalid metric errors, and search ordering with each metric.
+
+### Changed
+
+- Binary format bumped to version 6 to store the distance metric byte after the dimension field.
+- All internal cosine similarity calls replaced with `DistanceMetric::score()`, enabling metric-aware scoring throughout search, MMR, MaxSim, and record similarity computations.
+- The `simsimd` crate (v6.5) is now a dependency of `vectlite-core`.
+
+## [0.1.13] - 2026-05-11
+
+### Added
+
+- **Multi-vector / late interaction (ColBERT-style)** search with per-document token-level embeddings and MaxSim scoring:
+  - Storage of N token vectors per document in named multi-vector spaces (e.g. `"colbert"`, `"colpali"`).
+  - MaxSim scoring: for each query token, find the maximum cosine similarity against all document tokens, then sum across query tokens.
+  - **2-bit quantization** for ColBERTv2-style token compression (~16x memory reduction), using per-dimension quartile boundaries.
+  - Quantized multi-vector search uses a 2-stage pipeline: fast 2-bit approximate MaxSim candidate selection followed by exact float32 rescoring.
+- Multi-vector quantization parameters persist in `.vdb.mvquant.<space>` sidecar files and auto-load on database open.
+- Quantized multi-vector indexes automatically rebuild on inserts, upserts, and bulk ingestion.
+- Rust core: `upsert_multi_vectors()`, `search_multi_vector()`, `enable_multi_vector_quantization()`, `disable_multi_vector_quantization()`, `is_multi_vector_quantized()` on `Database`.
+- Python binding: `db.upsert_multi_vectors(id, vector, multi_vectors, ...)`, `db.search_multi_vector(space, query_tokens, ...)`, `db.enable_multi_vector_quantization(space, ...)`, `db.disable_multi_vector_quantization(space)`, `db.is_multi_vector_quantized(space)`.
+- Node binding: `db.upsertMultiVectors(id, vector, multiVectorsJson, ...)`, `db.searchMultiVector(space, queryTokensJson, ...)`, `db.enableMultiVectorQuantization(space, ...)`, `db.disableMultiVectorQuantization(space)`, `db.isMultiVectorQuantized(space)`.
+- New `TwoBitQuantizer`, `MultiVectorQuantizedIndex` in `quantization.rs` with train, search, serialize/deserialize.
+- New `maxsim_score()` function and `MultiVectorSearchOptions` / `MultiVectorSearchResult` types in the Rust core.
+- Binary format bumped to version 5 to support `multi_vectors` field on `Record`.
+- Rust unit tests for 2-bit quantizer, multi-vector quantized index, and MaxSim scoring correctness.
+- Rust integration tests for multi-vector upsert, search, namespace filtering, quantization enable/disable/persist, and record persistence.
+- Python smoke tests for multi-vector upsert and search, metadata, namespace filtering, quantization enable/disable/persist, error cases, and record persistence.
+
+### Changed
+
+- The repository README now documents multi-vector / ColBERT features, usage examples, and API for Python and Node.js.
+- The storage format table in the repository README now includes the `.vdb.mvquant.*` sidecar files.
+- Mutation methods (`insert_many`, `upsert_many`, `apply_operations`, `bulk_ingest`, `apply_wal_batch`) now rebuild multi-vector quantized indexes alongside regular quantized indexes.
+- All three `open` methods (`open`, `open_with_timeout`, `open_read_only_with_timeout`) now auto-load multi-vector quantization from sidecar files.
+
 ## [0.1.12] - 2026-05-10
 
 ### Added

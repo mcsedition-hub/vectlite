@@ -7,13 +7,14 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use serde_json::{Map, Number, Value, json};
 use vectlite::quantization::{
-    BinaryQuantizationConfig, ProductQuantizationConfig, QuantizationConfig,
-    ScalarQuantizationConfig,
+    BinaryQuantizationConfig, MultiVectorQuantizationConfig, ProductQuantizationConfig,
+    QuantizationConfig, ScalarQuantizationConfig, TwoBitQuantizationConfig,
 };
 use vectlite::{
-    Database as CoreDatabase, FusionStrategy, HybridSearchOptions, Metadata, MetadataFilter,
-    MetadataValue, NamedVectors, Record, SearchOutcome, SearchResult, SparseVector,
-    Store as CoreStore, WriteOperation,
+    Database as CoreDatabase, DistanceMetric, FusionStrategy, HybridSearchOptions, Metadata,
+    MetadataFilter, MetadataValue, MultiVectorSearchOptions, MultiVectors, NamedVectors,
+    PayloadIndexType, Record, SearchOutcome, SearchResult, SparseVector, Store as CoreStore,
+    WriteOperation,
 };
 
 #[napi(js_name = "NativeDatabase")]
@@ -130,6 +131,12 @@ impl NativeDatabase {
         Ok(database.dimension() as u32)
     }
 
+    #[napi(getter)]
+    pub fn metric(&self) -> Result<String> {
+        let database = self.read()?;
+        Ok(database.metric().name().to_owned())
+    }
+
     #[napi(getter, js_name = "readOnly")]
     pub fn read_only(&self) -> Result<bool> {
         let database = self.read()?;
@@ -146,10 +153,6 @@ impl NativeDatabase {
                 json_to_filter(&value)
             })
             .transpose()?;
-        if namespace.is_none() && filter.is_none() {
-            let database = self.read()?;
-            return Ok(database.len() as u32);
-        }
         let database = self.read()?;
         Ok(database.count_filtered(namespace.as_deref(), filter.as_ref()) as u32)
     }
@@ -199,6 +202,38 @@ impl NativeDatabase {
         stringify_value(Value::Array(json_records))
     }
 
+    #[napi(js_name = "listCursor")]
+    pub fn list_cursor(
+        &self,
+        namespace: Option<String>,
+        filter_json: Option<String>,
+        limit: Option<u32>,
+        cursor: Option<String>,
+    ) -> Result<String> {
+        let filter = filter_json
+            .as_ref()
+            .map(|json_str| {
+                let value: serde_json::Value = serde_json::from_str(json_str)
+                    .map_err(|e| err(format!("invalid filter JSON: {e}")))?;
+                json_to_filter(&value)
+            })
+            .transpose()?;
+        let database = self.read()?;
+        let (records, next_cursor) = database.list_cursor(
+            namespace.as_deref(),
+            filter.as_ref(),
+            limit.unwrap_or(0) as usize,
+            cursor.as_deref(),
+        );
+        let records: Vec<Record> = records.into_iter().cloned().collect();
+        let json_records: Vec<Value> = records.iter().map(record_to_json).collect();
+        let result = serde_json::json!({
+            "records": json_records,
+            "cursor": next_cursor,
+        });
+        stringify_value(result)
+    }
+
     #[napi(js_name = "deleteByFilter")]
     pub fn delete_by_filter(&self, filter_json: String, namespace: Option<String>) -> Result<u32> {
         let value: serde_json::Value = serde_json::from_str(&filter_json)
@@ -209,6 +244,70 @@ impl NativeDatabase {
             .delete_by_filter(namespace.as_deref(), &filter)
             .map(|count| count as u32)
             .map_err(to_napi_error)
+    }
+
+    #[napi]
+    pub fn update_metadata(
+        &self,
+        id: String,
+        metadata_json: String,
+        namespace: Option<String>,
+    ) -> Result<bool> {
+        let patch = parse_metadata_json(Some(metadata_json))?;
+        let mut database = self.write_open()?;
+        database
+            .update_metadata_in_namespace(namespace.unwrap_or_default(), &id, patch)
+            .map_err(to_napi_error)
+    }
+
+    // -------------------------------------------------------------------
+    // TTL / Expiry
+    // -------------------------------------------------------------------
+
+    #[napi(js_name = "setTtl")]
+    pub fn set_ttl(&self, id: String, ttl: f64, namespace: Option<String>) -> Result<bool> {
+        let mut database = self.write_open()?;
+        database
+            .set_ttl_in_namespace(&namespace.unwrap_or_default(), &id, ttl)
+            .map_err(to_napi_error)
+    }
+
+    #[napi(js_name = "clearTtl")]
+    pub fn clear_ttl(&self, id: String, namespace: Option<String>) -> Result<bool> {
+        let mut database = self.write_open()?;
+        database
+            .clear_ttl_in_namespace(&namespace.unwrap_or_default(), &id)
+            .map_err(to_napi_error)
+    }
+
+    // -------------------------------------------------------------------
+    // Payload Indexes
+    // -------------------------------------------------------------------
+
+    #[napi(js_name = "createIndex")]
+    pub fn create_index(&self, field: String, index_type: String) -> Result<bool> {
+        let ty = parse_payload_index_type(&index_type)?;
+        let mut database = self.write_open()?;
+        database.create_index(&field, ty).map_err(to_napi_error)
+    }
+
+    #[napi(js_name = "dropIndex")]
+    pub fn drop_index(&self, field: String) -> Result<bool> {
+        let mut database = self.write_open()?;
+        database.drop_index(&field).map_err(to_napi_error)
+    }
+
+    #[napi(js_name = "listIndexes")]
+    pub fn list_indexes(&self) -> Result<String> {
+        let database = self.read()?;
+        let indexes = database.list_indexes();
+        let arr: Vec<Value> = indexes
+            .into_iter()
+            .map(|(field, index_type)| {
+                json!({ "field": field, "type": index_type.name() })
+            })
+            .collect();
+        serde_json::to_string(&arr).map_err(|e| err(format!("JSON serialize: {e}")))
     }
 
     #[napi]
@@ -229,21 +328,27 @@ impl NativeDatabase {
         namespace: Option<String>,
         sparse_json: Option<String>,
         vectors_json: Option<String>,
+        ttl: Option<f64>,
     ) -> Result<()> {
         let metadata = parse_metadata_json(metadata_json)?;
         let sparse = parse_sparse_json(sparse_json)?;
         let vectors = parse_named_vectors_json(vectors_json)?;
         let vector = js_vector_to_core(vector, "vector")?;
+        let expires_at = ttl_to_expires_at(ttl)?;
+        let record = Record {
+            namespace: namespace.unwrap_or_default(),
+            id,
+            vector,
+            vectors,
+            sparse,
+            metadata,
+            multi_vectors: MultiVectors::new(),
+            expires_at,
+        };
         let mut database = self.write_open()?;
         database
-            .insert_with_vectors_in_namespace(
-                namespace.unwrap_or_default(),
-                &id,
-                vector,
-                vectors,
-                sparse,
-                metadata,
-            )
+            .insert_many(std::iter::once(record))
+            .map(|_| ())
             .map_err(to_napi_error)
     }
 
@@ -256,21 +361,27 @@ impl NativeDatabase {
         namespace: Option<String>,
         sparse_json: Option<String>,
         vectors_json: Option<String>,
+        ttl: Option<f64>,
     ) -> Result<()> {
         let metadata = parse_metadata_json(metadata_json)?;
         let sparse = parse_sparse_json(sparse_json)?;
         let vectors = parse_named_vectors_json(vectors_json)?;
         let vector = js_vector_to_core(vector, "vector")?;
+        let expires_at = ttl_to_expires_at(ttl)?;
+        let record = Record {
+            namespace: namespace.unwrap_or_default(),
+            id,
+            vector,
+            vectors,
+            sparse,
+            metadata,
+            multi_vectors: MultiVectors::new(),
+            expires_at,
+        };
         let mut database = self.write_open()?;
         database
-            .upsert_with_vectors_in_namespace(
-                namespace.unwrap_or_default(),
-                &id,
-                vector,
-                vectors,
-                sparse,
-                metadata,
-            )
+            .upsert_many(std::iter::once(record))
+            .map(|_| ())
             .map_err(to_napi_error)
     }
 
@@ -404,6 +515,190 @@ impl NativeDatabase {
         }))
     }
 
+    // ---- Multi-vector / ColBERT-style late interaction ----
+
+    /// Upsert a record with multi-vector token embeddings (ColBERT-style).
+    ///
+    /// `multi_vectors_json` is a JSON string mapping space names to arrays of
+    /// token vectors, e.g. `{"colbert": [[0.1, 0.2], [0.3, 0.4]]}`.
+    #[napi(js_name = "upsertMultiVectors")]
+    pub fn upsert_multi_vectors(
+        &self,
+        id: String,
+        vector: Vec<f64>,
+        multi_vectors_json: String,
+        options_json: Option<String>,
+    ) -> Result<()> {
+        let vector: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
+        let mv_value: Value = serde_json::from_str(&multi_vectors_json)
+            .map_err(|e| to_napi_error(vectlite::VectLiteError::InvalidFormat(e.to_string())))?;
+        let mv = json_to_multi_vectors(&mv_value)?;
+
+        let (metadata, namespace) = if let Some(opts) = options_json {
+            let opts: Value = serde_json::from_str(&opts)
+                .map_err(|e| to_napi_error(vectlite::VectLiteError::InvalidFormat(e.to_string())))?;
+            let metadata = opts
+                .get("metadata")
+                .map(|v| json_to_metadata(v))
+                .transpose()?
+                .unwrap_or_default();
+            let namespace = opts
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            (metadata, namespace)
+        } else {
+            (Metadata::new(), String::new())
+        };
+
+        let mut database = self.write_open()?;
+        database
+            .upsert_multi_vectors_in_namespace(namespace, id, vector, metadata, mv)
+            .map_err(to_napi_error)
+    }
+
+    /// Search using multi-vector late interaction (MaxSim) scoring.
+    ///
+    /// Returns a JSON array of results with id, score, namespace, and metadata.
+    #[napi(js_name = "searchMultiVector")]
+    pub fn search_multi_vector(
+        &self,
+        space: String,
+        query_tokens_json: String,
+        options_json: Option<String>,
+    ) -> Result<String> {
+        let qt_value: Value = serde_json::from_str(&query_tokens_json)
+            .map_err(|e| to_napi_error(vectlite::VectLiteError::InvalidFormat(e.to_string())))?;
+        let qt_arr = qt_value
+            .as_array()
+            .ok_or_else(|| to_napi_error(vectlite::VectLiteError::InvalidFormat(
+                "query_tokens must be a JSON array of arrays".to_owned(),
+            )))?;
+        let query_tokens: Vec<Vec<f32>> = qt_arr
+            .iter()
+            .map(|v| {
+                v.as_array()
+                    .ok_or_else(|| {
+                        to_napi_error(vectlite::VectLiteError::InvalidFormat(
+                            "each query token must be an array of numbers".to_owned(),
+                        ))
+                    })?
+                    .iter()
+                    .map(|n| {
+                        n.as_f64()
+                            .map(|f| f as f32)
+                            .ok_or_else(|| {
+                                to_napi_error(vectlite::VectLiteError::InvalidFormat(
+                                    "token values must be numbers".to_owned(),
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<f32>>>()
+            })
+            .collect::<Result<Vec<Vec<f32>>>>()?;
+
+        let (top_k, filter, namespace) = if let Some(opts) = options_json {
+            let opts: Value = serde_json::from_str(&opts)
+                .map_err(|e| to_napi_error(vectlite::VectLiteError::InvalidFormat(e.to_string())))?;
+            let top_k = opts.get("k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            let filter = opts
+                .get("filter")
+                .map(|v| json_to_filter(v))
+                .transpose()?;
+            let namespace = opts
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            (top_k, filter, namespace)
+        } else {
+            (10, None, None)
+        };
+
+        let options = MultiVectorSearchOptions {
+            top_k,
+            filter,
+            namespace,
+        };
+
+        let database = self.read()?;
+        let results = database
+            .search_multi_vector(&space, &query_tokens, options)
+            .map_err(to_napi_error)?;
+
+        let json_results: Vec<Value> = results
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "score": r.score,
+                    "namespace": r.namespace,
+                    "metadata": metadata_to_json(&r.metadata),
+                })
+            })
+            .collect();
+
+        serde_json::to_string(&json_results)
+            .map_err(|e| to_napi_error(vectlite::VectLiteError::InvalidFormat(e.to_string())))
+    }
+
+    /// Enable 2-bit quantization for a multi-vector space.
+    #[napi(js_name = "enableMultiVectorQuantization")]
+    pub fn enable_multi_vector_quantization(
+        &self,
+        space: String,
+        options_json: Option<String>,
+    ) -> Result<()> {
+        let (method, rescore_multiplier) = if let Some(opts) = options_json {
+            let opts: Value = serde_json::from_str(&opts)
+                .map_err(|e| to_napi_error(vectlite::VectLiteError::InvalidFormat(e.to_string())))?;
+            let method = opts
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("two_bit")
+                .to_string();
+            let rescore = opts
+                .get("rescoreMultiplier")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            (method, rescore)
+        } else {
+            ("two_bit".to_string(), None)
+        };
+
+        let config = match method.as_str() {
+            "two_bit" => MultiVectorQuantizationConfig::TwoBit(TwoBitQuantizationConfig {
+                rescore_multiplier: rescore_multiplier.unwrap_or(4),
+            }),
+            other => {
+                return Err(to_napi_error(vectlite::VectLiteError::InvalidFormat(
+                    format!("unknown multi-vector quantization method: {other}. Supported: two_bit"),
+                )));
+            }
+        };
+
+        let mut database = self.write_open()?;
+        database
+            .enable_multi_vector_quantization(&space, config)
+            .map_err(to_napi_error)
+    }
+
+    /// Disable multi-vector quantization for a space.
+    #[napi(js_name = "disableMultiVectorQuantization")]
+    pub fn disable_multi_vector_quantization(&self, space: String) -> Result<()> {
+        let mut database = self.write_open()?;
+        database
+            .disable_multi_vector_quantization(&space)
+            .map_err(to_napi_error)
+    }
+
+    /// Returns true if multi-vector quantization is enabled for the given space.
+    #[napi(js_name = "isMultiVectorQuantized")]
+    pub fn is_multi_vector_quantized(&self, space: String) -> Result<bool> {
+        let database = self.read()?;
+        Ok(database.is_multi_vector_quantized(&space))
+    }
+
     #[napi]
     pub fn snapshot(&self, dest: String) -> Result<()> {
         let database = self.read()?;
@@ -449,6 +744,206 @@ impl NativeDatabase {
     }
 }
 
+// -------------------------------------------------------------------
+// Async tasks (run on libuv threadpool via napi::Task)
+// -------------------------------------------------------------------
+
+pub struct SearchTask {
+    db: Arc<RwLock<CoreDatabase>>,
+    query: Option<Vec<f32>>,
+    request: SearchRequest,
+    with_stats: bool,
+}
+
+impl napi::Task for SearchTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let database = self
+            .db
+            .read()
+            .map_err(|e| err(format!("lock poisoned: {e}")))?;
+        let sparse_ref = if self.request.sparse.is_empty() {
+            None
+        } else {
+            Some(&self.request.sparse)
+        };
+        let outcome = if self.request.all_namespaces {
+            database
+                .hybrid_search_all_namespaces_with_stats(
+                    self.query.as_deref(),
+                    sparse_ref,
+                    self.request.options.clone(),
+                )
+                .map_err(to_napi_error)?
+        } else {
+            database
+                .hybrid_search_in_namespace_with_stats(
+                    &self.request.namespace,
+                    self.query.as_deref(),
+                    sparse_ref,
+                    self.request.options.clone(),
+                )
+                .map_err(to_napi_error)?
+        };
+        if self.with_stats {
+            stringify_value(search_outcome_to_json(
+                &outcome,
+                self.request.explain,
+                &self.request.fusion_name,
+            ))
+        } else {
+            stringify_value(search_results_to_json(
+                &outcome.results,
+                self.request.explain,
+                &self.request.fusion_name,
+            ))
+        }
+    }
+
+    fn resolve(&mut self, _env: napi::Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+pub struct FlushTask {
+    db: Arc<RwLock<CoreDatabase>>,
+}
+
+impl napi::Task for FlushTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let mut database = self
+            .db
+            .write()
+            .map_err(|e| err(format!("lock poisoned: {e}")))?;
+        database.flush().map_err(to_napi_error)
+    }
+
+    fn resolve(&mut self, _env: napi::Env, _output: Self::Output) -> Result<Self::JsValue> {
+        Ok(())
+    }
+}
+
+pub struct CompactTask {
+    db: Arc<RwLock<CoreDatabase>>,
+}
+
+impl napi::Task for CompactTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let mut database = self
+            .db
+            .write()
+            .map_err(|e| err(format!("lock poisoned: {e}")))?;
+        database.compact().map_err(to_napi_error)
+    }
+
+    fn resolve(&mut self, _env: napi::Env, _output: Self::Output) -> Result<Self::JsValue> {
+        Ok(())
+    }
+}
+
+pub struct BulkIngestTask {
+    db: Arc<RwLock<CoreDatabase>>,
+    records: Vec<Record>,
+    batch_size: usize,
+}
+
+impl napi::Task for BulkIngestTask {
+    type Output = u32;
+    type JsValue = u32;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let records = std::mem::take(&mut self.records);
+        let mut database = self
+            .db
+            .write()
+            .map_err(|e| err(format!("lock poisoned: {e}")))?;
+        database
+            .bulk_ingest(records, self.batch_size)
+            .map(|count| count as u32)
+            .map_err(to_napi_error)
+    }
+
+    fn resolve(&mut self, _env: napi::Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi]
+impl NativeDatabase {
+    #[napi(js_name = "searchAsync")]
+    pub fn search_async(
+        &self,
+        query: Option<Vec<f64>>,
+        options_json: Option<String>,
+    ) -> Result<AsyncTask<SearchTask>> {
+        let request = parse_search_request(options_json)?;
+        let query = query
+            .map(|vector| js_vector_to_core(vector, "query vector"))
+            .transpose()?;
+        Ok(AsyncTask::new(SearchTask {
+            db: self.inner.clone(),
+            query,
+            request,
+            with_stats: false,
+        }))
+    }
+
+    #[napi(js_name = "searchWithStatsAsync")]
+    pub fn search_with_stats_async(
+        &self,
+        query: Option<Vec<f64>>,
+        options_json: Option<String>,
+    ) -> Result<AsyncTask<SearchTask>> {
+        let request = parse_search_request(options_json)?;
+        let query = query
+            .map(|vector| js_vector_to_core(vector, "query vector"))
+            .transpose()?;
+        Ok(AsyncTask::new(SearchTask {
+            db: self.inner.clone(),
+            query,
+            request,
+            with_stats: true,
+        }))
+    }
+
+    #[napi(js_name = "flushAsync")]
+    pub fn flush_async(&self) -> AsyncTask<FlushTask> {
+        AsyncTask::new(FlushTask {
+            db: self.inner.clone(),
+        })
+    }
+
+    #[napi(js_name = "compactAsync")]
+    pub fn compact_async(&self) -> AsyncTask<CompactTask> {
+        AsyncTask::new(CompactTask {
+            db: self.inner.clone(),
+        })
+    }
+
+    #[napi(js_name = "bulkIngestAsync")]
+    pub fn bulk_ingest_async(
+        &self,
+        records_json: String,
+        namespace: Option<String>,
+        batch_size: u32,
+    ) -> Result<AsyncTask<BulkIngestTask>> {
+        let records = parse_record_batch_json(&records_json, namespace.as_deref())?;
+        Ok(AsyncTask::new(BulkIngestTask {
+            db: self.inner.clone(),
+            records,
+            batch_size: batch_size as usize,
+        }))
+    }
+}
+
 #[napi]
 impl NativeTransaction {
     #[napi]
@@ -466,11 +961,13 @@ impl NativeTransaction {
         namespace: Option<String>,
         sparse_json: Option<String>,
         vectors_json: Option<String>,
+        ttl: Option<f64>,
     ) -> Result<()> {
         let metadata = parse_metadata_json(metadata_json)?;
         let sparse = parse_sparse_json(sparse_json)?;
         let vectors = parse_named_vectors_json(vectors_json)?;
         let vector = js_vector_to_core(vector, "vector")?;
+        let expires_at = ttl_to_expires_at(ttl)?;
         self.stage(WriteOperation::Insert(Record {
             namespace: namespace.unwrap_or_default(),
             id,
@@ -478,6 +975,8 @@ impl NativeTransaction {
             vectors,
             sparse,
             metadata,
+            multi_vectors: MultiVectors::new(),
+            expires_at,
         }))
     }
 
@@ -490,11 +989,13 @@ impl NativeTransaction {
         namespace: Option<String>,
         sparse_json: Option<String>,
         vectors_json: Option<String>,
+        ttl: Option<f64>,
     ) -> Result<()> {
         let metadata = parse_metadata_json(metadata_json)?;
         let sparse = parse_sparse_json(sparse_json)?;
         let vectors = parse_named_vectors_json(vectors_json)?;
         let vector = js_vector_to_core(vector, "vector")?;
+        let expires_at = ttl_to_expires_at(ttl)?;
         self.stage(WriteOperation::Upsert(Record {
             namespace: namespace.unwrap_or_default(),
             id,
@@ -502,6 +1003,8 @@ impl NativeTransaction {
             vectors,
             sparse,
             metadata,
+            multi_vectors: MultiVectors::new(),
+            expires_at,
         }))
     }
 
@@ -660,7 +1163,13 @@ pub fn open(
     dimension: Option<u32>,
     read_only: bool,
     lock_timeout: Option<f64>,
+    metric: Option<String>,
 ) -> Result<NativeDatabase> {
+    let parsed_metric = match metric.as_deref() {
+        Some(name) => DistanceMetric::from_name(name).map_err(to_napi_error)?,
+        None => DistanceMetric::Cosine,
+    };
+
     let database = if read_only {
         if !Path::new(&path).exists() {
             return Err(err("cannot open non-existent database in read-only mode"));
@@ -683,7 +1192,8 @@ pub fn open(
                 db
             }
             (Some(dimension), None) => {
-                CoreDatabase::open_or_create(&path, dimension as usize).map_err(to_napi_error)?
+                CoreDatabase::open_or_create_with_metric(&path, dimension as usize, parsed_metric)
+                    .map_err(to_napi_error)?
             }
             (None, Some(timeout)) => {
                 CoreDatabase::open_with_timeout(&path, timeout).map_err(to_napi_error)?
@@ -694,7 +1204,8 @@ pub fn open(
         let Some(dimension) = dimension else {
             return Err(err("dimension is required when creating a new database"));
         };
-        CoreDatabase::create(&path, dimension as usize).map_err(to_napi_error)?
+        CoreDatabase::create_with_metric(&path, dimension as usize, parsed_metric)
+            .map_err(to_napi_error)?
     };
 
     Ok(NativeDatabase {
@@ -738,6 +1249,7 @@ fn parse_search_request(options_json: Option<String>) -> Result<SearchRequest> {
     let fetch_k = get_usize(object, "fetchK")?.unwrap_or(0);
     let mmr_lambda = get_optional_f32(object, "mmrLambda")?;
     let vector_name = get_string(object, "vectorName")?;
+    let truncate_dim = get_usize(object, "truncateDim")?;
     let fusion_name = get_string(object, "fusion")?.unwrap_or_else(|| "linear".to_owned());
     let rrf_k = get_usize(object, "rrfK")?.unwrap_or(60);
     let explain = get_bool(object, "explain")?.unwrap_or(false);
@@ -761,6 +1273,7 @@ fn parse_search_request(options_json: Option<String>) -> Result<SearchRequest> {
             mmr_lambda,
             vector_name,
             fusion: parse_fusion(&fusion_name, rrf_k)?,
+            truncate_dim,
             multi_vector_queries: query_vectors,
         },
     })
@@ -883,6 +1396,39 @@ fn json_to_named_vectors(value: &Value) -> Result<NamedVectors> {
         vectors.insert(name.clone(), value_to_vector(vector, "named vector")?);
     }
     Ok(vectors)
+}
+
+fn json_to_multi_vectors(value: &Value) -> Result<MultiVectors> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| err("multi_vectors must be a JSON object"))?;
+    let mut multi_vectors = MultiVectors::new();
+    for (name, token_array) in object {
+        if name.is_empty() {
+            return Err(err("multi-vector space names must not be empty"));
+        }
+        let arr = token_array
+            .as_array()
+            .ok_or_else(|| err("multi-vector space value must be an array of arrays"))?;
+        let mut token_vectors = Vec::with_capacity(arr.len());
+        for item in arr {
+            token_vectors.push(value_to_vector(item, "multi-vector token")?);
+        }
+        multi_vectors.insert(name.clone(), token_vectors);
+    }
+    Ok(multi_vectors)
+}
+
+fn multi_vectors_to_json(mv: &MultiVectors) -> Value {
+    let mut map = Map::new();
+    for (name, token_vectors) in mv {
+        let arr: Vec<Value> = token_vectors
+            .iter()
+            .map(|v| Value::Array(v.iter().map(|&f| json!(f)).collect()))
+            .collect();
+        map.insert(name.clone(), Value::Array(arr));
+    }
+    Value::Object(map)
 }
 
 fn json_to_filter(value: &Value) -> Result<MetadataFilter> {
@@ -1069,6 +1615,18 @@ fn json_to_record(object: &Map<String, Value>, default_namespace: Option<&str>) 
         .transpose()?
         .unwrap_or_default();
 
+    let multi_vectors = object
+        .get("multi_vectors")
+        .or_else(|| object.get("multiVectors"))
+        .map(json_to_multi_vectors)
+        .transpose()?
+        .unwrap_or_default();
+
+    let ttl = object
+        .get("ttl")
+        .and_then(|v| v.as_f64());
+    let expires_at = ttl_to_expires_at(ttl)?;
+
     Ok(Record {
         namespace,
         id: value_to_string(id)?,
@@ -1076,6 +1634,8 @@ fn json_to_record(object: &Map<String, Value>, default_namespace: Option<&str>) 
         vectors,
         sparse,
         metadata,
+        multi_vectors,
+        expires_at,
     })
 }
 
@@ -1087,6 +1647,8 @@ fn record_to_json(record: &Record) -> Value {
         "vectors": named_vectors_to_json(&record.vectors),
         "sparse": sparse_to_json(&record.sparse),
         "metadata": metadata_to_json(&record.metadata),
+        "multi_vectors": multi_vectors_to_json(&record.multi_vectors),
+        "expires_at": record.expires_at,
     })
 }
 
@@ -1188,6 +1750,8 @@ fn search_stats_to_json(stats: &vectlite::SearchStats) -> Value {
         "ann_loaded_from_disk": stats.ann_loaded_from_disk,
         "wal_entries_replayed": stats.wal_entries_replayed,
         "fusion": stats.fusion,
+        "effective_dimension": stats.effective_dimension,
+        "matryoshka_truncated": stats.matryoshka_truncated,
         "rerank_applied": false,
         "rerank_count": 0,
         "timings": {
@@ -1342,6 +1906,23 @@ fn value_to_f32(value: &Value, label: &str) -> Result<f32> {
         .ok_or_else(|| err(format!("{label} must contain numeric values")))
 }
 
+/// Convert an optional TTL (seconds from now) to an absolute `expires_at` timestamp.
+fn ttl_to_expires_at(ttl: Option<f64>) -> Result<Option<f64>> {
+    match ttl {
+        None => Ok(None),
+        Some(t) if t < 0.0 || t.is_nan() => {
+            Err(err("ttl must be a non-negative finite number"))
+        }
+        Some(t) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            Ok(Some(now + t))
+        }
+    }
+}
+
 fn js_vector_to_core(values: Vec<f64>, label: &str) -> Result<Vec<f32>> {
     let mut vector = Vec::with_capacity(values.len());
     for value in values {
@@ -1370,6 +1951,10 @@ fn to_napi_error(error: vectlite::VectLiteError) -> NapiError {
 
 fn closed_database_error() -> vectlite::VectLiteError {
     vectlite::VectLiteError::InvalidFormat("database is closed".to_owned())
+}
+
+fn parse_payload_index_type(name: &str) -> Result<PayloadIndexType> {
+    PayloadIndexType::from_name(name).map_err(to_napi_error)
 }
 
 fn parse_quantization_options(

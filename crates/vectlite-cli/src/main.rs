@@ -90,7 +90,14 @@ fn run() -> Result<(), String> {
             let filter = parse_filters(args.get(5).map(String::as_str))?;
 
             let results = database
-                .search(&vector, SearchOptions { top_k, filter })
+                .search(
+                    &vector,
+                    SearchOptions {
+                        top_k,
+                        filter,
+                        truncate_dim: None,
+                    },
+                )
                 .map_err(|err| err.to_string())?;
 
             if results.is_empty() {

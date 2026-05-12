@@ -43,10 +43,12 @@ db.close()
 ### Core
 
 - **Single-file storage** -- one `.vdb` file per database, portable and easy to back up
-- **Dense vectors** -- cosine similarity with automatic HNSW indexing for large collections
+- **Distance metrics** -- cosine (default), euclidean (L2), dot product, manhattan (L1) with SIMD acceleration
+- **Dense vectors** -- automatic HNSW indexing with metric-aware distance functions
 - **Sparse vectors** -- BM25-scored inverted index for keyword retrieval
 - **Hybrid search** -- dense + sparse fusion with linear or RRF strategies
 - **Vector quantization** -- scalar (int8, 4x), binary (32x), and product quantization (PQ) with 2-stage rescoring
+- **Multi-vector / ColBERT** -- late interaction search with per-token MaxSim scoring and 2-bit quantization (~16x compression)
 - **Rich metadata** -- string, number, boolean, null, array, and nested object values
 - **Crash-safe WAL** -- writes land in a write-ahead log first, then checkpoint with `compact()`
 - **Transactions** -- atomic batched writes with `db.transaction()`
@@ -61,6 +63,7 @@ db.close()
 - **MMR diversification** -- `mmrLambda` controls relevance vs. diversity trade-off
 - **Namespaces** -- logical isolation with per-namespace or cross-namespace search
 - **Observability** -- `searchWithStats()` returns timings, BM25 term scores, ANN stats, and per-result explain payloads
+- **Payload indexes** -- keyword and numeric indexes on metadata fields accelerate filtered queries on large collections
 
 ### Data Management
 
@@ -68,13 +71,34 @@ db.close()
 - **Bulk ingestion** -- `bulkIngest()` with deferred index rebuilds for fast imports
 - **Listing & filtered counts** -- `list()` and `count({ namespace, filter })` without a vector query
 - **Delete by filter** -- `deleteByFilter()` for bulk deletion by metadata filter
+- **Partial metadata updates** -- `updateMetadata()` merges a patch without re-writing the vector or rebuilding indexes
 - **Snapshots** -- `db.snapshot(path)` creates a self-contained copy
 - **Backup / Restore** -- `db.backup(dir)` and `vectlite.restore(dir, path)` for full roundtrips
 - **Read-only mode** -- `vectlite.open(path, { readOnly: true })` for safe concurrent readers
 - **Explicit close** -- `db.close()` to release locks deterministically
 - **Lock timeouts** -- `lockTimeout` for bounded lock acquisition waits
+- **TTL / Expiry** -- `setTtl()` / `clearTtl()` or `ttl` option on insert/upsert; expired records auto-filtered from reads and GC'd on compact
+- **Cursor-based pagination** -- `listCursor()` for efficient iteration over large collections
+- **Async API** -- `searchAsync()`, `compactAsync()`, `flushAsync()`, `bulkIngestAsync()` run on the libuv threadpool
 
 ## Usage
+
+### Distance Metrics
+
+```js
+// Default is cosine similarity
+const db = vectlite.open('knowledge.vdb', { dimension: 384 })
+
+// Choose a different metric at creation time
+const db2 = vectlite.open('knowledge.vdb', { dimension: 384, metric: 'euclidean' })
+const db3 = vectlite.open('knowledge.vdb', { dimension: 384, metric: 'dotproduct' })
+const db4 = vectlite.open('knowledge.vdb', { dimension: 384, metric: 'manhattan' })
+
+// Aliases: 'l2', 'dot', 'ip', 'l1'
+console.log(db2.metric) // "euclidean"
+```
+
+The metric is persisted in the database file. Scores are always oriented so that **higher is better**.
 
 ### Hybrid Search
 
@@ -167,6 +191,9 @@ const records = db.list({ namespace: 'docs', filter: { stale: false }, limit: 20
 const count = db.count({ namespace: 'docs', filter: { source: 'blog' } })
 const deleted = db.deleteByFilter({ stale: true }, { namespace: 'docs' })
 
+// Partial metadata update (merge patch -- only touches specified keys)
+db.updateMetadata('doc1', { status: 'reviewed', score: 0.95 })
+
 db.close()
 ```
 
@@ -182,6 +209,24 @@ const outcome = db.searchWithStats(query, {
 console.log(outcome.stats.timings)      // { dense_us: 120, sparse_us: 45, ... }
 console.log(outcome.stats.used_ann)     // true
 console.log(outcome.results[0].explain) // Detailed scoring breakdown
+```
+
+### Payload Indexes
+
+Create keyword or numeric indexes on metadata fields to accelerate filtered queries on large collections. Indexes are automatically used by `search()`, `count()`, and `list()`.
+
+```js
+// Create indexes on frequently-filtered fields
+db.createIndex('source', 'keyword')   // string equality, $in
+db.createIndex('score', 'numeric')    // range queries: $gt, $gte, $lt, $lte
+
+// Filtered queries now use indexes automatically
+const count = db.count({ filter: { source: 'blog' } })
+const results = db.search(query, { k: 10, filter: { score: { $gte: 0.8 } } })
+
+// Inspect and manage indexes
+console.log(db.listIndexes())  // [{ field: 'source', type: 'keyword' }, ...]
+db.dropIndex('score')
 ```
 
 ### Vector Quantization
@@ -211,6 +256,130 @@ db.disableQuantization()
 
 Quantization parameters persist across reopens in a `.vdb.quant` sidecar file. The quantized index auto-rebuilds on inserts and upserts.
 
+### Multi-Vector / ColBERT Search
+
+Store token-level embeddings (ColBERT, ColPali) and search with MaxSim late interaction scoring.
+
+```js
+// Upsert with per-token ColBERT embeddings
+db.upsertMultiVectors('doc1', denseVector,
+  JSON.stringify({ colbert: [tokenVec1, tokenVec2] }),
+  JSON.stringify({ metadata: { source: 'paper' } })
+)
+
+// MaxSim search
+const results = JSON.parse(
+  db.searchMultiVector('colbert', JSON.stringify(queryTokenVectors))
+)
+
+// Enable 2-bit quantization (~16x compression)
+db.enableMultiVectorQuantization('colbert')
+
+// Check and disable
+console.log(db.isMultiVectorQuantized('colbert'))  // true
+db.disableMultiVectorQuantization('colbert')
+```
+
+### TTL / Expiry
+
+Records can automatically expire after a time-to-live. Expired records are transparently filtered from all reads and permanently removed on `compact()`.
+
+```js
+// Set TTL on insert/upsert (seconds)
+db.upsert('session1', embedding, { user: 'alice' }, { ttl: 3600 }) // expires in 1 hour
+
+// Set/clear TTL on existing records
+db.setTtl('doc1', 86400)    // expire in 24 hours
+db.clearTtl('doc1')          // remove expiry
+
+// Expired records are invisible to get/list/count/search
+const record = db.get('session1') // null after TTL elapses
+
+// compact() garbage-collects expired records from disk
+db.compact()
+```
+
+### Cursor-Based Pagination
+
+Efficiently iterate over large collections without offset overhead.
+
+```js
+// Paginate 100 records at a time
+let cursor = null
+do {
+  const page = db.listCursor({ limit: 100, cursor })
+  for (const record of page.records) {
+    process(record)
+  }
+  cursor = page.cursor
+} while (cursor !== null)
+
+// Works with namespace and filter
+const page = db.listCursor({ namespace: 'docs', filter: { source: 'blog' }, limit: 50 })
+```
+
+### Async API
+
+Non-blocking versions of heavy operations that run on the libuv threadpool.
+
+```js
+// Async search (returns a Promise)
+const results = await db.searchAsync(queryEmbedding, { k: 10, filter: { source: 'blog' } })
+
+// Async search with stats
+const outcome = await db.searchWithStatsAsync(queryEmbedding, { k: 10 })
+
+// Async maintenance
+await db.flushAsync()
+await db.compactAsync()
+
+// Async bulk ingestion
+const count = await db.bulkIngestAsync(records, { batchSize: 5000 })
+```
+
+### OpenTelemetry Integration
+
+vectlite ships with optional OpenTelemetry tracing. When enabled, every search
+call is wrapped in a span carrying semantic DB attributes and search-specific
+metrics. `@opentelemetry/api` is loaded lazily -- it is **not** a runtime
+dependency.
+
+```js
+const vectlite = require('vectlite')
+
+// Auto-detect: resolves a tracer from @opentelemetry/api if installed
+const tracer = vectlite.configureOpenTelemetry()
+
+// Or supply your own tracer
+vectlite.configureOpenTelemetry({ tracer: myTracer })
+
+// Custom tracer name (default: 'vectlite')
+vectlite.configureOpenTelemetry({ tracerName: 'my-app' })
+
+// Disable
+vectlite.configureOpenTelemetry(false)
+```
+
+When a tracer is active, each `search` / `searchWithStats` / `searchAsync` /
+`searchWithStatsAsync` call creates a `vectlite.search` span with these
+attributes:
+
+| Attribute | Description |
+|---|---|
+| `db.system` | Always `"vectlite"` |
+| `db.operation.name` | Always `"search"` |
+| `vectlite.search.k` | Requested result count |
+| `vectlite.search.namespace` | Target namespace |
+| `vectlite.search.has_dense` | Whether a dense query vector was provided |
+| `vectlite.search.has_sparse` | Whether sparse terms were provided |
+| `vectlite.search.fusion` | Fusion strategy (`"linear"` or `"rrf"`) |
+| `vectlite.search.used_ann` | Whether HNSW was used (set after completion) |
+| `vectlite.search.result_count` | Number of results returned (set after completion) |
+| `vectlite.search.total_us` | Total search time in microseconds (set after completion) |
+
+If a search throws, the span records the exception and sets an error status
+before re-throwing.
+
 ## Database Methods Reference
 
 ### Write Methods
@@ -225,6 +394,9 @@ Quantization parameters persist across reopens in a `.vdb.quant` sidecar file. T
 | `db.delete(id, { namespace })` | Delete a single record |
 | `db.deleteMany(ids, { namespace })` | Delete multiple records by id |
 | `db.deleteByFilter(filter, { namespace })` | Delete all records matching a filter |
+| `db.updateMetadata(id, metadata, { namespace })` | Merge a metadata patch into an existing record (no vector rewrite) |
+| `db.setTtl(id, seconds, { namespace })` | Set time-to-live on a record (seconds from now) |
+| `db.clearTtl(id, { namespace })` | Remove TTL from a record |
 
 ### Read Methods
 
@@ -235,10 +407,20 @@ Quantization parameters persist across reopens in a `.vdb.quant` sidecar file. T
 | `db.searchWithStats(query, options)` | Search with detailed performance stats |
 | `db.count({ namespace, filter })` | Count records, optionally scoped by namespace/filter |
 | `db.list({ namespace, filter, limit, offset })` | List records without issuing a vector query |
+| `db.listCursor({ namespace, filter, limit, cursor })` | Cursor-based pagination for large collections |
 | `db.namespaces()` | List all namespaces |
 | `db.dimension` | Vector dimension (property) |
 | `db.path` | Database file path (property) |
+| `db.metric` | Distance metric name: `"cosine"`, `"euclidean"`, `"dotproduct"`, or `"manhattan"` (property) |
 | `db.readOnly` | Whether the database is read-only (property) |
+
+### Index Methods
+
+| Method | Description |
+|---|---|
+| `db.createIndex(field, indexType)` | Create a payload index (`'keyword'` or `'numeric'`) on a metadata field |
+| `db.dropIndex(field)` | Remove an index |
+| `db.listIndexes()` | List all active indexes as `[{ field, type }, ...]` |
 
 ### Quantization Methods
 
@@ -259,6 +441,16 @@ Quantization parameters persist across reopens in a `.vdb.quant` sidecar file. T
 | `db.backup(destDir)` | Full backup including ANN sidecar files |
 | `db.transaction()` | Begin an atomic transaction |
 | `db.close()` | Flush pending state, release the file lock, and invalidate the handle |
+
+### Async Methods
+
+| Method | Description |
+|---|---|
+| `db.searchAsync(query, options)` | Non-blocking search (returns Promise) |
+| `db.searchWithStatsAsync(query, options)` | Non-blocking search with stats (returns Promise) |
+| `db.flushAsync()` | Non-blocking flush/compact (returns Promise) |
+| `db.compactAsync()` | Non-blocking compact (returns Promise) |
+| `db.bulkIngestAsync(records, options)` | Non-blocking bulk import (returns Promise) |
 
 ## Filter Operators
 

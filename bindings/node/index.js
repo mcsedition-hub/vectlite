@@ -63,6 +63,7 @@ function loadNative() {
 const native = loadNative()
 
 const TOKEN_RE = /[a-z0-9]+/g
+let otelTracer = null
 
 class VectLiteError extends Error {
   constructor(message, cause) {
@@ -102,6 +103,84 @@ function decode(value) {
   return value == null ? null : JSON.parse(value)
 }
 
+function configureOpenTelemetry(options = {}) {
+  if (options === false || options?.enabled === false) {
+    otelTracer = null
+    return null
+  }
+  if (options?.tracer != null) {
+    otelTracer = options.tracer
+    return otelTracer
+  }
+  try {
+    const { trace } = require('@opentelemetry/api')
+    otelTracer = trace.getTracer(options?.tracerName ?? 'vectlite')
+    return otelTracer
+  } catch {
+    otelTracer = null
+    return null
+  }
+}
+
+function searchAttributes(query, options, stats = null) {
+  const attrs = {
+    'db.system': 'vectlite',
+    'db.operation.name': 'search',
+    'vectlite.search.k': options?.k ?? 10,
+    'vectlite.search.namespace': options?.namespace ?? '',
+    'vectlite.search.all_namespaces': Boolean(options?.allNamespaces),
+    'vectlite.search.has_dense': query != null,
+    'vectlite.search.has_sparse': options?.sparse != null,
+    'vectlite.search.fusion': options?.fusion ?? 'linear',
+  }
+  if (options?.vectorName != null) attrs['vectlite.search.vector_name'] = options.vectorName
+  if (options?.truncateDim != null) attrs['vectlite.search.truncate_dim'] = options.truncateDim
+  if (stats != null) {
+    attrs['vectlite.search.used_ann'] = Boolean(stats.used_ann)
+    attrs['vectlite.search.exact_fallback'] = Boolean(stats.exact_fallback)
+    attrs['vectlite.search.considered_count'] = stats.considered_count ?? 0
+    attrs['vectlite.search.result_count'] = stats.result_count ?? 0
+    attrs['vectlite.search.effective_dimension'] = stats.effective_dimension ?? 0
+    attrs['vectlite.search.matryoshka_truncated'] = Boolean(stats.matryoshka_truncated)
+    attrs['vectlite.search.total_us'] = stats.timings?.total_us ?? 0
+  }
+  return attrs
+}
+
+function withSearchSpan(query, options, fn) {
+  if (otelTracer == null) {
+    return fn()
+  }
+  return otelTracer.startActiveSpan('vectlite.search', { attributes: searchAttributes(query, options) }, (span) => {
+    try {
+      const value = fn()
+      if (isPromiseLike(value)) {
+        return value.then(
+          (resolved) => {
+            span.setAttributes(searchAttributes(query, options, resolved?.stats ?? null))
+            span.end()
+            return resolved
+          },
+          (error) => {
+            span.recordException?.(error)
+            span.setStatus?.({ code: 2, message: error?.message ?? String(error) })
+            span.end()
+            throw error
+          },
+        )
+      }
+      span.setAttributes(searchAttributes(query, options, value?.stats ?? null))
+      span.end()
+      return value
+    } catch (error) {
+      span.recordException?.(error)
+      span.setStatus?.({ code: 2, message: error?.message ?? String(error) })
+      span.end()
+      throw error
+    }
+  })
+}
+
 function asArray(values) {
   return Array.from(values)
 }
@@ -123,6 +202,7 @@ function normalizeWriteOptions(options = {}) {
     namespace: options.namespace ?? null,
     sparse: options.sparse ?? null,
     vectors: options.vectors ?? null,
+    ttl: options.ttl ?? null,
   }
 }
 
@@ -150,16 +230,16 @@ class Transaction {
   }
 
   insert(id, vector, metadata = null, options = {}) {
-    const { namespace, sparse, vectors } = normalizeWriteOptions(options)
+    const { namespace, sparse, vectors, ttl } = normalizeWriteOptions(options)
     return wrapError(() =>
-      this._native.insert(id, asArray(vector), encode(metadata), namespace, encode(sparse), encode(vectors)),
+      this._native.insert(id, asArray(vector), encode(metadata), namespace, encode(sparse), encode(vectors), ttl),
     )
   }
 
   upsert(id, vector, metadata = null, options = {}) {
-    const { namespace, sparse, vectors } = normalizeWriteOptions(options)
+    const { namespace, sparse, vectors, ttl } = normalizeWriteOptions(options)
     return wrapError(() =>
-      this._native.upsert(id, asArray(vector), encode(metadata), namespace, encode(sparse), encode(vectors)),
+      this._native.upsert(id, asArray(vector), encode(metadata), namespace, encode(sparse), encode(vectors), ttl),
     )
   }
 
@@ -205,6 +285,10 @@ class Database {
     return wrapError(() => this._native.dimension)
   }
 
+  get metric() {
+    return wrapError(() => this._native.metric)
+  }
+
   get readOnly() {
     return wrapError(() => this._native.readOnly)
   }
@@ -234,21 +318,35 @@ class Database {
     )
   }
 
+  listCursor(options = {}) {
+    return wrapError(() => {
+      const raw = decode(
+        this._native.listCursor(
+          options.namespace ?? null,
+          encode(options.filter),
+          options.limit ?? null,
+          options.cursor ?? null,
+        ),
+      )
+      return { records: raw.records, cursor: raw.cursor ?? null }
+    })
+  }
+
   transaction() {
     return wrapError(() => new Transaction(this._native.transaction()))
   }
 
   insert(id, vector, metadata = null, options = {}) {
-    const { namespace, sparse, vectors } = normalizeWriteOptions(options)
+    const { namespace, sparse, vectors, ttl } = normalizeWriteOptions(options)
     return wrapError(() =>
-      this._native.insert(id, asArray(vector), encode(metadata), namespace, encode(sparse), encode(vectors)),
+      this._native.insert(id, asArray(vector), encode(metadata), namespace, encode(sparse), encode(vectors), ttl),
     )
   }
 
   upsert(id, vector, metadata = null, options = {}) {
-    const { namespace, sparse, vectors } = normalizeWriteOptions(options)
+    const { namespace, sparse, vectors, ttl } = normalizeWriteOptions(options)
     return wrapError(() =>
-      this._native.upsert(id, asArray(vector), encode(metadata), namespace, encode(sparse), encode(vectors)),
+      this._native.upsert(id, asArray(vector), encode(metadata), namespace, encode(sparse), encode(vectors), ttl),
     )
   }
 
@@ -282,6 +380,32 @@ class Database {
     return wrapError(() => this._native.deleteByFilter(encode(filter), options.namespace ?? null))
   }
 
+  updateMetadata(id, metadata, options = {}) {
+    return wrapError(() =>
+      this._native.updateMetadata(id, encode(metadata), options.namespace ?? null),
+    )
+  }
+
+  setTtl(id, ttl, options = {}) {
+    return wrapError(() => this._native.setTtl(id, ttl, options.namespace ?? null))
+  }
+
+  clearTtl(id, options = {}) {
+    return wrapError(() => this._native.clearTtl(id, options.namespace ?? null))
+  }
+
+  createIndex(field, indexType) {
+    return wrapError(() => this._native.createIndex(field, indexType))
+  }
+
+  dropIndex(field) {
+    return wrapError(() => this._native.dropIndex(field))
+  }
+
+  listIndexes() {
+    return wrapError(() => decode(this._native.listIndexes()))
+  }
+
   flush() {
     return wrapError(() => this._native.flush())
   }
@@ -299,12 +423,46 @@ class Database {
   }
 
   search(query = null, options = {}) {
-    return wrapError(() => decode(this._native.search(query == null ? null : asArray(query), encode(options))))
+    return withSearchSpan(query, options, () =>
+      wrapError(() => decode(this._native.search(query == null ? null : asArray(query), encode(options)))),
+    )
   }
 
   searchWithStats(query = null, options = {}) {
-    return wrapError(() =>
-      decode(this._native.searchWithStats(query == null ? null : asArray(query), encode(options))),
+    return withSearchSpan(query, options, () =>
+      wrapError(() =>
+        decode(this._native.searchWithStats(query == null ? null : asArray(query), encode(options))),
+      ),
+    )
+  }
+
+  searchAsync(query = null, options = {}) {
+    return withSearchSpan(query, options, () =>
+      wrapAsync(
+        this._native.searchAsync(query == null ? null : asArray(query), encode(options)),
+      ).then(decode),
+    )
+  }
+
+  searchWithStatsAsync(query = null, options = {}) {
+    return withSearchSpan(query, options, () =>
+      wrapAsync(
+        this._native.searchWithStatsAsync(query == null ? null : asArray(query), encode(options)),
+      ).then(decode),
+    )
+  }
+
+  flushAsync() {
+    return wrapAsync(this._native.flushAsync())
+  }
+
+  compactAsync() {
+    return wrapAsync(this._native.compactAsync())
+  }
+
+  bulkIngestAsync(records, options = {}) {
+    return wrapAsync(
+      this._native.bulkIngestAsync(encode(records), options.namespace ?? null, options.batchSize ?? 10_000),
     )
   }
 }
@@ -345,7 +503,7 @@ class Store {
 
 function open(path, options = {}) {
   return wrapError(() =>
-    new Database(native.open(path, options.dimension ?? null, options.readOnly ?? false, options.lockTimeout ?? null)),
+    new Database(native.open(path, options.dimension ?? null, options.readOnly ?? false, options.lockTimeout ?? null, options.metric ?? null)),
   )
 }
 
@@ -393,6 +551,7 @@ module.exports = {
   Store,
   Transaction,
   VectLiteError,
+  configureOpenTelemetry,
   open,
   openStore,
   restore,

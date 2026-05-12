@@ -1,0 +1,203 @@
+[Error]
+enum VectLiteError {
+    "Io",
+    "InvalidFormat",
+    "DimensionMismatch",
+    "DuplicateId",
+    "ReadOnly",
+    "LockContention",
+    "JsonError",
+};
+
+/// A search result returned from search operations.
+dictionary SearchResult {
+    string namespace;
+    string id;
+    f32 score;
+    /// Metadata as a JSON string.
+    string metadata_json;
+};
+
+/// A record returned from get/list operations.
+dictionary RecordResult {
+    string namespace;
+    string id;
+    sequence<f32> vector;
+    /// Metadata as a JSON string.
+    string metadata_json;
+    /// Expiry timestamp (epoch seconds) or null.
+    f64? expires_at;
+};
+
+/// A page of cursor-based results.
+dictionary CursorPage {
+    sequence<RecordResult> records;
+    string? cursor;
+};
+
+/// Statistics from a search-with-stats call.
+dictionary SearchStatsResult {
+    sequence<SearchResult> results;
+    /// Stats as a JSON string.
+    string stats_json;
+};
+
+/// An embedded vector database.
+interface Database {
+    // -- Constructors --
+    [Throws=VectLiteError, Name=open_or_create]
+    constructor(string path, u32 dimension, string? metric);
+
+    [Throws=VectLiteError, Name=open_existing]
+    constructor(string path, f64? lock_timeout);
+
+    [Throws=VectLiteError, Name=open_read_only]
+    constructor(string path, f64? lock_timeout);
+
+    // -- Properties --
+    string path();
+    u32 dimension();
+    string metric();
+    boolean is_read_only();
+    boolean is_closed();
+
+    // -- Write --
+    [Throws=VectLiteError]
+    void upsert(string id, sequence<f32> vector, string? metadata_json, string? namespace, f64? ttl);
+
+    [Throws=VectLiteError]
+    void insert(string id, sequence<f32> vector, string? metadata_json, string? namespace, f64? ttl);
+
+    [Throws=VectLiteError]
+    boolean delete(string id, string? namespace);
+
+    [Throws=VectLiteError]
+    u32 delete_many(sequence<string> ids, string? namespace);
+
+    [Throws=VectLiteError]
+    u32 delete_by_filter(string filter_json, string? namespace);
+
+    [Throws=VectLiteError]
+    boolean update_metadata(string id, string metadata_json, string? namespace);
+
+    [Throws=VectLiteError]
+    boolean set_ttl(string id, f64 ttl_secs, string? namespace);
+
+    [Throws=VectLiteError]
+    boolean clear_ttl(string id, string? namespace);
+
+    // -- Read --
+    RecordResult? get(string id, string? namespace);
+
+    u32 count(string? namespace, string? filter_json);
+
+    sequence<RecordResult> list(string? namespace, string? filter_json, u32 limit, u32 offset);
+
+    [Throws=VectLiteError]
+    CursorPage list_cursor(string? namespace, string? filter_json, u32 limit, string? cursor);
+
+    sequence<string> namespaces();
+
+    // -- Search --
+    [Throws=VectLiteError]
+    sequence<SearchResult> search(
+        sequence<f32> query,
+        u32 k,
+        string? filter_json,
+        string? namespace,
+        string? sparse_json,
+        string? fusion,
+        f32? dense_weight,
+        f32? sparse_weight,
+        f32? mmr_lambda
+    );
+
+    [Throws=VectLiteError]
+    SearchStatsResult search_with_stats(
+        sequence<f32> query,
+        u32 k,
+        string? filter_json,
+        string? namespace,
+        string? sparse_json,
+        string? fusion,
+        f32? dense_weight,
+        f32? sparse_weight,
+        f32? mmr_lambda
+    );
+
+    // -- Index --
+    [Throws=VectLiteError]
+    void create_index(string field, string index_type);
+
+    [Throws=VectLiteError]
+    boolean drop_index(string field);
+
+    /// Returns JSON array of {field, type} objects.
+    string list_indexes_json();
+
+    // -- Quantization --
+    [Throws=VectLiteError]
+    void enable_quantization(string method, string? options_json);
+
+    [Throws=VectLiteError]
+    void disable_quantization();
+
+    boolean is_quantized();
+    string? quantization_method();
+
+    // -- Bulk --
+    [Throws=VectLiteError]
+    u32 bulk_ingest(string records_json, u32 batch_size);
+
+    // -- Maintenance --
+    [Throws=VectLiteError]
+    void compact();
+
+    [Throws=VectLiteError]
+    void flush();
+
+    [Throws=VectLiteError]
+    void snapshot(string dest);
+
+    [Throws=VectLiteError]
+    void backup(string dest);
+
+    [Throws=VectLiteError]
+    void close();
+
+    // -- Transaction --
+    [Throws=VectLiteError]
+    void transaction_execute(string operations_json);
+};
+
+/// A physical collection store (directory of databases).
+interface Store {
+    [Throws=VectLiteError]
+    constructor(string root);
+
+    string root();
+
+    [Throws=VectLiteError]
+    Database create_collection(string name, u32 dimension);
+
+    [Throws=VectLiteError]
+    Database open_collection(string name);
+
+    [Throws=VectLiteError]
+    Database open_or_create_collection(string name, u32 dimension);
+
+    [Throws=VectLiteError]
+    boolean drop_collection(string name);
+
+    [Throws=VectLiteError]
+    sequence<string> collections();
+};
+
+namespace vectlite {
+    /// Generate BM25 sparse terms from text. Returns JSON: {"term": weight, ...}
+    string sparse_terms(string text);
+
+    /// Restore a database from backup directory.
+    [Throws=VectLiteError]
+    Database restore(string source, string dest);
+};

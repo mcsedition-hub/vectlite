@@ -1,20 +1,23 @@
 pub mod quantization;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use hnsw_rs::prelude::*;
+use simsimd::SpatialSimilarity;
 
-use quantization::{QuantizationConfig, QuantizedIndex};
+use quantization::{
+    MultiVectorQuantizationConfig, MultiVectorQuantizedIndex, QuantizationConfig, QuantizedIndex,
+};
 
 const MAGIC: &[u8; 4] = b"VDB1";
-const VERSION: u16 = 4;
+const VERSION: u16 = 7;
 const WAL_MAGIC: &[u8; 4] = b"VWL1";
 const TYPE_STRING: u8 = 1;
 const TYPE_INTEGER: u8 = 2;
@@ -38,12 +41,209 @@ pub type Result<T> = std::result::Result<T, VectLiteError>;
 pub type Metadata = BTreeMap<String, MetadataValue>;
 pub type SparseVector = BTreeMap<String, f32>;
 pub type NamedVectors = BTreeMap<String, Vec<f32>>;
+/// Multi-vectors: a named space maps to N token-level vectors (e.g. ColBERT embeddings).
+pub type MultiVectors = BTreeMap<String, Vec<Vec<f32>>>;
 type RecordKey = (String, String);
+
+/// Distance metric used for vector similarity computation.
+///
+/// Each metric defines how vectors are compared and scored.
+/// The metric is persisted in the database file and cannot be changed
+/// after creation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DistanceMetric {
+    /// Cosine similarity: `dot(a,b) / (|a| * |b|)`.
+    /// Returns a similarity in \[-1, 1\] (higher is more similar).
+    /// This is the default metric and the most common choice for text embeddings.
+    Cosine,
+    /// Euclidean (L2) distance: `sqrt(sum((a_i - b_i)^2))`.
+    /// Returns a distance >= 0 (lower is more similar).
+    Euclidean,
+    /// Dot product: `sum(a_i * b_i)`.
+    /// Returns raw inner product (higher is more similar for normalized vectors).
+    /// Use this for pre-normalized embeddings (e.g. OpenAI v3 with `dimensions` param).
+    DotProduct,
+    /// Manhattan (L1) distance: `sum(|a_i - b_i|)`.
+    /// Returns a distance >= 0 (lower is more similar).
+    Manhattan,
+}
+
+impl DistanceMetric {
+    /// Serialization tag for the binary format.
+    fn to_tag(self) -> u8 {
+        match self {
+            DistanceMetric::Cosine => 0,
+            DistanceMetric::Euclidean => 1,
+            DistanceMetric::DotProduct => 2,
+            DistanceMetric::Manhattan => 3,
+        }
+    }
+
+    /// Deserialize from tag byte.
+    fn from_tag(tag: u8) -> Result<Self> {
+        match tag {
+            0 => Ok(DistanceMetric::Cosine),
+            1 => Ok(DistanceMetric::Euclidean),
+            2 => Ok(DistanceMetric::DotProduct),
+            3 => Ok(DistanceMetric::Manhattan),
+            _ => Err(VectLiteError::InvalidFormat(format!(
+                "unknown distance metric tag {tag}"
+            ))),
+        }
+    }
+
+    /// Compute similarity between two vectors using SIMD-accelerated routines.
+    ///
+    /// For all metrics, the returned score is oriented so that **higher is better**
+    /// (more similar / closer). Distance metrics (Euclidean, Manhattan) are negated.
+    pub fn score(self, left: &[f32], right: &[f32]) -> f32 {
+        match self {
+            DistanceMetric::Cosine => simd_cosine_similarity(left, right),
+            DistanceMetric::Euclidean => {
+                // Negate so higher = more similar
+                -simd_euclidean_distance(left, right)
+            }
+            DistanceMetric::DotProduct => simd_dot_product(left, right),
+            DistanceMetric::Manhattan => {
+                // Negate so higher = more similar
+                -simd_manhattan_distance(left, right)
+            }
+        }
+    }
+
+    /// String name suitable for user-facing display and serialization.
+    pub fn name(self) -> &'static str {
+        match self {
+            DistanceMetric::Cosine => "cosine",
+            DistanceMetric::Euclidean => "euclidean",
+            DistanceMetric::DotProduct => "dotproduct",
+            DistanceMetric::Manhattan => "manhattan",
+        }
+    }
+
+    /// Parse a metric name (case-insensitive).
+    pub fn from_name(name: &str) -> Result<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "cosine" => Ok(DistanceMetric::Cosine),
+            "euclidean" | "l2" => Ok(DistanceMetric::Euclidean),
+            "dotproduct" | "dot" | "dot_product" | "ip" | "inner_product" => {
+                Ok(DistanceMetric::DotProduct)
+            }
+            "manhattan" | "l1" => Ok(DistanceMetric::Manhattan),
+            _ => Err(VectLiteError::InvalidFormat(format!(
+                "unknown distance metric '{name}'; valid options: cosine, euclidean, dotproduct, manhattan"
+            ))),
+        }
+    }
+
+    /// Whether this metric behaves as a similarity (higher = better)
+    /// or a distance (lower = better) in its raw form before negation.
+    pub fn is_similarity(self) -> bool {
+        matches!(self, DistanceMetric::Cosine | DistanceMetric::DotProduct)
+    }
+}
+
+impl Default for DistanceMetric {
+    fn default() -> Self {
+        DistanceMetric::Cosine
+    }
+}
+
+impl fmt::Display for DistanceMetric {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SIMD-accelerated distance functions (simsimd with scalar fallback)
+// ---------------------------------------------------------------------------
+
+/// Cosine similarity using SIMD, returns value in [-1, 1].
+fn simd_cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
+    // simsimd returns cosine *distance* (1 - cos_sim), so we convert.
+    match f32::cosine(left, right) {
+        Some(dist) => 1.0 - dist as f32,
+        None => scalar_cosine_similarity(left, right),
+    }
+}
+
+/// Euclidean (L2) distance using SIMD, returns value >= 0.
+fn simd_euclidean_distance(left: &[f32], right: &[f32]) -> f32 {
+    match f32::sqeuclidean(left, right) {
+        Some(sq) => (sq as f32).sqrt(),
+        None => scalar_euclidean_distance(left, right),
+    }
+}
+
+/// Dot product using SIMD.
+fn simd_dot_product(left: &[f32], right: &[f32]) -> f32 {
+    // simsimd::SpatialSimilarity::dot returns the raw inner product.
+    match f32::dot(left, right) {
+        Some(d) => d as f32,
+        None => scalar_dot_product(left, right),
+    }
+}
+
+/// Manhattan (L1) distance using SIMD, returns value >= 0.
+fn simd_manhattan_distance(left: &[f32], right: &[f32]) -> f32 {
+    // simsimd does not provide L1; use scalar.
+    scalar_manhattan_distance(left, right)
+}
+
+// ---------------------------------------------------------------------------
+// Scalar fallback implementations
+// ---------------------------------------------------------------------------
+
+fn scalar_cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
+    let mut dot = 0.0_f32;
+    let mut left_norm = 0.0_f32;
+    let mut right_norm = 0.0_f32;
+    for (l, r) in left.iter().zip(right.iter()) {
+        dot += l * r;
+        left_norm += l * l;
+        right_norm += r * r;
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        0.0
+    } else {
+        dot / (left_norm.sqrt() * right_norm.sqrt())
+    }
+}
+
+fn scalar_euclidean_distance(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right.iter())
+        .map(|(l, r)| (l - r) * (l - r))
+        .sum::<f32>()
+        .sqrt()
+}
+
+fn scalar_dot_product(left: &[f32], right: &[f32]) -> f32 {
+    left.iter().zip(right.iter()).map(|(l, r)| l * r).sum()
+}
+
+fn scalar_manhattan_distance(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right.iter())
+        .map(|(l, r)| (l - r).abs())
+        .sum()
+}
 
 #[derive(Clone, Debug)]
 enum WalOp {
     Upsert(Record),
     Delete { namespace: String, id: String },
+    UpdateMetadata {
+        namespace: String,
+        id: String,
+        metadata: Metadata,
+    },
+    SetTtl {
+        namespace: String,
+        id: String,
+        expires_at: Option<f64>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -240,6 +440,12 @@ pub struct Record {
     pub vectors: NamedVectors,
     pub sparse: SparseVector,
     pub metadata: Metadata,
+    /// Multi-vectors for late interaction scoring (e.g. ColBERT token embeddings).
+    /// Each key is a named vector space, and the value is a list of token-level vectors.
+    pub multi_vectors: MultiVectors,
+    /// Optional Unix-epoch timestamp (seconds, f64) at which this record expires.
+    /// `None` means the record never expires.
+    pub expires_at: Option<f64>,
 }
 
 impl Record {
@@ -259,6 +465,20 @@ impl Record {
                 .map(|(name, vector)| (name.as_str(), vector)),
         )
     }
+
+    /// Returns `true` if the record has an `expires_at` timestamp that is in
+    /// the past relative to the given `now` epoch (seconds since UNIX epoch).
+    fn is_expired_at(&self, now: f64) -> bool {
+        self.expires_at.map_or(false, |ts| ts <= now)
+    }
+}
+
+/// Returns the current time as seconds since the UNIX epoch.
+fn now_epoch_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -521,6 +741,13 @@ fn resolve_dot_path<'a>(metadata: &'a Metadata, key: &str) -> Option<&'a Metadat
 pub struct SearchOptions {
     pub top_k: usize,
     pub filter: Option<MetadataFilter>,
+    /// Optional prefix dimension for Matryoshka embeddings.
+    ///
+    /// When set, dense scoring uses only the first `truncate_dim` dimensions
+    /// of the stored vectors and query. ANN/quantized candidate selection is
+    /// bypassed because those indexes are built over the full database
+    /// dimension.
+    pub truncate_dim: Option<usize>,
 }
 
 impl Default for SearchOptions {
@@ -528,6 +755,7 @@ impl Default for SearchOptions {
         Self {
             top_k: 10,
             filter: None,
+            truncate_dim: None,
         }
     }
 }
@@ -542,6 +770,8 @@ pub struct HybridSearchOptions {
     pub mmr_lambda: Option<f32>,
     pub vector_name: Option<String>,
     pub fusion: FusionStrategy,
+    /// Optional prefix dimension for Matryoshka embeddings.
+    pub truncate_dim: Option<usize>,
     /// Multi-vector search: provide per-vector-name queries and their weights.
     /// When non-empty, the dense score is the weighted sum of cosine
     /// similarities over the given vector spaces, and `vector_name` is ignored.
@@ -559,6 +789,7 @@ impl Default for HybridSearchOptions {
             mmr_lambda: None,
             vector_name: None,
             fusion: FusionStrategy::Linear,
+            truncate_dim: None,
             multi_vector_queries: BTreeMap::new(),
         }
     }
@@ -598,6 +829,10 @@ pub struct SearchStats {
     pub ann_loaded_from_disk: bool,
     pub wal_entries_replayed: usize,
     pub fusion: String,
+    /// Effective dense dimensions used for scoring. This can be lower than the
+    /// stored database dimension for Matryoshka/prefix searches.
+    pub effective_dimension: usize,
+    pub matryoshka_truncated: bool,
     /// Timing breakdown in microseconds.
     pub timings: SearchTimings,
 }
@@ -618,6 +853,36 @@ pub struct SearchTimings {
 pub struct SearchOutcome {
     pub results: Vec<SearchResult>,
     pub stats: SearchStats,
+}
+
+/// Options for multi-vector (late interaction / ColBERT-style) search.
+#[derive(Clone, Debug)]
+pub struct MultiVectorSearchOptions {
+    /// Number of results to return.
+    pub top_k: usize,
+    /// Optional metadata filter.
+    pub filter: Option<MetadataFilter>,
+    /// Optional namespace.
+    pub namespace: Option<String>,
+}
+
+impl Default for MultiVectorSearchOptions {
+    fn default() -> Self {
+        Self {
+            top_k: 10,
+            filter: None,
+            namespace: None,
+        }
+    }
+}
+
+/// A result from multi-vector (MaxSim) search.
+#[derive(Clone, Debug)]
+pub struct MultiVectorSearchResult {
+    pub namespace: String,
+    pub id: String,
+    pub score: f32,
+    pub metadata: Metadata,
 }
 
 /// A store manages a directory of independent physical collections, each
@@ -731,10 +996,208 @@ impl Store {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Payload indexes  (keyword + numeric)
+// ---------------------------------------------------------------------------
+
+/// The type of payload index on a metadata field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadIndexType {
+    /// Inverted index for exact string equality, `$in`, `$nin` lookups.
+    Keyword,
+    /// Ordered B-tree index for numeric range queries (`$gt`, `$gte`, `$lt`, `$lte`).
+    Numeric,
+}
+
+impl PayloadIndexType {
+    fn tag(&self) -> u8 {
+        match self {
+            Self::Keyword => 1,
+            Self::Numeric => 2,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Result<Self> {
+        match tag {
+            1 => Ok(Self::Keyword),
+            2 => Ok(Self::Numeric),
+            _ => Err(VectLiteError::InvalidFormat(format!(
+                "unknown payload index type tag: {tag}"
+            ))),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Keyword => "keyword",
+            Self::Numeric => "numeric",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Result<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "keyword" | "string" | "text" => Ok(Self::Keyword),
+            "numeric" | "number" | "int" | "float" | "integer" => Ok(Self::Numeric),
+            _ => Err(VectLiteError::InvalidFormat(format!(
+                "unknown payload index type: {name:?}"
+            ))),
+        }
+    }
+}
+
+/// A keyword (inverted) index: value → set of record keys.
+#[derive(Clone, Debug, Default)]
+struct KeywordIndex {
+    postings: HashMap<String, HashSet<RecordKey>>,
+}
+
+impl KeywordIndex {
+    fn insert(&mut self, value: &str, key: RecordKey) {
+        self.postings
+            .entry(value.to_owned())
+            .or_default()
+            .insert(key);
+    }
+
+    fn remove(&mut self, value: &str, key: &RecordKey) {
+        if let Some(set) = self.postings.get_mut(value) {
+            set.remove(key);
+            if set.is_empty() {
+                self.postings.remove(value);
+            }
+        }
+    }
+
+    /// Return keys that match `value` exactly (for `$eq`).
+    fn lookup_eq(&self, value: &str) -> Option<&HashSet<RecordKey>> {
+        self.postings.get(value)
+    }
+
+    /// Return keys matching any of `values` (for `$in`).
+    fn lookup_in(&self, values: &[&str]) -> HashSet<RecordKey> {
+        let mut result = HashSet::new();
+        for value in values {
+            if let Some(set) = self.postings.get(*value) {
+                result.extend(set.iter().cloned());
+            }
+        }
+        result
+    }
+
+    /// Return all indexed keys (universe for negation).
+    #[allow(dead_code)]
+    fn all_keys(&self) -> HashSet<RecordKey> {
+        let mut result = HashSet::new();
+        for set in self.postings.values() {
+            result.extend(set.iter().cloned());
+        }
+        result
+    }
+}
+
+/// An ordered-float wrapper for BTreeMap keys.
+#[derive(Clone, Copy, Debug)]
+struct OrdF64(f64);
+
+impl PartialEq for OrdF64 {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for OrdF64 {}
+
+impl PartialOrd for OrdF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrdF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl std::hash::Hash for OrdF64 {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
+}
+
+/// A numeric (sorted B-tree) index: ordered value → set of record keys.
+#[derive(Clone, Debug, Default)]
+struct NumericIndex {
+    tree: BTreeMap<OrdF64, HashSet<RecordKey>>,
+}
+
+impl NumericIndex {
+    fn insert(&mut self, value: f64, key: RecordKey) {
+        self.tree.entry(OrdF64(value)).or_default().insert(key);
+    }
+
+    fn remove(&mut self, value: f64, key: &RecordKey) {
+        if let Some(set) = self.tree.get_mut(&OrdF64(value)) {
+            set.remove(key);
+            if set.is_empty() {
+                self.tree.remove(&OrdF64(value));
+            }
+        }
+    }
+
+    /// Return keys where value > threshold.
+    fn range_gt(&self, threshold: f64) -> HashSet<RecordKey> {
+        let mut result = HashSet::new();
+        for (_, set) in self.tree.range((std::ops::Bound::Excluded(OrdF64(threshold)), std::ops::Bound::Unbounded)) {
+            result.extend(set.iter().cloned());
+        }
+        result
+    }
+
+    /// Return keys where value >= threshold.
+    fn range_gte(&self, threshold: f64) -> HashSet<RecordKey> {
+        let mut result = HashSet::new();
+        for (_, set) in self.tree.range(OrdF64(threshold)..) {
+            result.extend(set.iter().cloned());
+        }
+        result
+    }
+
+    /// Return keys where value < threshold.
+    fn range_lt(&self, threshold: f64) -> HashSet<RecordKey> {
+        let mut result = HashSet::new();
+        for (_, set) in self.tree.range(..OrdF64(threshold)) {
+            result.extend(set.iter().cloned());
+        }
+        result
+    }
+
+    /// Return keys where value <= threshold.
+    fn range_lte(&self, threshold: f64) -> HashSet<RecordKey> {
+        let mut result = HashSet::new();
+        for (_, set) in self.tree.range(..=OrdF64(threshold)) {
+            result.extend(set.iter().cloned());
+        }
+        result
+    }
+
+    /// Return keys where value == target (exact match).
+    fn lookup_eq(&self, target: f64) -> Option<&HashSet<RecordKey>> {
+        self.tree.get(&OrdF64(target))
+    }
+}
+
+/// A live payload index with its definition and populated data.
+#[derive(Clone, Debug)]
+enum PayloadIndexData {
+    Keyword(KeywordIndex),
+    Numeric(NumericIndex),
+}
+
 pub struct Database {
     path: PathBuf,
     wal_path: PathBuf,
     dimension: usize,
+    metric: DistanceMetric,
     records: BTreeMap<(String, String), Record>,
     ann: AnnCatalog,
     sparse_index: SparseIndex,
@@ -750,6 +1213,16 @@ pub struct Database {
     quantization_config: Option<QuantizationConfig>,
     /// Ordered keys mapping quantized index positions to record keys.
     quantized_keys: Vec<RecordKey>,
+    /// Optional quantized index for multi-vector (ColBERT) search.
+    multi_vector_quantized: BTreeMap<String, MultiVectorQuantizedIndex>,
+    /// Configuration for multi-vector quantization (per space).
+    multi_vector_quantization_config: BTreeMap<String, MultiVectorQuantizationConfig>,
+    /// Ordered keys mapping multi-vector quantized index doc positions to record keys.
+    multi_vector_quantized_keys: BTreeMap<String, Vec<RecordKey>>,
+    /// Payload index definitions (field → type), persisted in sidecar file.
+    payload_index_defs: BTreeMap<String, PayloadIndexType>,
+    /// Live payload indexes, populated from records.
+    payload_indexes: BTreeMap<String, PayloadIndexData>,
 }
 
 #[derive(Default)]
@@ -758,8 +1231,38 @@ struct AnnCatalog {
     namespaces: BTreeMap<String, BTreeMap<String, AnnIndex>>,
 }
 
+enum AnnHnsw {
+    Cosine(Hnsw<'static, f32, DistCosine>),
+    Euclidean(Hnsw<'static, f32, DistL2>),
+    DotProduct(Hnsw<'static, f32, DistDot>),
+    Manhattan(Hnsw<'static, f32, DistL1>),
+}
+
+impl AnnHnsw {
+    fn search(&self, query: &[f32], knbn: usize, ef_search: usize) -> Vec<Neighbour> {
+        match self {
+            AnnHnsw::Cosine(h) => h.search(query, knbn, ef_search),
+            AnnHnsw::Euclidean(h) => h.search(query, knbn, ef_search),
+            AnnHnsw::DotProduct(h) => h.search(query, knbn, ef_search),
+            AnnHnsw::Manhattan(h) => h.search(query, knbn, ef_search),
+        }
+    }
+
+    fn file_dump(&self, directory: &Path, basename: &str) -> Result<()> {
+        let result = match self {
+            AnnHnsw::Cosine(h) => h.file_dump(directory, basename),
+            AnnHnsw::Euclidean(h) => h.file_dump(directory, basename),
+            AnnHnsw::DotProduct(h) => h.file_dump(directory, basename),
+            AnnHnsw::Manhattan(h) => h.file_dump(directory, basename),
+        };
+        result
+            .map(|_| ())
+            .map_err(|err| VectLiteError::InvalidFormat(format!("failed to persist ANN index: {err}")))
+    }
+}
+
 struct AnnIndex {
-    hnsw: Hnsw<'static, f32, DistCosine>,
+    hnsw: AnnHnsw,
     keys: Vec<RecordKey>,
 }
 
@@ -786,6 +1289,14 @@ struct ScoredRecord<'a> {
 
 impl Database {
     pub fn create(path: impl AsRef<Path>, dimension: usize) -> Result<Self> {
+        Self::create_with_metric(path, dimension, DistanceMetric::Cosine)
+    }
+
+    pub fn create_with_metric(
+        path: impl AsRef<Path>,
+        dimension: usize,
+        metric: DistanceMetric,
+    ) -> Result<Self> {
         ensure_dimension(dimension)?;
         let lock = acquire_exclusive_lock(path.as_ref())?;
 
@@ -793,6 +1304,7 @@ impl Database {
             path: path.as_ref().to_path_buf(),
             wal_path: wal_path(path.as_ref()),
             dimension,
+            metric,
             records: BTreeMap::new(),
             ann: AnnCatalog::default(),
             sparse_index: SparseIndex::default(),
@@ -803,6 +1315,11 @@ impl Database {
             quantized: None,
             quantization_config: None,
             quantized_keys: Vec::new(),
+            multi_vector_quantized: BTreeMap::new(),
+            multi_vector_quantization_config: BTreeMap::new(),
+            multi_vector_quantized_keys: BTreeMap::new(),
+            payload_index_defs: BTreeMap::new(),
+            payload_indexes: BTreeMap::new(),
         };
 
         database.flush()?;
@@ -823,6 +1340,9 @@ impl Database {
             database.rebuild_ann();
         }
         database.try_load_quantization();
+        database.try_load_multi_vector_quantization();
+        database.try_load_payload_index_defs();
+        database.rebuild_payload_indexes();
         Ok(database)
     }
 
@@ -844,6 +1364,9 @@ impl Database {
             database.rebuild_ann();
         }
         database.try_load_quantization();
+        database.try_load_multi_vector_quantization();
+        database.try_load_payload_index_defs();
+        database.rebuild_payload_indexes();
         Ok(database)
     }
 
@@ -876,6 +1399,9 @@ impl Database {
             database.rebuild_ann();
         }
         database.try_load_quantization();
+        database.try_load_multi_vector_quantization();
+        database.try_load_payload_index_defs();
+        database.rebuild_payload_indexes();
         Ok(database)
     }
 
@@ -930,6 +1456,14 @@ impl Database {
     }
 
     pub fn open_or_create(path: impl AsRef<Path>, dimension: usize) -> Result<Self> {
+        Self::open_or_create_with_metric(path, dimension, DistanceMetric::Cosine)
+    }
+
+    pub fn open_or_create_with_metric(
+        path: impl AsRef<Path>,
+        dimension: usize,
+        metric: DistanceMetric,
+    ) -> Result<Self> {
         if path.as_ref().exists() {
             let database = Self::open(path)?;
             if database.dimension != dimension {
@@ -940,7 +1474,7 @@ impl Database {
             }
             Ok(database)
         } else {
-            Self::create(path, dimension)
+            Self::create_with_metric(path, dimension, metric)
         }
     }
 
@@ -950,6 +1484,10 @@ impl Database {
 
     pub fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    pub fn metric(&self) -> DistanceMetric {
+        self.metric
     }
 
     pub fn len(&self) -> usize {
@@ -966,22 +1504,42 @@ impl Database {
         namespace: Option<&str>,
         filter: Option<&MetadataFilter>,
     ) -> usize {
-        self.records
-            .iter()
-            .filter(|((ns, _), record)| {
-                if let Some(target_ns) = namespace {
-                    if ns != target_ns {
+        let now = now_epoch_secs();
+        // Try to use payload indexes to narrow down candidates.
+        let candidates = filter.and_then(|f| self.payload_index_candidates(f, namespace));
+
+        if let Some(ref cand) = candidates {
+            // Iterate only over candidate keys (still verify filter for safety).
+            cand.iter()
+                .filter_map(|key| self.records.get(key))
+                .filter(|record| {
+                    !record.is_expired_at(now)
+                        && filter
+                            .map(|f| f.matches(&record.metadata))
+                            .unwrap_or(true)
+                })
+                .count()
+        } else {
+            self.records
+                .iter()
+                .filter(|((ns, _), record)| {
+                    if record.is_expired_at(now) {
                         return false;
                     }
-                }
-                if let Some(filter) = filter {
-                    if !filter.matches(&record.metadata) {
-                        return false;
+                    if let Some(target_ns) = namespace {
+                        if ns != target_ns {
+                            return false;
+                        }
                     }
-                }
-                true
-            })
-            .count()
+                    if let Some(filter) = filter {
+                        if !filter.matches(&record.metadata) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .count()
+        }
     }
 
     /// List records by namespace and/or metadata filter without requiring a
@@ -993,25 +1551,122 @@ impl Database {
         limit: usize,
         offset: usize,
     ) -> Vec<&Record> {
-        self.records
-            .iter()
-            .filter(|((ns, _), record)| {
-                if let Some(target_ns) = namespace {
-                    if ns != target_ns {
+        let now = now_epoch_secs();
+        // Try to use payload indexes to narrow down candidates.
+        let candidates = filter.and_then(|f| self.payload_index_candidates(f, namespace));
+
+        if let Some(ref cand) = candidates {
+            // Collect into a sorted vec to maintain (namespace, id) ordering.
+            let mut keys: Vec<&RecordKey> = cand.iter().collect();
+            keys.sort();
+            keys.iter()
+                .filter_map(|key| self.records.get(*key))
+                .filter(|record| {
+                    !record.is_expired_at(now)
+                        && filter
+                            .map(|f| f.matches(&record.metadata))
+                            .unwrap_or(true)
+                })
+                .skip(offset)
+                .take(if limit == 0 { usize::MAX } else { limit })
+                .collect()
+        } else {
+            self.records
+                .iter()
+                .filter(|((ns, _), record)| {
+                    if record.is_expired_at(now) {
                         return false;
                     }
-                }
-                if let Some(filter) = filter {
-                    if !filter.matches(&record.metadata) {
-                        return false;
+                    if let Some(target_ns) = namespace {
+                        if ns != target_ns {
+                            return false;
+                        }
                     }
+                    if let Some(filter) = filter {
+                        if !filter.matches(&record.metadata) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .skip(offset)
+                .take(if limit == 0 { usize::MAX } else { limit })
+                .map(|(_, record)| record)
+                .collect()
+        }
+    }
+
+    /// Cursor-based pagination over records. Returns up to `limit` records
+    /// whose key is strictly greater than `after` (if provided), plus an
+    /// optional next-page cursor.
+    ///
+    /// The cursor is an opaque `(namespace, id)` pair serialised as
+    /// `"namespace\0id"`.  Callers should treat it as an opaque token.
+    pub fn list_cursor(
+        &self,
+        namespace: Option<&str>,
+        filter: Option<&MetadataFilter>,
+        limit: usize,
+        after: Option<&str>,
+    ) -> (Vec<&Record>, Option<String>) {
+        let now = now_epoch_secs();
+        let limit = if limit == 0 { 100 } else { limit };
+
+        // Decode cursor
+        let after_key: Option<RecordKey> = after.map(|cursor| {
+            let parts: Vec<&str> = cursor.splitn(2, '\0').collect();
+            if parts.len() == 2 {
+                (parts[0].to_owned(), parts[1].to_owned())
+            } else {
+                (String::new(), cursor.to_owned())
+            }
+        });
+
+        let iter = self.records.iter();
+        // If we have a cursor, skip to the first key after it.
+        let iter: Box<dyn Iterator<Item = (&RecordKey, &Record)> + '_> = match &after_key {
+            Some(key) => {
+                // BTreeMap range starting from Excluded(key)
+                use std::ops::Bound;
+                Box::new(
+                    self.records
+                        .range((Bound::Excluded(key.clone()), Bound::Unbounded)),
+                )
+            }
+            None => Box::new(iter),
+        };
+
+        let mut results = Vec::with_capacity(limit + 1);
+        for ((ns, _id), record) in iter {
+            if record.is_expired_at(now) {
+                continue;
+            }
+            if let Some(target_ns) = namespace {
+                if ns != target_ns {
+                    continue;
                 }
-                true
-            })
-            .skip(offset)
-            .take(if limit == 0 { usize::MAX } else { limit })
-            .map(|(_, record)| record)
-            .collect()
+            }
+            if let Some(f) = filter {
+                if !f.matches(&record.metadata) {
+                    continue;
+                }
+            }
+            results.push(record);
+            if results.len() > limit {
+                break;
+            }
+        }
+
+        let next_cursor = if results.len() > limit {
+            results.pop(); // remove the extra
+            results
+                .last()
+                .map(|r| format!("{}\0{}", r.namespace, r.id))
+        } else {
+            None
+        };
+
+        (results, next_cursor)
     }
 
     /// Delete all records matching a filter, optionally within a namespace.
@@ -1047,6 +1702,177 @@ impl Database {
             .collect();
         self.apply_wal_batch(ops)?;
         Ok(count)
+    }
+
+    /// Merge a metadata patch into an existing record without re-writing the
+    /// vector.  Keys present in `metadata` overwrite existing keys; keys not
+    /// in the patch are left untouched.
+    ///
+    /// Returns `true` if the record exists and was updated, `false` if the
+    /// record was not found (no error is raised).
+    pub fn update_metadata(
+        &mut self,
+        id: impl Into<String>,
+        metadata: Metadata,
+    ) -> Result<bool> {
+        self.update_metadata_in_namespace(DEFAULT_NAMESPACE, id, metadata)
+    }
+
+    /// Merge a metadata patch into an existing record in the given namespace.
+    /// See [`update_metadata`](Self::update_metadata) for details.
+    pub fn update_metadata_in_namespace(
+        &mut self,
+        namespace: impl Into<String>,
+        id: impl Into<String>,
+        metadata: Metadata,
+    ) -> Result<bool> {
+        self.check_writable()?;
+        let namespace = namespace.into();
+        let id = id.into();
+        let key = (namespace.clone(), id.clone());
+        if !self.records.contains_key(&key) {
+            return Ok(false);
+        }
+        self.apply_wal_batch(vec![WalOp::UpdateMetadata {
+            namespace,
+            id,
+            metadata,
+        }])?;
+        Ok(true)
+    }
+
+    // -----------------------------------------------------------------------
+    // TTL / Expiry API
+    // -----------------------------------------------------------------------
+
+    /// Set a time-to-live on a record. The TTL is expressed as seconds from now.
+    /// After `ttl_secs` seconds the record will be excluded from reads and
+    /// garbage-collected on the next `compact()`.
+    ///
+    /// Returns `true` if the record was found, `false` otherwise.
+    pub fn set_ttl(&mut self, id: &str, ttl_secs: f64) -> Result<bool> {
+        self.set_ttl_in_namespace(DEFAULT_NAMESPACE, id, ttl_secs)
+    }
+
+    /// Set a time-to-live on a record in a specific namespace.
+    pub fn set_ttl_in_namespace(
+        &mut self,
+        namespace: &str,
+        id: &str,
+        ttl_secs: f64,
+    ) -> Result<bool> {
+        self.check_writable()?;
+        if ttl_secs < 0.0 || ttl_secs.is_nan() {
+            return Err(VectLiteError::InvalidFormat(
+                "ttl_secs must be a non-negative finite number".to_owned(),
+            ));
+        }
+        let key = (namespace.to_owned(), id.to_owned());
+        if !self.records.contains_key(&key) {
+            return Ok(false);
+        }
+        let expires_at = Some(now_epoch_secs() + ttl_secs);
+        self.apply_wal_batch(vec![WalOp::SetTtl {
+            namespace: namespace.to_owned(),
+            id: id.to_owned(),
+            expires_at,
+        }])?;
+        Ok(true)
+    }
+
+    /// Remove the TTL from a record so it never expires.
+    /// Returns `true` if the record was found, `false` otherwise.
+    pub fn clear_ttl(&mut self, id: &str) -> Result<bool> {
+        self.clear_ttl_in_namespace(DEFAULT_NAMESPACE, id)
+    }
+
+    /// Remove the TTL from a record in a specific namespace.
+    pub fn clear_ttl_in_namespace(&mut self, namespace: &str, id: &str) -> Result<bool> {
+        self.check_writable()?;
+        let key = (namespace.to_owned(), id.to_owned());
+        if !self.records.contains_key(&key) {
+            return Ok(false);
+        }
+        self.apply_wal_batch(vec![WalOp::SetTtl {
+            namespace: namespace.to_owned(),
+            id: id.to_owned(),
+            expires_at: None,
+        }])?;
+        Ok(true)
+    }
+
+    // -----------------------------------------------------------------------
+    // Payload index management API
+    // -----------------------------------------------------------------------
+
+    /// Create a payload index on a metadata field.
+    ///
+    /// - `field` — the top-level metadata key to index (e.g. `"category"`, `"price"`).
+    /// - `index_type` — `PayloadIndexType::Keyword` or `PayloadIndexType::Numeric`.
+    ///
+    /// The index is populated immediately from all existing records. Subsequent
+    /// mutations (upsert, delete, update_metadata) maintain the index incrementally.
+    ///
+    /// Returns `true` if the index was created, `false` if an index already exists
+    /// for this field.
+    pub fn create_index(
+        &mut self,
+        field: impl Into<String>,
+        index_type: PayloadIndexType,
+    ) -> Result<bool> {
+        self.check_writable()?;
+        let field = field.into();
+        if self.payload_index_defs.contains_key(&field) {
+            return Ok(false);
+        }
+        self.payload_index_defs.insert(field.clone(), index_type);
+
+        // Build the index from existing records.
+        let data = match index_type {
+            PayloadIndexType::Keyword => {
+                let mut kw = KeywordIndex::default();
+                for (key, record) in &self.records {
+                    if let Some(MetadataValue::String(val)) = record.metadata.get(&field) {
+                        kw.insert(val, key.clone());
+                    }
+                }
+                PayloadIndexData::Keyword(kw)
+            }
+            PayloadIndexType::Numeric => {
+                let mut num = NumericIndex::default();
+                for (key, record) in &self.records {
+                    if let Some(val) = record.metadata.get(&field).and_then(MetadataValue::as_number) {
+                        num.insert(val, key.clone());
+                    }
+                }
+                PayloadIndexData::Numeric(num)
+            }
+        };
+        self.payload_indexes.insert(field, data);
+        self.persist_payload_index_defs()?;
+        Ok(true)
+    }
+
+    /// Drop a payload index on a metadata field.
+    ///
+    /// Returns `true` if the index existed and was removed, `false` if there was
+    /// no index on this field.
+    pub fn drop_index(&mut self, field: &str) -> Result<bool> {
+        self.check_writable()?;
+        if self.payload_index_defs.remove(field).is_none() {
+            return Ok(false);
+        }
+        self.payload_indexes.remove(field);
+        self.persist_payload_index_defs()?;
+        Ok(true)
+    }
+
+    /// List all payload indexes as `(field, type_name)` pairs.
+    pub fn list_indexes(&self) -> Vec<(String, PayloadIndexType)> {
+        self.payload_index_defs
+            .iter()
+            .map(|(field, index_type)| (field.clone(), *index_type))
+            .collect()
     }
 
     pub fn insert(
@@ -1212,6 +2038,7 @@ impl Database {
         self.ann_loaded_from_disk = false;
         self.persist_ann_to_disk()?;
         self.rebuild_quantized_index();
+        self.rebuild_all_multi_vector_quantized_indexes();
         Ok(count)
     }
 
@@ -1239,6 +2066,7 @@ impl Database {
         self.ann_loaded_from_disk = false;
         self.persist_ann_to_disk()?;
         self.rebuild_quantized_index();
+        self.rebuild_all_multi_vector_quantized_indexes();
         Ok(count)
     }
 
@@ -1247,7 +2075,10 @@ impl Database {
     }
 
     pub fn get_in_namespace(&self, namespace: &str, id: &str) -> Option<&Record> {
-        self.records.get(&(namespace.to_owned(), id.to_owned()))
+        let now = now_epoch_secs();
+        self.records
+            .get(&(namespace.to_owned(), id.to_owned()))
+            .filter(|record| !record.is_expired_at(now))
     }
 
     pub fn delete(&mut self, id: &str) -> Result<bool> {
@@ -1323,6 +2154,7 @@ impl Database {
                 HybridSearchOptions {
                     top_k: options.top_k,
                     filter: options.filter,
+                    truncate_dim: options.truncate_dim,
                     dense_weight: 1.0,
                     sparse_weight: 0.0,
                     ..HybridSearchOptions::default()
@@ -1343,6 +2175,7 @@ impl Database {
                 HybridSearchOptions {
                     top_k: options.top_k,
                     filter: options.filter,
+                    truncate_dim: options.truncate_dim,
                     dense_weight: 1.0,
                     sparse_weight: 0.0,
                     ..HybridSearchOptions::default()
@@ -1438,6 +2271,7 @@ impl Database {
         self.ann_loaded_from_disk = false;
         self.persist_ann_to_disk()?;
         self.rebuild_quantized_index();
+        self.rebuild_all_multi_vector_quantized_indexes();
         Ok(())
     }
 
@@ -1449,9 +2283,8 @@ impl Database {
         namespace: Option<&str>,
     ) -> Result<SearchOutcome> {
         self.check_open()?;
-        if let Some(query) = dense_query {
-            self.validate_vector(query)?;
-        }
+        let effective_dimension =
+            self.resolve_dense_search_dimension(dense_query, options.truncate_dim)?;
         if dense_query.is_none() && sparse_query.is_none() {
             return Err(VectLiteError::InvalidFormat(
                 "search requires a dense query, a sparse query, or both".to_owned(),
@@ -1486,12 +2319,17 @@ impl Database {
             options.mmr_lambda,
         );
         let vector_name = options.vector_name.as_deref();
+        let matryoshka_truncated = effective_dimension
+            .map(|dimension| dimension < self.dimension)
+            .unwrap_or(false);
 
         let dense_start = Instant::now();
         // Use quantized index for candidate selection if available (2-stage pipeline).
         // The quantized index operates on the default vector only and globally (not per-namespace).
         let quantized_candidates =
-            if vector_name.is_none() || vector_name == Some(DEFAULT_VECTOR_NAME) {
+            if !matryoshka_truncated
+                && (vector_name.is_none() || vector_name == Some(DEFAULT_VECTOR_NAME))
+            {
                 dense_query.and_then(|query| self.quantized_candidate_keys(query, fetch_k))
             } else {
                 None
@@ -1501,6 +2339,7 @@ impl Database {
             None
         } else {
             dense_query
+                .filter(|_| !matryoshka_truncated)
                 .and_then(|query| self.ann_candidate_keys(namespace, vector_name, query, fetch_k))
         };
         let effective_dense_candidates = quantized_candidates.or(ann_candidates);
@@ -1522,6 +2361,23 @@ impl Database {
                 Some(sparse_candidates.as_slice()),
             )
         };
+
+        // Use payload indexes to narrow candidates when doing a full scan.
+        let payload_candidates = options.filter.as_ref().and_then(|f| {
+            self.payload_index_candidates(f, namespace)
+        });
+        let candidate_keys = match (candidate_keys, payload_candidates) {
+            (Some(ck), Some(pc)) => {
+                // Intersect ANN/sparse candidates with payload index candidates.
+                Some(ck.into_iter().filter(|k| pc.contains(k)).collect::<Vec<_>>())
+            }
+            (None, Some(pc)) => {
+                // No ANN candidates but payload index narrowed the set.
+                Some(pc.into_iter().collect::<Vec<_>>())
+            }
+            (ck, None) => ck,
+        };
+
         let mut stats = SearchStats {
             used_ann: effective_dense_candidates.is_some(),
             ann_candidate_count: effective_dense_candidates.as_ref().map_or(0, Vec::len),
@@ -1530,6 +2386,8 @@ impl Database {
             ann_loaded_from_disk: self.ann_loaded_from_disk,
             wal_entries_replayed: self.wal_entries_replayed,
             fusion: options.fusion.label().to_owned(),
+            effective_dimension: effective_dimension.unwrap_or(0),
+            matryoshka_truncated,
             ..SearchStats::default()
         };
 
@@ -1539,12 +2397,14 @@ impl Database {
             &options,
             namespace,
             candidate_keys.as_deref(),
+            effective_dimension,
         );
         stats.considered_count = results.len();
 
         if effective_dense_candidates.is_some() && results.len() < fetch_k {
             stats.exact_fallback = true;
-            results = self.collect_results(dense_query, sparse_query, &options, namespace, None);
+            results =
+                self.collect_results(dense_query, sparse_query, &options, namespace, None, effective_dimension);
             stats.considered_count = results.len();
         }
 
@@ -1568,6 +2428,8 @@ impl Database {
                 options.dense_weight,
                 options.sparse_weight,
                 vector_name,
+                self.metric,
+                effective_dimension,
             )
         } else {
             let mut results = results;
@@ -1635,6 +2497,7 @@ impl Database {
             self.ann_loaded_from_disk = false;
             self.persist_ann_to_disk()?;
             self.rebuild_quantized_index();
+            self.rebuild_all_multi_vector_quantized_indexes();
         }
 
         Ok(total)
@@ -1781,7 +2644,561 @@ impl Database {
         )
     }
 
+    // -----------------------------------------------------------------------
+    // Multi-vector (ColBERT / late interaction) API
+    // -----------------------------------------------------------------------
+
+    /// Upsert a record with multi-vector (token-level) embeddings for late interaction.
+    pub fn upsert_multi_vectors(
+        &mut self,
+        id: impl Into<String>,
+        vector: impl Into<Vec<f32>>,
+        metadata: Metadata,
+        multi_vectors: MultiVectors,
+    ) -> Result<()> {
+        self.upsert_multi_vectors_in_namespace(
+            DEFAULT_NAMESPACE, id, vector, metadata, multi_vectors,
+        )
+    }
+
+    /// Upsert a record with multi-vectors in a specific namespace.
+    pub fn upsert_multi_vectors_in_namespace(
+        &mut self,
+        namespace: impl Into<String>,
+        id: impl Into<String>,
+        vector: impl Into<Vec<f32>>,
+        metadata: Metadata,
+        multi_vectors: MultiVectors,
+    ) -> Result<()> {
+        self.check_writable()?;
+        let record = self.record_from_parts_full(
+            namespace,
+            id,
+            vector,
+            NamedVectors::new(),
+            SparseVector::new(),
+            metadata,
+            multi_vectors,
+        )?;
+        self.apply_wal_batch(vec![WalOp::Upsert(record)])?;
+        Ok(())
+    }
+
+    /// Search using multi-vector late interaction (MaxSim) scoring.
+    ///
+    /// `query_tokens` are the token-level embeddings from the query encoder
+    /// (e.g. ColBERT query encoder output).
+    /// `space` identifies which multi-vector space to search in.
+    pub fn search_multi_vector(
+        &self,
+        space: &str,
+        query_tokens: &[Vec<f32>],
+        options: MultiVectorSearchOptions,
+    ) -> Result<Vec<MultiVectorSearchResult>> {
+        self.check_open()?;
+        if space.is_empty() {
+            return Err(VectLiteError::InvalidFormat(
+                "multi-vector space name must not be empty".to_owned(),
+            ));
+        }
+        if query_tokens.is_empty() {
+            return Err(VectLiteError::InvalidFormat(
+                "query_tokens must not be empty".to_owned(),
+            ));
+        }
+
+        let top_k = if options.top_k == 0 {
+            self.records.len()
+        } else {
+            options.top_k
+        };
+        let namespace = options.namespace.as_deref();
+
+        // Try quantized multi-vector search first for candidate selection
+        let query_refs: Vec<&[f32]> = query_tokens.iter().map(Vec::as_slice).collect();
+        let candidate_keys: Option<Vec<RecordKey>> = self
+            .multi_vector_quantized
+            .get(space)
+            .and_then(|index| {
+                let keys = self.multi_vector_quantized_keys.get(space)?;
+                let candidate_indices = index.search(&query_refs, top_k);
+                Some(
+                    candidate_indices
+                        .into_iter()
+                        .filter_map(|idx| keys.get(idx).cloned())
+                        .collect(),
+                )
+            });
+
+        // Score all candidates with exact MaxSim
+        let now = now_epoch_secs();
+        let record_iter: Box<dyn Iterator<Item = &Record> + '_> = match &candidate_keys {
+            Some(keys) => Box::new(keys.iter().filter_map(|key| self.records.get(key))),
+            None => Box::new(self.records.values()),
+        };
+
+        let mut scored: Vec<(f32, &Record)> = record_iter
+            .filter(|record| {
+                !record.is_expired_at(now)
+                    && namespace
+                        .map(|ns| record.namespace == ns)
+                        .unwrap_or(true)
+                    && record.multi_vectors.contains_key(space)
+                    && options
+                        .filter
+                        .as_ref()
+                        .map(|f| f.matches(&record.metadata))
+                        .unwrap_or(true)
+            })
+            .map(|record| {
+                let doc_tokens = &record.multi_vectors[space];
+                let score = maxsim_score(&query_refs, doc_tokens, self.metric);
+                (score, record)
+            })
+            .collect();
+
+        scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        scored.truncate(top_k);
+
+        Ok(scored
+            .into_iter()
+            .map(|(score, record)| MultiVectorSearchResult {
+                namespace: record.namespace.clone(),
+                id: record.id.clone(),
+                score,
+                metadata: record.metadata.clone(),
+            })
+            .collect())
+    }
+
+    /// Enable 2-bit quantization for a multi-vector space to accelerate
+    /// ColBERT-style MaxSim search. Trains the quantizer on all current
+    /// token vectors in the given space.
+    pub fn enable_multi_vector_quantization(
+        &mut self,
+        space: &str,
+        config: MultiVectorQuantizationConfig,
+    ) -> Result<()> {
+        self.check_writable()?;
+        if space.is_empty() {
+            return Err(VectLiteError::InvalidFormat(
+                "multi-vector space name must not be empty".to_owned(),
+            ));
+        }
+
+        self.multi_vector_quantization_config
+            .insert(space.to_owned(), config);
+        self.rebuild_multi_vector_quantized_index(space);
+        self.persist_multi_vector_quantization_params(space)?;
+        Ok(())
+    }
+
+    /// Disable multi-vector quantization for a space.
+    pub fn disable_multi_vector_quantization(&mut self, space: &str) -> Result<()> {
+        self.check_writable()?;
+        self.multi_vector_quantized.remove(space);
+        self.multi_vector_quantization_config.remove(space);
+        self.multi_vector_quantized_keys.remove(space);
+        let params_path = multi_vector_quantization_params_path(&self.path, space);
+        if params_path.exists() {
+            fs::remove_file(&params_path)?;
+        }
+        Ok(())
+    }
+
+    /// Returns true if multi-vector quantization is enabled for a given space.
+    pub fn is_multi_vector_quantized(&self, space: &str) -> bool {
+        self.multi_vector_quantized.contains_key(space)
+    }
+
+    fn rebuild_multi_vector_quantized_index(&mut self, space: &str) {
+        let config = match self.multi_vector_quantization_config.get(space) {
+            Some(config) => config.clone(),
+            None => return,
+        };
+
+        // Collect per-document token vectors for this space
+        let mut keys = Vec::new();
+        let mut doc_token_vectors: Vec<&[Vec<f32>]> = Vec::new();
+        let mut token_dimension = 0_usize;
+
+        for (key, record) in &self.records {
+            if let Some(tokens) = record.multi_vectors.get(space) {
+                if !tokens.is_empty() {
+                    if token_dimension == 0 {
+                        token_dimension = tokens[0].len();
+                    }
+                    keys.push(key.clone());
+                    doc_token_vectors.push(tokens.as_slice());
+                }
+            }
+        }
+
+        if doc_token_vectors.is_empty() || token_dimension == 0 {
+            self.multi_vector_quantized.remove(space);
+            self.multi_vector_quantized_keys.remove(space);
+            return;
+        }
+
+        let index = MultiVectorQuantizedIndex::build(
+            &doc_token_vectors,
+            token_dimension,
+            &config,
+        );
+
+        self.multi_vector_quantized
+            .insert(space.to_owned(), index);
+        self.multi_vector_quantized_keys
+            .insert(space.to_owned(), keys);
+    }
+
+    fn rebuild_all_multi_vector_quantized_indexes(&mut self) {
+        let spaces: Vec<String> = self
+            .multi_vector_quantization_config
+            .keys()
+            .cloned()
+            .collect();
+        for space in spaces {
+            self.rebuild_multi_vector_quantized_index(&space);
+        }
+    }
+
+    fn persist_multi_vector_quantization_params(&self, space: &str) -> Result<()> {
+        let params_path = multi_vector_quantization_params_path(&self.path, space);
+        if let Some(index) = self.multi_vector_quantized.get(space) {
+            let mut file = File::create(&params_path)?;
+            index.write_params(&mut file).map_err(VectLiteError::Io)?;
+            file.sync_all()?;
+        } else {
+            if params_path.exists() {
+                fs::remove_file(&params_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn try_load_multi_vector_quantization(&mut self) {
+        // Look for .mvquant.<space> sidecar files
+        let Some(parent) = self.path.parent() else {
+            return;
+        };
+        let Some(stem) = self.path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        let prefix = format!("{stem}.mvquant.");
+
+        let entries = match fs::read_dir(parent) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let Some(fname) = entry.file_name().to_str().map(String::from) else {
+                continue;
+            };
+            if !fname.starts_with(&prefix) {
+                continue;
+            }
+            let space = &fname[prefix.len()..];
+            if space.is_empty() {
+                continue;
+            }
+
+            let file = match File::open(entry.path()) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let mut reader = BufReader::new(file);
+            let mut index = match MultiVectorQuantizedIndex::read_params(&mut reader) {
+                Ok(idx) => idx,
+                Err(_) => continue,
+            };
+
+            // Rebuild codes from current records
+            let mut keys = Vec::new();
+            let mut doc_token_vectors: Vec<&[Vec<f32>]> = Vec::new();
+            for (key, record) in &self.records {
+                if let Some(tokens) = record.multi_vectors.get(space) {
+                    if !tokens.is_empty() {
+                        keys.push(key.clone());
+                        doc_token_vectors.push(tokens.as_slice());
+                    }
+                }
+            }
+
+            if !doc_token_vectors.is_empty() {
+                index.rebuild(&doc_token_vectors);
+                let MultiVectorQuantizationConfig::TwoBit(ref cfg) = {
+                    MultiVectorQuantizationConfig::TwoBit(index.quantizer.config.clone())
+                };
+                self.multi_vector_quantization_config
+                    .insert(space.to_owned(), MultiVectorQuantizationConfig::TwoBit(cfg.clone()));
+                self.multi_vector_quantized_keys
+                    .insert(space.to_owned(), keys);
+                self.multi_vector_quantized
+                    .insert(space.to_owned(), index);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Payload index helpers
+    // -----------------------------------------------------------------------
+
+    fn payload_index_sidecar_path(&self) -> PathBuf {
+        let mut p = self.path.clone();
+        let name = p.file_name().unwrap_or_default().to_os_string();
+        p.set_file_name(format!("{}.pidx", name.to_string_lossy()));
+        p
+    }
+
+    /// Persist payload index definitions to the sidecar file.
+    fn persist_payload_index_defs(&self) -> Result<()> {
+        let sidecar = self.payload_index_sidecar_path();
+        if self.payload_index_defs.is_empty() {
+            // Remove the sidecar if there are no indexes.
+            let _ = fs::remove_file(&sidecar);
+            return Ok(());
+        }
+        let file = File::create(&sidecar)?;
+        let mut writer = BufWriter::new(file);
+        write_u32(&mut writer, u32_from_usize(self.payload_index_defs.len())?)?;
+        for (field, index_type) in &self.payload_index_defs {
+            write_string(&mut writer, field)?;
+            write_u8(&mut writer, index_type.tag())?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Load payload index definitions from the sidecar file (if present).
+    fn try_load_payload_index_defs(&mut self) {
+        let sidecar = self.payload_index_sidecar_path();
+        let file = match File::open(&sidecar) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let mut reader = BufReader::new(file);
+        let count = match read_u32(&mut reader) {
+            Ok(n) => usize_from_u32(n).unwrap_or(0),
+            Err(_) => return,
+        };
+        let mut defs = BTreeMap::new();
+        for _ in 0..count {
+            let field = match read_string(&mut reader) {
+                Ok(f) => f,
+                Err(_) => return,
+            };
+            let tag = match read_u8(&mut reader) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            let index_type = match PayloadIndexType::from_tag(tag) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            defs.insert(field, index_type);
+        }
+        self.payload_index_defs = defs;
+    }
+
+    /// Rebuild all payload indexes from scratch, based on current `payload_index_defs`
+    /// and all records in memory.
+    fn rebuild_payload_indexes(&mut self) {
+        let mut indexes = BTreeMap::new();
+        for (field, index_type) in &self.payload_index_defs {
+            let data = match index_type {
+                PayloadIndexType::Keyword => {
+                    let mut kw = KeywordIndex::default();
+                    for (key, record) in &self.records {
+                        if let Some(MetadataValue::String(val)) = record.metadata.get(field) {
+                            kw.insert(val, key.clone());
+                        }
+                    }
+                    PayloadIndexData::Keyword(kw)
+                }
+                PayloadIndexType::Numeric => {
+                    let mut num = NumericIndex::default();
+                    for (key, record) in &self.records {
+                        if let Some(val) = record.metadata.get(field).and_then(MetadataValue::as_number) {
+                            num.insert(val, key.clone());
+                        }
+                    }
+                    PayloadIndexData::Numeric(num)
+                }
+            };
+            indexes.insert(field.clone(), data);
+        }
+        self.payload_indexes = indexes;
+    }
+
+    /// Incrementally update payload indexes for an upserted record.
+    /// Call with the old record (if any) first to remove stale entries.
+    fn payload_index_remove(&mut self, key: &RecordKey, metadata: &Metadata) {
+        for (field, data) in &mut self.payload_indexes {
+            match data {
+                PayloadIndexData::Keyword(kw) => {
+                    if let Some(MetadataValue::String(val)) = metadata.get(field) {
+                        kw.remove(val, key);
+                    }
+                }
+                PayloadIndexData::Numeric(num) => {
+                    if let Some(val) = metadata.get(field).and_then(MetadataValue::as_number) {
+                        num.remove(val, key);
+                    }
+                }
+            }
+        }
+    }
+
+    fn payload_index_insert(&mut self, key: &RecordKey, metadata: &Metadata) {
+        for (field, data) in &mut self.payload_indexes {
+            match data {
+                PayloadIndexData::Keyword(kw) => {
+                    if let Some(MetadataValue::String(val)) = metadata.get(field) {
+                        kw.insert(val, key.clone());
+                    }
+                }
+                PayloadIndexData::Numeric(num) => {
+                    if let Some(val) = metadata.get(field).and_then(MetadataValue::as_number) {
+                        num.insert(val, key.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Use payload indexes to narrow down candidate keys for a filter.
+    /// Returns `None` if no indexes can help with this filter (fallback to scan).
+    /// Returns `Some(set)` with the set of record keys that *may* match the filter.
+    fn payload_index_candidates(&self, filter: &MetadataFilter, namespace: Option<&str>) -> Option<HashSet<RecordKey>> {
+        if self.payload_indexes.is_empty() {
+            return None;
+        }
+        self.payload_index_candidates_inner(filter, namespace)
+    }
+
+    fn payload_index_candidates_inner(&self, filter: &MetadataFilter, namespace: Option<&str>) -> Option<HashSet<RecordKey>> {
+        match filter {
+            MetadataFilter::Eq { key, value } => {
+                // Try keyword index for string equality
+                if let Some(PayloadIndexData::Keyword(kw)) = self.payload_indexes.get(key) {
+                    if let MetadataValue::String(s) = value {
+                        let set = kw.lookup_eq(s).cloned().unwrap_or_default();
+                        return Some(self.filter_by_namespace(set, namespace));
+                    }
+                }
+                // Try numeric index for numeric equality
+                if let Some(PayloadIndexData::Numeric(num)) = self.payload_indexes.get(key) {
+                    if let Some(v) = value.as_number() {
+                        let set = num.lookup_eq(v).cloned().unwrap_or_default();
+                        return Some(self.filter_by_namespace(set, namespace));
+                    }
+                }
+                None
+            }
+            MetadataFilter::In { key, values } => {
+                if let Some(PayloadIndexData::Keyword(kw)) = self.payload_indexes.get(key) {
+                    let str_values: Vec<&str> = values
+                        .iter()
+                        .filter_map(|v| match v {
+                            MetadataValue::String(s) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    if str_values.len() == values.len() {
+                        let set = kw.lookup_in(&str_values);
+                        return Some(self.filter_by_namespace(set, namespace));
+                    }
+                }
+                None
+            }
+            MetadataFilter::GreaterThan { key, value } => {
+                if let Some(PayloadIndexData::Numeric(num)) = self.payload_indexes.get(key) {
+                    let set = num.range_gt(*value);
+                    return Some(self.filter_by_namespace(set, namespace));
+                }
+                None
+            }
+            MetadataFilter::GreaterThanOrEqual { key, value } => {
+                if let Some(PayloadIndexData::Numeric(num)) = self.payload_indexes.get(key) {
+                    let set = num.range_gte(*value);
+                    return Some(self.filter_by_namespace(set, namespace));
+                }
+                None
+            }
+            MetadataFilter::LessThan { key, value } => {
+                if let Some(PayloadIndexData::Numeric(num)) = self.payload_indexes.get(key) {
+                    let set = num.range_lt(*value);
+                    return Some(self.filter_by_namespace(set, namespace));
+                }
+                None
+            }
+            MetadataFilter::LessThanOrEqual { key, value } => {
+                if let Some(PayloadIndexData::Numeric(num)) = self.payload_indexes.get(key) {
+                    let set = num.range_lte(*value);
+                    return Some(self.filter_by_namespace(set, namespace));
+                }
+                None
+            }
+            MetadataFilter::And(filters) => {
+                // Intersect candidates from all sub-filters that have index support.
+                let mut result: Option<HashSet<RecordKey>> = None;
+                for sub in filters {
+                    if let Some(sub_set) = self.payload_index_candidates_inner(sub, namespace) {
+                        result = Some(match result {
+                            Some(existing) => existing.intersection(&sub_set).cloned().collect(),
+                            None => sub_set,
+                        });
+                    }
+                }
+                result
+            }
+            MetadataFilter::Or(filters) => {
+                // Union candidates, but only if ALL sub-filters have index support.
+                let mut result = HashSet::new();
+                for sub in filters {
+                    match self.payload_index_candidates_inner(sub, namespace) {
+                        Some(sub_set) => {
+                            result.extend(sub_set);
+                        }
+                        None => return None, // Can't guarantee completeness
+                    }
+                }
+                Some(result)
+            }
+            // For other filter types, no index support — fallback to scan.
+            _ => None,
+        }
+    }
+
+    fn filter_by_namespace(&self, keys: HashSet<RecordKey>, namespace: Option<&str>) -> HashSet<RecordKey> {
+        match namespace {
+            Some(ns) => keys.into_iter().filter(|(n, _)| n == ns).collect(),
+            None => keys,
+        }
+    }
+
     fn compact_inner(&mut self) -> Result<()> {
+        // GC: remove expired records before writing the snapshot.
+        let now = now_epoch_secs();
+        let expired_keys: Vec<RecordKey> = self
+            .records
+            .iter()
+            .filter(|(_, record)| record.is_expired_at(now))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let has_payload_indexes = !self.payload_indexes.is_empty();
+        for key in &expired_keys {
+            if has_payload_indexes {
+                if let Some(record) = self.records.get(key) {
+                    let meta = record.metadata.clone();
+                    self.payload_index_remove(key, &meta);
+                }
+            }
+            self.records.remove(key);
+        }
+
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
@@ -1862,6 +3279,14 @@ impl Database {
                         let _ = fs::copy(&manifest, dest.join(manifest_name));
                     }
                 }
+
+                // Copy payload index sidecar
+                let pidx = self.payload_index_sidecar_path();
+                if pidx.exists() {
+                    if let Some(pidx_name) = pidx.file_name() {
+                        let _ = fs::copy(&pidx, dest.join(pidx_name));
+                    }
+                }
             }
         }
 
@@ -1929,18 +3354,25 @@ impl Database {
                 .records
                 .get(&(namespace.clone(), id.clone()))
                 .map_or(false, |r| !r.sparse.is_empty()),
+            WalOp::UpdateMetadata { .. } | WalOp::SetTtl { .. } => false,
         });
+
+        let metadata_only = ops.iter().all(|op| matches!(op, WalOp::UpdateMetadata { .. } | WalOp::SetTtl { .. }));
 
         self.append_wal_batch(&ops)?;
         self.apply_ops_in_memory(ops);
 
-        if has_sparse {
-            self.rebuild_sparse_index();
+        // Metadata-only updates don't change vectors, so skip all index rebuilds.
+        if !metadata_only {
+            if has_sparse {
+                self.rebuild_sparse_index();
+            }
+            self.rebuild_ann();
+            self.ann_loaded_from_disk = false;
+            self.persist_ann_to_disk()?;
+            self.rebuild_quantized_index();
+            self.rebuild_all_multi_vector_quantized_indexes();
         }
-        self.rebuild_ann();
-        self.ann_loaded_from_disk = false;
-        self.persist_ann_to_disk()?;
-        self.rebuild_quantized_index();
         Ok(())
     }
 
@@ -1958,14 +3390,66 @@ impl Database {
     }
 
     fn apply_ops_in_memory(&mut self, ops: Vec<WalOp>) {
+        let has_payload_indexes = !self.payload_indexes.is_empty();
         for op in ops {
             match op {
                 WalOp::Upsert(record) => {
-                    self.records
-                        .insert((record.namespace.clone(), record.id.clone()), record);
+                    let key = (record.namespace.clone(), record.id.clone());
+                    if has_payload_indexes {
+                        // Remove old index entries if the record already exists.
+                        let old_meta = self.records.get(&key).map(|r| r.metadata.clone());
+                        if let Some(ref meta) = old_meta {
+                            self.payload_index_remove(&key, meta);
+                        }
+                        self.payload_index_insert(&key, &record.metadata);
+                    }
+                    self.records.insert(key, record);
                 }
                 WalOp::Delete { namespace, id } => {
-                    self.records.remove(&(namespace, id));
+                    let key = (namespace, id);
+                    if has_payload_indexes {
+                        let old_meta = self.records.get(&key).map(|r| r.metadata.clone());
+                        if let Some(ref meta) = old_meta {
+                            self.payload_index_remove(&key, meta);
+                        }
+                    }
+                    self.records.remove(&key);
+                }
+                WalOp::UpdateMetadata {
+                    namespace,
+                    id,
+                    metadata,
+                } => {
+                    let key = (namespace, id);
+                    if has_payload_indexes {
+                        if let Some(record) = self.records.get(&key) {
+                            let old_meta = record.metadata.clone();
+                            self.payload_index_remove(&key, &old_meta);
+                        }
+                    }
+                    if let Some(record) = self.records.get_mut(&key) {
+                        for (k, v) in metadata {
+                            record.metadata.insert(k, v);
+                        }
+                    }
+                    if has_payload_indexes {
+                        if let Some(record) = self.records.get(&key) {
+                            let new_meta = record.metadata.clone();
+                            self.payload_index_insert(&key, &new_meta);
+                        }
+                    }
+                    // If the record doesn't exist, the update is silently ignored
+                    // (same semantics as deleting a non-existent record).
+                }
+                WalOp::SetTtl {
+                    namespace,
+                    id,
+                    expires_at,
+                } => {
+                    let key = (namespace, id);
+                    if let Some(record) = self.records.get_mut(&key) {
+                        record.expires_at = expires_at;
+                    }
                 }
             }
         }
@@ -2076,6 +3560,12 @@ impl Database {
         let dimension = usize_from_u32(read_u32(reader)?)?;
         ensure_dimension(dimension)?;
 
+        let metric = if version >= 6 {
+            DistanceMetric::from_tag(read_u8(reader)?)?
+        } else {
+            DistanceMetric::Cosine
+        };
+
         let record_count = usize_from_u64(read_u64(reader)?)?;
         let mut records = BTreeMap::new();
 
@@ -2118,6 +3608,19 @@ impl Database {
                 SparseVector::new()
             };
 
+            let multi_vectors = if version >= 5 {
+                read_multi_vectors(reader)?
+            } else {
+                MultiVectors::new()
+            };
+
+            let expires_at = if version >= 7 {
+                let ts = read_f64(reader)?;
+                if ts == 0.0 { None } else { Some(ts) }
+            } else {
+                None
+            };
+
             let record = Record {
                 namespace: namespace.clone(),
                 id: id.clone(),
@@ -2125,6 +3628,8 @@ impl Database {
                 vectors,
                 sparse,
                 metadata,
+                multi_vectors,
+                expires_at,
             };
             records.insert((namespace, id), record);
         }
@@ -2133,6 +3638,7 @@ impl Database {
             path: path.to_path_buf(),
             wal_path: wal_path(path),
             dimension,
+            metric,
             records,
             ann: AnnCatalog::default(),
             sparse_index: SparseIndex::default(),
@@ -2143,6 +3649,11 @@ impl Database {
             quantized: None,
             quantization_config: None,
             quantized_keys: Vec::new(),
+            multi_vector_quantized: BTreeMap::new(),
+            multi_vector_quantization_config: BTreeMap::new(),
+            multi_vector_quantized_keys: BTreeMap::new(),
+            payload_index_defs: BTreeMap::new(),
+            payload_indexes: BTreeMap::new(),
         })
     }
 
@@ -2150,6 +3661,7 @@ impl Database {
         writer.write_all(MAGIC)?;
         write_u16(writer, VERSION)?;
         write_u32(writer, u32_from_usize(self.dimension)?)?;
+        write_u8(writer, self.metric.to_tag())?;
         write_u64(writer, u64_from_usize(self.records.len())?)?;
 
         for record in self.records.values() {
@@ -2167,6 +3679,8 @@ impl Database {
             }
             write_named_vectors(writer, &record.vectors)?;
             write_sparse_vector(writer, &record.sparse)?;
+            write_multi_vectors(writer, &record.multi_vectors)?;
+            write_f64(writer, record.expires_at.unwrap_or(0.0))?;
         }
 
         Ok(())
@@ -2183,6 +3697,51 @@ impl Database {
         Ok(())
     }
 
+    fn resolve_dense_search_dimension(
+        &self,
+        dense_query: Option<&[f32]>,
+        truncate_dim: Option<usize>,
+    ) -> Result<Option<usize>> {
+        let Some(query) = dense_query else {
+            return Ok(None);
+        };
+        if query.is_empty() {
+            return Err(VectLiteError::InvalidFormat(
+                "query vector must not be empty".to_owned(),
+            ));
+        }
+        if query.len() > self.dimension {
+            return Err(VectLiteError::DimensionMismatch {
+                expected: self.dimension,
+                found: query.len(),
+            });
+        }
+
+        let effective = match truncate_dim {
+            Some(0) => {
+                return Err(VectLiteError::InvalidFormat(
+                    "truncate_dim must be greater than zero".to_owned(),
+                ))
+            }
+            Some(dim) if dim > self.dimension => {
+                return Err(VectLiteError::DimensionMismatch {
+                    expected: self.dimension,
+                    found: dim,
+                })
+            }
+            Some(dim) if dim > query.len() => {
+                return Err(VectLiteError::InvalidFormat(format!(
+                    "truncate_dim ({dim}) cannot exceed query vector length ({})",
+                    query.len()
+                )))
+            }
+            Some(dim) => dim,
+            None => query.len(),
+        };
+
+        Ok(Some(effective))
+    }
+
     fn validate_record(&self, record: &Record) -> Result<()> {
         self.validate_vector(&record.vector)?;
 
@@ -2193,6 +3752,30 @@ impl Database {
                 ));
             }
             self.validate_vector(vector)?;
+        }
+
+        for (space_name, token_vectors) in &record.multi_vectors {
+            if space_name.is_empty() {
+                return Err(VectLiteError::InvalidFormat(
+                    "multi-vector space names must not be empty".to_owned(),
+                ));
+            }
+            if let Some(first) = token_vectors.first() {
+                if first.is_empty() {
+                    return Err(VectLiteError::InvalidFormat(format!(
+                        "multi-vector space '{space_name}' contains an empty token vector"
+                    )));
+                }
+                let expected_dim = first.len();
+                for token_vec in &token_vectors[1..] {
+                    if token_vec.len() != expected_dim {
+                        return Err(VectLiteError::InvalidFormat(format!(
+                            "multi-vector space '{space_name}' has inconsistent token dimensions: expected {expected_dim}, found {}",
+                            token_vec.len(),
+                        )));
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -2225,7 +3808,7 @@ impl Database {
                 if records.len() < ANN_MIN_POINTS {
                     None
                 } else {
-                    Some((vector_name, build_ann_index(records)))
+                    Some((vector_name, build_ann_index(records, self.metric)))
                 }
             })
             .collect();
@@ -2239,7 +3822,7 @@ impl Database {
                         if records.len() < ANN_MIN_POINTS {
                             None
                         } else {
-                            Some((vector_name, build_ann_index(records)))
+                            Some((vector_name, build_ann_index(records, self.metric)))
                         }
                     })
                     .collect::<BTreeMap<_, _>>();
@@ -2292,6 +3875,7 @@ impl Database {
                     &expected_entry.vector_name,
                 ),
                 expected_entry.keys.clone(),
+                self.metric,
             ) else {
                 return false;
             };
@@ -2342,9 +3926,7 @@ impl Database {
                 None => self.ann.global.get(&entry.vector_name),
             };
             if let Some(index) = index {
-                index.hnsw.file_dump(parent, &basename).map_err(|err| {
-                    VectLiteError::InvalidFormat(format!("failed to persist ANN index: {err}"))
-                })?;
+                index.hnsw.file_dump(parent, &basename)?;
             }
         }
 
@@ -2447,7 +4029,9 @@ impl Database {
         options: &HybridSearchOptions,
         namespace: Option<&str>,
         candidate_keys: Option<&[RecordKey]>,
+        effective_dimension: Option<usize>,
     ) -> Vec<ScoredRecord<'_>> {
+        let now = now_epoch_secs();
         let record_iter: Box<dyn Iterator<Item = &Record> + '_> = match candidate_keys {
             Some(keys) => Box::new(keys.iter().filter_map(|key| self.records.get(key))),
             None => Box::new(self.records.values()),
@@ -2455,9 +4039,10 @@ impl Database {
 
         record_iter
             .filter(|record| {
-                namespace
-                    .map(|namespace| record.namespace == namespace)
-                    .unwrap_or(true)
+                !record.is_expired_at(now)
+                    && namespace
+                        .map(|namespace| record.namespace == namespace)
+                        .unwrap_or(true)
                     && (dense_query.is_none()
                         || record.vector_for(options.vector_name.as_deref()).is_some())
                     && options
@@ -2473,7 +4058,8 @@ impl Database {
                         let mut weighted_sum = 0.0_f32;
                         for (name, (query, weight)) in &options.multi_vector_queries {
                             if let Some(vector) = record.vector_for(Some(name.as_str())) {
-                                weighted_sum += weight * cosine_similarity(query, vector);
+                                weighted_sum +=
+                                    weight * score_dense_prefix(self.metric, query, vector, effective_dimension);
                             }
                         }
                         (weighted_sum, None)
@@ -2482,7 +4068,14 @@ impl Database {
                             .and_then(|query| {
                                 record
                                     .vector_for(options.vector_name.as_deref())
-                                    .map(|vector| cosine_similarity(query, vector))
+                                    .map(|vector| {
+                                        score_dense_prefix(
+                                            self.metric,
+                                            query,
+                                            vector,
+                                            effective_dimension,
+                                        )
+                                    })
                             })
                             .unwrap_or(0.0);
                         (score, options.vector_name.clone())
@@ -2671,6 +4264,27 @@ impl Database {
         sparse: SparseVector,
         metadata: Metadata,
     ) -> Result<Record> {
+        self.record_from_parts_full(
+            namespace,
+            id,
+            vector,
+            vectors,
+            sparse,
+            metadata,
+            MultiVectors::new(),
+        )
+    }
+
+    fn record_from_parts_full(
+        &self,
+        namespace: impl Into<String>,
+        id: impl Into<String>,
+        vector: impl Into<Vec<f32>>,
+        vectors: NamedVectors,
+        sparse: SparseVector,
+        metadata: Metadata,
+        multi_vectors: MultiVectors,
+    ) -> Result<Record> {
         let vector = vector.into();
         self.validate_vector(&vector)?;
 
@@ -2683,6 +4297,31 @@ impl Database {
             self.validate_vector(named_vector)?;
         }
 
+        // Validate multi-vector dimensions
+        for (space_name, token_vectors) in &multi_vectors {
+            if space_name.is_empty() {
+                return Err(VectLiteError::InvalidFormat(
+                    "multi-vector space names must not be empty".to_owned(),
+                ));
+            }
+            for token_vec in token_vectors {
+                if token_vec.is_empty() {
+                    return Err(VectLiteError::InvalidFormat(format!(
+                        "multi-vector space '{space_name}' contains an empty token vector"
+                    )));
+                }
+                // Token vectors within a space must all have the same dimension,
+                // but that dimension can differ from the database dimension.
+                if !token_vectors.is_empty() && token_vec.len() != token_vectors[0].len() {
+                    return Err(VectLiteError::InvalidFormat(format!(
+                        "multi-vector space '{space_name}' has inconsistent token dimensions: expected {}, found {}",
+                        token_vectors[0].len(),
+                        token_vec.len(),
+                    )));
+                }
+            }
+        }
+
         Ok(Record {
             namespace: namespace.into(),
             id: id.into(),
@@ -2690,6 +4329,8 @@ impl Database {
             vectors,
             sparse,
             metadata,
+            multi_vectors,
+            expires_at: None,
         })
     }
 }
@@ -2731,22 +4372,29 @@ fn ensure_dimension(dimension: usize) -> Result<()> {
     Ok(())
 }
 
-fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
-    let mut dot = 0.0_f32;
-    let mut left_norm = 0.0_f32;
-    let mut right_norm = 0.0_f32;
-
-    for (left_value, right_value) in left.iter().zip(right.iter()) {
-        dot += left_value * right_value;
-        left_norm += left_value * left_value;
-        right_norm += right_value * right_value;
+/// MaxSim scoring (ColBERT-style late interaction).
+/// For each query token, find the maximum similarity against any document
+/// token using the given metric, then sum those maxima across all query tokens.
+fn maxsim_score(
+    query_tokens: &[&[f32]],
+    doc_tokens: &[Vec<f32>],
+    metric: DistanceMetric,
+) -> f32 {
+    if query_tokens.is_empty() || doc_tokens.is_empty() {
+        return 0.0;
     }
-
-    if left_norm == 0.0 || right_norm == 0.0 {
-        0.0
-    } else {
-        dot / (left_norm.sqrt() * right_norm.sqrt())
+    let mut total = 0.0_f32;
+    for q_token in query_tokens {
+        let mut best = f32::NEG_INFINITY;
+        for d_token in doc_tokens {
+            let sim = metric.score(q_token, d_token);
+            if sim > best {
+                best = sim;
+            }
+        }
+        total += best;
     }
+    total
 }
 
 fn sparse_dot_product(left: &SparseVector, right: &SparseVector) -> f32 {
@@ -2761,24 +4409,46 @@ fn sparse_dot_product(left: &SparseVector, right: &SparseVector) -> f32 {
     })
 }
 
-fn build_ann_index(records: Vec<(RecordKey, &Vec<f32>)>) -> AnnIndex {
+fn score_dense_prefix(
+    metric: DistanceMetric,
+    left: &[f32],
+    right: &[f32],
+    effective_dimension: Option<usize>,
+) -> f32 {
+    let dimension = effective_dimension
+        .unwrap_or_else(|| left.len().min(right.len()))
+        .min(left.len())
+        .min(right.len());
+    metric.score(&left[..dimension], &right[..dimension])
+}
+
+fn build_ann_index(records: Vec<(RecordKey, &Vec<f32>)>, metric: DistanceMetric) -> AnnIndex {
     let max_layer = compute_hnsw_layers(records.len());
-    let mut hnsw = Hnsw::<f32, DistCosine>::new(
-        ANN_M,
-        records.len(),
-        max_layer,
-        ANN_EF_CONSTRUCTION,
-        DistCosine {},
-    );
+    let count = records.len();
 
-    let mut keys = Vec::with_capacity(records.len());
-    for (origin_id, (key, vector)) in records.into_iter().enumerate() {
-        hnsw.insert((vector.as_slice(), origin_id));
-        keys.push(key);
+    macro_rules! build_hnsw {
+        ($dist_type:ty, $dist_val:expr, $variant:ident) => {{
+            let mut hnsw =
+                Hnsw::<f32, $dist_type>::new(ANN_M, count, max_layer, ANN_EF_CONSTRUCTION, $dist_val);
+            let mut keys = Vec::with_capacity(count);
+            for (origin_id, (key, vector)) in records.into_iter().enumerate() {
+                hnsw.insert((vector.as_slice(), origin_id));
+                keys.push(key);
+            }
+            hnsw.set_searching_mode(true);
+            AnnIndex {
+                hnsw: AnnHnsw::$variant(hnsw),
+                keys,
+            }
+        }};
     }
-    hnsw.set_searching_mode(true);
 
-    AnnIndex { hnsw, keys }
+    match metric {
+        DistanceMetric::Cosine => build_hnsw!(DistCosine, DistCosine {}, Cosine),
+        DistanceMetric::Euclidean => build_hnsw!(DistL2, DistL2 {}, Euclidean),
+        DistanceMetric::DotProduct => build_hnsw!(DistDot, DistDot {}, DotProduct),
+        DistanceMetric::Manhattan => build_hnsw!(DistL1, DistL1 {}, Manhattan),
+    }
 }
 
 fn compute_hnsw_layers(record_count: usize) -> usize {
@@ -2822,6 +4492,12 @@ fn lock_path(path: &Path) -> PathBuf {
 fn quantization_params_path(path: &Path) -> PathBuf {
     let mut p = path.as_os_str().to_os_string();
     p.push(".quant");
+    PathBuf::from(p)
+}
+
+fn multi_vector_quantization_params_path(path: &Path, space: &str) -> PathBuf {
+    let mut p = path.as_os_str().to_os_string();
+    p.push(format!(".mvquant.{space}"));
     PathBuf::from(p)
 }
 
@@ -2972,11 +4648,31 @@ fn record_key_signature(keys: &[RecordKey]) -> u64 {
     state
 }
 
-fn load_ann_index(directory: &Path, basename: &str, keys: Vec<RecordKey>) -> Option<AnnIndex> {
+fn load_ann_index(
+    directory: &Path,
+    basename: &str,
+    keys: Vec<RecordKey>,
+    metric: DistanceMetric,
+) -> Option<AnnIndex> {
     let reloader = Box::leak(Box::new(HnswIo::new(directory, basename)));
-    let mut hnsw = reloader.load_hnsw_with_dist(DistCosine {}).ok()?;
-    hnsw.set_searching_mode(true);
-    Some(AnnIndex { hnsw, keys })
+
+    macro_rules! load_with_dist {
+        ($dist_val:expr, $variant:ident) => {{
+            let mut hnsw = reloader.load_hnsw_with_dist($dist_val).ok()?;
+            hnsw.set_searching_mode(true);
+            Some(AnnIndex {
+                hnsw: AnnHnsw::$variant(hnsw),
+                keys,
+            })
+        }};
+    }
+
+    match metric {
+        DistanceMetric::Cosine => load_with_dist!(DistCosine {}, Cosine),
+        DistanceMetric::Euclidean => load_with_dist!(DistL2 {}, Euclidean),
+        DistanceMetric::DotProduct => load_with_dist!(DistDot {}, DotProduct),
+        DistanceMetric::Manhattan => load_with_dist!(DistL1 {}, Manhattan),
+    }
 }
 
 fn write_ann_manifest(path: &Path, entries: &[AnnManifestEntry]) -> Result<()> {
@@ -3157,6 +4853,8 @@ fn apply_mmr<'a>(
     dense_weight: f32,
     sparse_weight: f32,
     vector_name: Option<&str>,
+    metric: DistanceMetric,
+    effective_dimension: Option<usize>,
 ) -> Vec<ScoredRecord<'a>> {
     let limit = top_k.min(candidates.len());
     if limit <= 1 {
@@ -3183,6 +4881,8 @@ fn apply_mmr<'a>(
                         dense_weight,
                         sparse_weight,
                         vector_name,
+                        metric,
+                        effective_dimension,
                     )
                 })
                 .fold(0.0_f32, f32::max);
@@ -3231,9 +4931,11 @@ fn record_similarity(
     dense_weight: f32,
     sparse_weight: f32,
     vector_name: Option<&str>,
+    metric: DistanceMetric,
+    effective_dimension: Option<usize>,
 ) -> f32 {
     let dense_score = match (left.vector_for(vector_name), right.vector_for(vector_name)) {
-        (Some(left), Some(right)) => cosine_similarity(left, right),
+        (Some(left), Some(right)) => score_dense_prefix(metric, left, right, effective_dimension),
         _ => 0.0,
     };
 
@@ -3370,6 +5072,45 @@ fn read_named_vectors(reader: &mut impl Read, dimension: usize) -> Result<NamedV
     Ok(vectors)
 }
 
+fn write_multi_vectors(writer: &mut impl Write, multi_vectors: &MultiVectors) -> Result<()> {
+    write_u32(writer, u32_from_usize(multi_vectors.len())?)?;
+    for (name, token_vectors) in multi_vectors {
+        write_string(writer, name)?;
+        // Write the token dimension (0 if empty)
+        let token_dim = token_vectors.first().map_or(0, |v| v.len());
+        write_u32(writer, u32_from_usize(token_dim)?)?;
+        write_u32(writer, u32_from_usize(token_vectors.len())?)?;
+        for token_vec in token_vectors {
+            for value in token_vec {
+                write_f32(writer, *value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_multi_vectors(reader: &mut impl Read) -> Result<MultiVectors> {
+    let space_count = usize_from_u32(read_u32(reader)?)?;
+    let mut multi_vectors = MultiVectors::new();
+
+    for _ in 0..space_count {
+        let name = read_string(reader)?;
+        let token_dim = usize_from_u32(read_u32(reader)?)?;
+        let token_count = usize_from_u32(read_u32(reader)?)?;
+        let mut token_vectors = Vec::with_capacity(token_count);
+        for _ in 0..token_count {
+            let mut vec = Vec::with_capacity(token_dim);
+            for _ in 0..token_dim {
+                vec.push(read_f32(reader)?);
+            }
+            token_vectors.push(vec);
+        }
+        multi_vectors.insert(name, token_vectors);
+    }
+
+    Ok(multi_vectors)
+}
+
 fn write_wal_op(writer: &mut impl Write, op: &WalOp) -> Result<()> {
     match op {
         WalOp::Upsert(record) => {
@@ -3387,11 +5128,37 @@ fn write_wal_op(writer: &mut impl Write, op: &WalOp) -> Result<()> {
             }
             write_named_vectors(writer, &record.vectors)?;
             write_sparse_vector(writer, &record.sparse)?;
+            write_multi_vectors(writer, &record.multi_vectors)?;
+            write_f64(writer, record.expires_at.unwrap_or(0.0))?;
         }
         WalOp::Delete { namespace, id } => {
             write_u8(writer, 2)?;
             write_string(writer, namespace)?;
             write_string(writer, id)?;
+        }
+        WalOp::UpdateMetadata {
+            namespace,
+            id,
+            metadata,
+        } => {
+            write_u8(writer, 3)?;
+            write_string(writer, namespace)?;
+            write_string(writer, id)?;
+            write_u32(writer, u32_from_usize(metadata.len())?)?;
+            for (key, value) in metadata {
+                write_string(writer, key)?;
+                write_metadata_value(writer, value)?;
+            }
+        }
+        WalOp::SetTtl {
+            namespace,
+            id,
+            expires_at,
+        } => {
+            write_u8(writer, 4)?;
+            write_string(writer, namespace)?;
+            write_string(writer, id)?;
+            write_f64(writer, expires_at.unwrap_or(0.0))?;
         }
     }
     Ok(())
@@ -3421,6 +5188,11 @@ fn read_wal_op(reader: &mut impl Read, dimension: usize) -> Result<WalOp> {
             }
             let vectors = read_named_vectors(reader, dimension)?;
             let sparse = read_sparse_vector(reader)?;
+            let multi_vectors = read_multi_vectors(reader)?;
+            let expires_at = {
+                let ts = read_f64(reader)?;
+                if ts == 0.0 { None } else { Some(ts) }
+            };
             Ok(WalOp::Upsert(Record {
                 namespace,
                 id,
@@ -3428,12 +5200,41 @@ fn read_wal_op(reader: &mut impl Read, dimension: usize) -> Result<WalOp> {
                 vectors,
                 sparse,
                 metadata,
+                multi_vectors,
+                expires_at,
             }))
         }
         2 => Ok(WalOp::Delete {
             namespace: read_string(reader)?,
             id: read_string(reader)?,
         }),
+        3 => {
+            let namespace = read_string(reader)?;
+            let id = read_string(reader)?;
+            let metadata_count = usize_from_u32(read_u32(reader)?)?;
+            let mut metadata = Metadata::new();
+            for _ in 0..metadata_count {
+                let key = read_string(reader)?;
+                let value = read_metadata_value(reader)?;
+                metadata.insert(key, value);
+            }
+            Ok(WalOp::UpdateMetadata {
+                namespace,
+                id,
+                metadata,
+            })
+        }
+        4 => {
+            let namespace = read_string(reader)?;
+            let id = read_string(reader)?;
+            let ts = read_f64(reader)?;
+            let expires_at = if ts == 0.0 { None } else { Some(ts) };
+            Ok(WalOp::SetTtl {
+                namespace,
+                id,
+                expires_at,
+            })
+        }
         other => Err(VectLiteError::InvalidFormat(format!(
             "unknown WAL op tag {other}"
         ))),
@@ -3549,8 +5350,9 @@ fn usize_from_u64(value: u64) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Database, HybridSearchOptions, Metadata, MetadataFilter, MetadataValue, NamedVectors,
-        Record, SearchOptions, SparseVector, VectLiteError,
+        Database, HybridSearchOptions, Metadata, MetadataFilter, MetadataValue, MultiVectors,
+        MultiVectorSearchOptions, NamedVectors, PayloadIndexType, Record, SearchOptions,
+        SparseVector, VectLiteError,
     };
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3614,6 +5416,7 @@ mod tests {
                         MetadataFilter::eq("source", "notes"),
                         MetadataFilter::contains("title", "auth"),
                     ])),
+                    truncate_dim: None,
                 },
             )
             .expect("search database");
@@ -3658,6 +5461,8 @@ mod tests {
                         vectors: NamedVectors::new(),
                         sparse: SparseVector::new(),
                         metadata: Metadata::new(),
+                        multi_vectors: MultiVectors::new(),
+                        expires_at: None,
                     },
                     Record {
                         namespace: "".to_owned(),
@@ -3666,6 +5471,8 @@ mod tests {
                         vectors: NamedVectors::new(),
                         sparse: SparseVector::new(),
                         metadata: Metadata::new(),
+                        multi_vectors: MultiVectors::new(),
+                        expires_at: None,
                     },
                 ])
                 .expect("batch upsert");
@@ -3702,6 +5509,7 @@ mod tests {
                         MetadataFilter::gte("priority", 10.0),
                         MetadataFilter::lte("priority", 10.0),
                     ])),
+                    truncate_dim: None,
                 },
             )
             .expect("search database");
@@ -4009,6 +5817,7 @@ mod tests {
                 SearchOptions {
                     top_k: 2,
                     filter: None,
+                    truncate_dim: None,
                 },
             )
             .expect("search database");
@@ -4067,6 +5876,7 @@ mod tests {
                 SearchOptions {
                     top_k: 1,
                     filter: None,
+                    truncate_dim: None,
                 },
             )
             .expect_err("search on closed database should fail");
@@ -4137,6 +5947,21 @@ mod tests {
         let mut lock = path.as_os_str().to_os_string();
         lock.push(".lock");
         let _ = std::fs::remove_file(PathBuf::from(&lock));
+        // Clean up multi-vector quantization sidecar files (.mvquant.*)
+        if let Some(parent) = path.parent() {
+            if let Some(stem) = path.file_name().and_then(|n| n.to_str()) {
+                let prefix = format!("{stem}.mvquant.");
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        if let Some(fname) = entry.file_name().to_str() {
+                            if fname.starts_with(&prefix) {
+                                let _ = std::fs::remove_file(entry.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4181,6 +6006,7 @@ mod tests {
                     SearchOptions {
                         top_k: 5,
                         filter: None,
+                        truncate_dim: None,
                     },
                 )
                 .expect("search");
@@ -4209,6 +6035,7 @@ mod tests {
                     SearchOptions {
                         top_k: 5,
                         filter: None,
+                        truncate_dim: None,
                     },
                 )
                 .expect("search after reopen");
@@ -4254,6 +6081,7 @@ mod tests {
                 SearchOptions {
                     top_k: 5,
                     filter: None,
+                    truncate_dim: None,
                 },
             )
             .expect("search");
@@ -4298,6 +6126,7 @@ mod tests {
                 SearchOptions {
                     top_k: 5,
                     filter: None,
+                    truncate_dim: None,
                 },
             )
             .expect("search");
@@ -4355,6 +6184,1865 @@ mod tests {
         assert!(result.is_err());
         assert!(!db.is_quantized());
 
+        cleanup(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-vector / ColBERT-style integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multi_vector_upsert_and_search() {
+        let path = temp_file("mv-upsert-search");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        // Upsert records with ColBERT-style token vectors
+        let mut mv1 = MultiVectors::new();
+        mv1.insert(
+            "colbert".to_owned(),
+            vec![
+                vec![1.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0],
+            ],
+        );
+        db.upsert_multi_vectors("doc1", vec![1.0, 0.0, 0.0], Metadata::new(), mv1)
+            .expect("upsert doc1");
+
+        let mut mv2 = MultiVectors::new();
+        mv2.insert(
+            "colbert".to_owned(),
+            vec![
+                vec![0.0, 0.0, 1.0],
+                vec![0.0, 1.0, 0.0],
+            ],
+        );
+        db.upsert_multi_vectors("doc2", vec![0.0, 0.0, 1.0], Metadata::new(), mv2)
+            .expect("upsert doc2");
+
+        assert_eq!(db.len(), 2);
+
+        // Search with query tokens that strongly match doc1
+        let query_tokens = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+        ];
+
+        let results = db
+            .search_multi_vector("colbert", &query_tokens, MultiVectorSearchOptions::default())
+            .expect("search");
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, "doc1"); // doc1 has perfect MaxSim match
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn multi_vector_empty_space_error() {
+        let path = temp_file("mv-empty-space");
+        let db = Database::create(&path, 3).expect("create");
+
+        let query_tokens = vec![vec![1.0, 0.0, 0.0]];
+        let result = db.search_multi_vector("", &query_tokens, MultiVectorSearchOptions::default());
+        assert!(result.is_err());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn multi_vector_empty_query_tokens_error() {
+        let path = temp_file("mv-empty-query");
+        let db = Database::create(&path, 3).expect("create");
+
+        let query_tokens: Vec<Vec<f32>> = vec![];
+        let result = db.search_multi_vector("colbert", &query_tokens, MultiVectorSearchOptions::default());
+        assert!(result.is_err());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn multi_vector_search_with_namespace_filter() {
+        let path = temp_file("mv-ns-filter");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        let mut mv = MultiVectors::new();
+        mv.insert("colbert".to_owned(), vec![vec![1.0, 0.0, 0.0]]);
+        db.upsert_multi_vectors_in_namespace("ns1", "doc1", vec![1.0, 0.0, 0.0], Metadata::new(), mv.clone())
+            .expect("upsert ns1");
+        db.upsert_multi_vectors_in_namespace("ns2", "doc2", vec![0.0, 1.0, 0.0], Metadata::new(), mv.clone())
+            .expect("upsert ns2");
+
+        let query_tokens = vec![vec![1.0, 0.0, 0.0]];
+        let options = MultiVectorSearchOptions {
+            top_k: 10,
+            filter: None,
+            namespace: Some("ns1".to_owned()),
+        };
+        let results = db.search_multi_vector("colbert", &query_tokens, options).expect("search");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "doc1");
+        assert_eq!(results[0].namespace, "ns1");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn multi_vector_quantization_enable_disable() {
+        use super::quantization::{MultiVectorQuantizationConfig, TwoBitQuantizationConfig};
+
+        let path = temp_file("mv-quant");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        // Insert some records with multi-vectors
+        for i in 0..10 {
+            let mut mv = MultiVectors::new();
+            mv.insert(
+                "colbert".to_owned(),
+                vec![
+                    vec![i as f32, 0.0, 0.0],
+                    vec![0.0, i as f32, 0.0],
+                    vec![0.0, 0.0, i as f32],
+                ],
+            );
+            db.upsert_multi_vectors(
+                &format!("doc{i}"),
+                vec![i as f32, 0.0, 0.0],
+                Metadata::new(),
+                mv,
+            )
+            .expect("upsert");
+        }
+
+        assert!(!db.is_multi_vector_quantized("colbert"));
+
+        // Enable quantization
+        db.enable_multi_vector_quantization(
+            "colbert",
+            MultiVectorQuantizationConfig::TwoBit(TwoBitQuantizationConfig {
+                rescore_multiplier: 4,
+            }),
+        )
+        .expect("enable");
+
+        assert!(db.is_multi_vector_quantized("colbert"));
+
+        // Search should still work
+        let query_tokens = vec![vec![9.0, 0.0, 0.0], vec![0.0, 9.0, 0.0]];
+        let results = db
+            .search_multi_vector("colbert", &query_tokens, MultiVectorSearchOptions::default())
+            .expect("search");
+
+        assert!(!results.is_empty());
+
+        // Disable quantization
+        db.disable_multi_vector_quantization("colbert").expect("disable");
+        assert!(!db.is_multi_vector_quantized("colbert"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn multi_vector_quantization_persists_across_reopen() {
+        use super::quantization::{MultiVectorQuantizationConfig, TwoBitQuantizationConfig};
+
+        let path = temp_file("mv-quant-persist");
+
+        {
+            let mut db = Database::create(&path, 3).expect("create");
+            for i in 0..10 {
+                let mut mv = MultiVectors::new();
+                mv.insert(
+                    "colbert".to_owned(),
+                    vec![
+                        vec![i as f32 * 0.1, 0.5, 0.5],
+                        vec![0.5, i as f32 * 0.1, 0.5],
+                    ],
+                );
+                db.upsert_multi_vectors(
+                    &format!("doc{i}"),
+                    vec![1.0, 0.0, 0.0],
+                    Metadata::new(),
+                    mv,
+                )
+                .expect("upsert");
+            }
+
+            db.enable_multi_vector_quantization(
+                "colbert",
+                MultiVectorQuantizationConfig::TwoBit(TwoBitQuantizationConfig {
+                    rescore_multiplier: 4,
+                }),
+            )
+            .expect("enable");
+
+            assert!(db.is_multi_vector_quantized("colbert"));
+        }
+
+        // Reopen and verify quantization was loaded
+        let db = Database::open(&path).expect("reopen");
+        assert!(db.is_multi_vector_quantized("colbert"));
+
+        // Search should work on reopened database
+        let query_tokens = vec![vec![0.9, 0.5, 0.5]];
+        let results = db
+            .search_multi_vector("colbert", &query_tokens, MultiVectorSearchOptions::default())
+            .expect("search");
+        assert!(!results.is_empty());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn multi_vector_record_persists_across_reopen() {
+        let path = temp_file("mv-persist");
+        let mut mv = MultiVectors::new();
+        mv.insert(
+            "colbert".to_owned(),
+            vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
+        );
+
+        {
+            let mut db = Database::create(&path, 3).expect("create");
+            db.upsert_multi_vectors("doc1", vec![1.0, 0.0, 0.0], Metadata::new(), mv.clone())
+                .expect("upsert");
+        }
+
+        let db = Database::open(&path).expect("reopen");
+        let record = db.get("doc1").expect("exists");
+        let tokens = record.multi_vectors.get("colbert").expect("colbert space");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], vec![1.0, 2.0, 3.0]);
+        assert_eq!(tokens[1], vec![4.0, 5.0, 6.0]);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn multi_vector_maxsim_scoring_correctness() {
+        use super::{maxsim_score, DistanceMetric};
+
+        // Two identical sets: MaxSim should be sum of 1.0 per query token
+        let query = [&[1.0_f32, 0.0, 0.0][..], &[0.0, 1.0, 0.0]];
+        let doc = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]];
+        let score = maxsim_score(&query, &doc, DistanceMetric::Cosine);
+        // cosine(q0, d0) = 1.0, cosine(q0, d1) = 0.0 -> max = 1.0
+        // cosine(q1, d0) = 0.0, cosine(q1, d1) = 1.0 -> max = 1.0
+        // sum = 2.0
+        assert!((score - 2.0).abs() < 1e-6);
+
+        // Orthogonal: each query token has zero max sim
+        let query2 = [&[1.0_f32, 0.0, 0.0][..]];
+        let doc2 = vec![vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]];
+        let score2 = maxsim_score(&query2, &doc2, DistanceMetric::Cosine);
+        assert!(score2.abs() < 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // Distance metric tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn distance_metric_tag_roundtrip() {
+        use super::DistanceMetric;
+        for metric in [
+            DistanceMetric::Cosine,
+            DistanceMetric::Euclidean,
+            DistanceMetric::DotProduct,
+            DistanceMetric::Manhattan,
+        ] {
+            let tag = metric.to_tag();
+            let back = DistanceMetric::from_tag(tag).expect("valid tag");
+            assert_eq!(back, metric);
+        }
+        // Invalid tag
+        assert!(DistanceMetric::from_tag(255).is_err());
+    }
+
+    #[test]
+    fn distance_metric_name_roundtrip() {
+        use super::DistanceMetric;
+        for metric in [
+            DistanceMetric::Cosine,
+            DistanceMetric::Euclidean,
+            DistanceMetric::DotProduct,
+            DistanceMetric::Manhattan,
+        ] {
+            let name = metric.name();
+            let back = DistanceMetric::from_name(name).expect("valid name");
+            assert_eq!(back, metric);
+        }
+    }
+
+    #[test]
+    fn distance_metric_name_aliases() {
+        use super::DistanceMetric;
+        // Euclidean aliases
+        assert_eq!(DistanceMetric::from_name("l2").unwrap(), DistanceMetric::Euclidean);
+        assert_eq!(DistanceMetric::from_name("L2").unwrap(), DistanceMetric::Euclidean);
+        assert_eq!(DistanceMetric::from_name("EUCLIDEAN").unwrap(), DistanceMetric::Euclidean);
+        // DotProduct aliases
+        assert_eq!(DistanceMetric::from_name("dot").unwrap(), DistanceMetric::DotProduct);
+        assert_eq!(DistanceMetric::from_name("dot_product").unwrap(), DistanceMetric::DotProduct);
+        assert_eq!(DistanceMetric::from_name("ip").unwrap(), DistanceMetric::DotProduct);
+        assert_eq!(DistanceMetric::from_name("inner_product").unwrap(), DistanceMetric::DotProduct);
+        // Manhattan aliases
+        assert_eq!(DistanceMetric::from_name("l1").unwrap(), DistanceMetric::Manhattan);
+        assert_eq!(DistanceMetric::from_name("L1").unwrap(), DistanceMetric::Manhattan);
+        // Invalid
+        assert!(DistanceMetric::from_name("hamming").is_err());
+    }
+
+    #[test]
+    fn distance_metric_score_cosine() {
+        use super::DistanceMetric;
+        let a = [1.0_f32, 0.0, 0.0];
+        let b = [1.0_f32, 0.0, 0.0];
+        let c = [0.0_f32, 1.0, 0.0];
+        // Identical vectors -> similarity ~1.0
+        let s1 = DistanceMetric::Cosine.score(&a, &b);
+        assert!((s1 - 1.0).abs() < 1e-5, "cosine identical: {s1}");
+        // Orthogonal vectors -> similarity ~0.0
+        let s2 = DistanceMetric::Cosine.score(&a, &c);
+        assert!(s2.abs() < 1e-5, "cosine orthogonal: {s2}");
+    }
+
+    #[test]
+    fn distance_metric_score_euclidean() {
+        use super::DistanceMetric;
+        let a = [1.0_f32, 0.0, 0.0];
+        let b = [1.0_f32, 0.0, 0.0];
+        let c = [4.0_f32, 0.0, 0.0];
+        // Identical -> score = -0.0 (negated distance)
+        let s1 = DistanceMetric::Euclidean.score(&a, &b);
+        assert!(s1.abs() < 1e-5, "euclidean identical: {s1}");
+        // Distance = 3.0, score = -3.0
+        let s2 = DistanceMetric::Euclidean.score(&a, &c);
+        assert!((s2 - (-3.0)).abs() < 1e-5, "euclidean dist=3: {s2}");
+        // Closer is higher score
+        let d = [2.0_f32, 0.0, 0.0];
+        let s3 = DistanceMetric::Euclidean.score(&a, &d);
+        assert!(s3 > s2, "closer should have higher score");
+    }
+
+    #[test]
+    fn distance_metric_score_dot_product() {
+        use super::DistanceMetric;
+        // Normalized unit vectors
+        let a = [1.0_f32, 0.0, 0.0];
+        let b = [1.0_f32, 0.0, 0.0];
+        let c = [0.0_f32, 1.0, 0.0];
+        // dot(a, b) = 1.0
+        let s1 = DistanceMetric::DotProduct.score(&a, &b);
+        assert!((s1 - 1.0).abs() < 1e-5, "dot identical: {s1}");
+        // dot(a, c) = 0.0
+        let s2 = DistanceMetric::DotProduct.score(&a, &c);
+        assert!(s2.abs() < 1e-5, "dot orthogonal: {s2}");
+        // Higher dot = higher score
+        let d = [0.5_f32, 0.5, 0.0];
+        let s3 = DistanceMetric::DotProduct.score(&a, &d);
+        assert!(s3 > s2, "non-zero dot should be higher than orthogonal");
+    }
+
+    #[test]
+    fn distance_metric_score_manhattan() {
+        use super::DistanceMetric;
+        let a = [1.0_f32, 2.0, 3.0];
+        let b = [1.0_f32, 2.0, 3.0];
+        let c = [4.0_f32, 6.0, 3.0];
+        // Identical -> score = 0.0 (negated L1 distance)
+        let s1 = DistanceMetric::Manhattan.score(&a, &b);
+        assert!(s1.abs() < 1e-5, "manhattan identical: {s1}");
+        // L1 dist = |1-4| + |2-6| + |3-3| = 3 + 4 + 0 = 7, score = -7
+        let s2 = DistanceMetric::Manhattan.score(&a, &c);
+        assert!((s2 - (-7.0)).abs() < 1e-5, "manhattan dist=7: {s2}");
+    }
+
+    #[test]
+    fn distance_metric_is_similarity() {
+        use super::DistanceMetric;
+        assert!(DistanceMetric::Cosine.is_similarity());
+        assert!(DistanceMetric::DotProduct.is_similarity());
+        assert!(!DistanceMetric::Euclidean.is_similarity());
+        assert!(!DistanceMetric::Manhattan.is_similarity());
+    }
+
+    #[test]
+    fn distance_metric_default_is_cosine() {
+        use super::DistanceMetric;
+        assert_eq!(DistanceMetric::default(), DistanceMetric::Cosine);
+    }
+
+    #[test]
+    fn distance_metric_display() {
+        use super::DistanceMetric;
+        assert_eq!(format!("{}", DistanceMetric::Cosine), "cosine");
+        assert_eq!(format!("{}", DistanceMetric::Euclidean), "euclidean");
+        assert_eq!(format!("{}", DistanceMetric::DotProduct), "dotproduct");
+        assert_eq!(format!("{}", DistanceMetric::Manhattan), "manhattan");
+    }
+
+    #[test]
+    fn create_with_metric_persists_metric() {
+        use super::DistanceMetric;
+        for metric in [
+            DistanceMetric::Cosine,
+            DistanceMetric::Euclidean,
+            DistanceMetric::DotProduct,
+            DistanceMetric::Manhattan,
+        ] {
+            let path = temp_file(&format!("metric-persist-{}", metric.name()));
+            {
+                let db = Database::create_with_metric(&path, 4, metric).expect("create");
+                assert_eq!(db.metric(), metric);
+            }
+            // Reopen and verify metric
+            let db = Database::open(&path).expect("reopen");
+            assert_eq!(db.metric(), metric, "metric should persist for {metric}");
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn default_create_uses_cosine_metric() {
+        use super::DistanceMetric;
+        let path = temp_file("metric-default-cosine");
+        let db = Database::create(&path, 4).expect("create");
+        assert_eq!(db.metric(), DistanceMetric::Cosine);
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_or_create_with_metric_creates_new() {
+        use super::DistanceMetric;
+        let path = temp_file("metric-ooc-new");
+        let db = Database::open_or_create_with_metric(&path, 4, DistanceMetric::Euclidean)
+            .expect("open_or_create");
+        assert_eq!(db.metric(), DistanceMetric::Euclidean);
+        drop(db);
+        // Reopen with open_or_create again — should keep Euclidean
+        let db2 = Database::open_or_create_with_metric(&path, 4, DistanceMetric::Euclidean)
+            .expect("reopen");
+        assert_eq!(db2.metric(), DistanceMetric::Euclidean);
+        drop(db2);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn search_with_euclidean_metric() {
+        use super::DistanceMetric;
+        let path = temp_file("metric-search-euclidean");
+        let mut db = Database::create_with_metric(&path, 3, DistanceMetric::Euclidean)
+            .expect("create");
+
+        // Insert vectors at known distances from query [0, 0, 0]
+        db.insert("close", vec![1.0, 0.0, 0.0], Metadata::new())
+            .expect("insert close"); // L2 = 1
+        db.insert("mid", vec![3.0, 0.0, 0.0], Metadata::new())
+            .expect("insert mid"); // L2 = 3
+        db.insert("far", vec![5.0, 5.0, 5.0], Metadata::new())
+            .expect("insert far"); // L2 = sqrt(75) ≈ 8.66
+
+        let results = db
+            .search(
+                &[0.0, 0.0, 0.0],
+                SearchOptions {
+                    top_k: 3,
+                    ..Default::default()
+                },
+            )
+            .expect("search");
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].id, "close");
+        assert_eq!(results[1].id, "mid");
+        assert_eq!(results[2].id, "far");
+        // Scores should be negative distances
+        assert!(results[0].score > results[1].score);
+        assert!(results[1].score > results[2].score);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn search_with_dotproduct_metric() {
+        use super::DistanceMetric;
+        let path = temp_file("metric-search-dot");
+        let mut db = Database::create_with_metric(&path, 3, DistanceMetric::DotProduct)
+            .expect("create");
+
+        // Vectors with different dot products with query [1, 0, 0]
+        db.insert("high", vec![10.0, 0.0, 0.0], Metadata::new())
+            .expect("insert high"); // dot = 10
+        db.insert("medium", vec![5.0, 0.0, 0.0], Metadata::new())
+            .expect("insert medium"); // dot = 5
+        db.insert("low", vec![0.0, 1.0, 0.0], Metadata::new())
+            .expect("insert low"); // dot = 0
+
+        let results = db
+            .search(
+                &[1.0, 0.0, 0.0],
+                SearchOptions {
+                    top_k: 3,
+                    ..Default::default()
+                },
+            )
+            .expect("search");
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].id, "high");
+        assert_eq!(results[1].id, "medium");
+        assert_eq!(results[2].id, "low");
+        assert!(results[0].score > results[1].score);
+        assert!(results[1].score > results[2].score);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn search_with_manhattan_metric() {
+        use super::DistanceMetric;
+        let path = temp_file("metric-search-manhattan");
+        let mut db = Database::create_with_metric(&path, 3, DistanceMetric::Manhattan)
+            .expect("create");
+
+        // Vectors at known Manhattan distances from query [0, 0, 0]
+        db.insert("close", vec![1.0, 0.0, 0.0], Metadata::new())
+            .expect("insert close"); // L1 = 1
+        db.insert("mid", vec![2.0, 1.0, 0.0], Metadata::new())
+            .expect("insert mid"); // L1 = 3
+        db.insert("far", vec![3.0, 3.0, 3.0], Metadata::new())
+            .expect("insert far"); // L1 = 9
+
+        let results = db
+            .search(
+                &[0.0, 0.0, 0.0],
+                SearchOptions {
+                    top_k: 3,
+                    ..Default::default()
+                },
+            )
+            .expect("search");
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].id, "close");
+        assert_eq!(results[1].id, "mid");
+        assert_eq!(results[2].id, "far");
+        assert!(results[0].score > results[1].score);
+        assert!(results[1].score > results[2].score);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn matryoshka_prefix_search_accepts_short_query() {
+        let path = temp_file("matryoshka-short-query");
+        let mut db = Database::create(&path, 4).expect("create");
+        db.insert("prefix_match", vec![1.0, 0.0, -1.0, -1.0], Metadata::new())
+            .expect("insert prefix");
+        db.insert("full_match", vec![0.0, 1.0, 1.0, 1.0], Metadata::new())
+            .expect("insert full");
+
+        let outcome = db
+            .hybrid_search_in_namespace_with_stats(
+                "",
+                Some(&[1.0, 0.0]),
+                None,
+                HybridSearchOptions {
+                    top_k: 2,
+                    ..HybridSearchOptions::default()
+                },
+            )
+            .expect("search");
+
+        assert_eq!(outcome.results[0].id, "prefix_match");
+        assert_eq!(outcome.stats.effective_dimension, 2);
+        assert!(outcome.stats.matryoshka_truncated);
+        assert!(!outcome.stats.used_ann);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn matryoshka_prefix_search_can_truncate_full_query() {
+        let path = temp_file("matryoshka-truncate");
+        let mut db = Database::create(&path, 4).expect("create");
+        db.insert("prefix_match", vec![1.0, 0.0, -1.0, -1.0], Metadata::new())
+            .expect("insert prefix");
+        db.insert("tail_match", vec![0.0, 1.0, 1.0, 1.0], Metadata::new())
+            .expect("insert tail");
+
+        let outcome = db
+            .hybrid_search_in_namespace_with_stats(
+                "",
+                Some(&[1.0, 0.0, 1.0, 1.0]),
+                None,
+                HybridSearchOptions {
+                    top_k: 2,
+                    truncate_dim: Some(2),
+                    ..HybridSearchOptions::default()
+                },
+            )
+            .expect("search");
+
+        assert_eq!(outcome.results[0].id, "prefix_match");
+        assert_eq!(outcome.stats.effective_dimension, 2);
+        assert!(outcome.stats.matryoshka_truncated);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn search_with_cosine_metric_explicit() {
+        use super::DistanceMetric;
+        let path = temp_file("metric-search-cosine-explicit");
+        let mut db = Database::create_with_metric(&path, 3, DistanceMetric::Cosine)
+            .expect("create");
+
+        db.insert("aligned", vec![2.0, 0.0, 0.0], Metadata::new())
+            .expect("insert aligned"); // cosine = 1.0
+        db.insert("diagonal", vec![1.0, 1.0, 0.0], Metadata::new())
+            .expect("insert diagonal"); // cosine = 1/sqrt(2) ≈ 0.707
+        db.insert("orthogonal", vec![0.0, 0.0, 1.0], Metadata::new())
+            .expect("insert orthogonal"); // cosine = 0.0
+
+        let results = db
+            .search(
+                &[1.0, 0.0, 0.0],
+                SearchOptions {
+                    top_k: 3,
+                    ..Default::default()
+                },
+            )
+            .expect("search");
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].id, "aligned");
+        assert_eq!(results[1].id, "diagonal");
+        assert_eq!(results[2].id, "orthogonal");
+        assert!((results[0].score - 1.0).abs() < 1e-4);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn metric_persists_with_upsert_and_search_cycle() {
+        use super::DistanceMetric;
+        let path = temp_file("metric-upsert-cycle");
+        {
+            let mut db = Database::create_with_metric(&path, 3, DistanceMetric::Manhattan)
+                .expect("create");
+            db.upsert("a", vec![1.0, 0.0, 0.0], Metadata::new())
+                .expect("upsert a");
+            db.upsert("b", vec![0.0, 5.0, 0.0], Metadata::new())
+                .expect("upsert b");
+        }
+
+        // Reopen and search — metric should still be Manhattan
+        let db = Database::open(&path).expect("reopen");
+        assert_eq!(db.metric(), DistanceMetric::Manhattan);
+
+        let results = db
+            .search(
+                &[1.0, 0.0, 0.0],
+                SearchOptions {
+                    top_k: 2,
+                    ..Default::default()
+                },
+            )
+            .expect("search");
+        // "a" is closer (L1=0) vs "b" (L1=6)
+        assert_eq!(results[0].id, "a");
+        assert_eq!(results[1].id, "b");
+        assert!(results[0].score > results[1].score);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn simd_cosine_matches_scalar() {
+        use super::{scalar_cosine_similarity, simd_cosine_similarity};
+        let a = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        let b = [0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1];
+        let simd_val = simd_cosine_similarity(&a, &b);
+        let scalar_val = scalar_cosine_similarity(&a, &b);
+        assert!(
+            (simd_val - scalar_val).abs() < 1e-4,
+            "simd={simd_val}, scalar={scalar_val}"
+        );
+    }
+
+    #[test]
+    fn simd_euclidean_matches_scalar() {
+        use super::{scalar_euclidean_distance, simd_euclidean_distance};
+        let a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let b = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+        let simd_val = simd_euclidean_distance(&a, &b);
+        let scalar_val = scalar_euclidean_distance(&a, &b);
+        assert!(
+            (simd_val - scalar_val).abs() < 1e-3,
+            "simd={simd_val}, scalar={scalar_val}"
+        );
+    }
+
+    #[test]
+    fn simd_dot_matches_scalar() {
+        use super::{scalar_dot_product, simd_dot_product};
+        let a = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        let b = [0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1];
+        let simd_val = simd_dot_product(&a, &b);
+        let scalar_val = scalar_dot_product(&a, &b);
+        assert!(
+            (simd_val - scalar_val).abs() < 1e-4,
+            "simd={simd_val}, scalar={scalar_val}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // update_metadata tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn update_metadata_merges_patch() {
+        let path = temp_file("update-metadata-merge");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        let mut meta = Metadata::new();
+        meta.insert("source".into(), "blog".into());
+        meta.insert("version".into(), MetadataValue::Integer(1));
+        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta).expect("upsert");
+
+        // Patch: update version, add new key
+        let mut patch = Metadata::new();
+        patch.insert("version".into(), MetadataValue::Integer(2));
+        patch.insert("reviewed".into(), MetadataValue::Boolean(true));
+
+        let updated = db.update_metadata("doc1", patch).expect("update");
+        assert!(updated);
+
+        let record = db.get("doc1").expect("found");
+        assert_eq!(
+            record.metadata.get("source"),
+            Some(&MetadataValue::String("blog".into()))
+        );
+        assert_eq!(
+            record.metadata.get("version"),
+            Some(&MetadataValue::Integer(2))
+        );
+        assert_eq!(
+            record.metadata.get("reviewed"),
+            Some(&MetadataValue::Boolean(true))
+        );
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_metadata_returns_false_for_missing_record() {
+        let path = temp_file("update-metadata-missing");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        let mut patch = Metadata::new();
+        patch.insert("key".into(), "value".into());
+
+        let updated = db.update_metadata("nonexistent", patch).expect("update");
+        assert!(!updated);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_metadata_does_not_touch_vector() {
+        let path = temp_file("update-metadata-vector-intact");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        let mut meta = Metadata::new();
+        meta.insert("source".into(), "blog".into());
+        db.upsert("doc1", vec![1.0, 2.0, 3.0], meta).expect("upsert");
+
+        let mut patch = Metadata::new();
+        patch.insert("source".into(), "updated".into());
+        db.update_metadata("doc1", patch).expect("update");
+
+        let record = db.get("doc1").expect("found");
+        assert_eq!(record.vector, vec![1.0, 2.0, 3.0]);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_metadata_persists_across_reopen() {
+        let path = temp_file("update-metadata-persist");
+        {
+            let mut db = Database::create(&path, 3).expect("create");
+            let mut meta = Metadata::new();
+            meta.insert("source".into(), "blog".into());
+            db.upsert("doc1", vec![1.0, 0.0, 0.0], meta).expect("upsert");
+
+            let mut patch = Metadata::new();
+            patch.insert("source".into(), "updated".into());
+            patch.insert("new_key".into(), MetadataValue::Integer(42));
+            db.update_metadata("doc1", patch).expect("update");
+        }
+
+        // Reopen and verify
+        let db = Database::open(&path).expect("reopen");
+        let record = db.get("doc1").expect("found");
+        assert_eq!(
+            record.metadata.get("source"),
+            Some(&MetadataValue::String("updated".into()))
+        );
+        assert_eq!(
+            record.metadata.get("new_key"),
+            Some(&MetadataValue::Integer(42))
+        );
+        assert_eq!(record.vector, vec![1.0, 0.0, 0.0]);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_metadata_in_namespace() {
+        let path = temp_file("update-metadata-ns");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        let mut meta = Metadata::new();
+        meta.insert("key".into(), "original".into());
+        db.upsert_in_namespace("ns1", "doc1", vec![1.0, 0.0, 0.0], meta)
+            .expect("upsert");
+
+        let mut patch = Metadata::new();
+        patch.insert("key".into(), "patched".into());
+        let updated = db
+            .update_metadata_in_namespace("ns1", "doc1", patch)
+            .expect("update");
+        assert!(updated);
+
+        let record = db.get_in_namespace("ns1", "doc1").expect("found");
+        assert_eq!(
+            record.metadata.get("key"),
+            Some(&MetadataValue::String("patched".into()))
+        );
+
+        // Wrong namespace returns false
+        let mut patch2 = Metadata::new();
+        patch2.insert("key".into(), "nope".into());
+        let updated2 = db
+            .update_metadata_in_namespace("ns2", "doc1", patch2)
+            .expect("update wrong ns");
+        assert!(!updated2);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_metadata_searchable_after_patch() {
+        let path = temp_file("update-metadata-search");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        let mut meta = Metadata::new();
+        meta.insert("status".into(), "draft".into());
+        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta).expect("upsert");
+
+        // Before patch: filter matches
+        let count = db.count_filtered(None, Some(&MetadataFilter::eq("status", "draft")));
+        assert_eq!(count, 1);
+
+        // Patch to "published"
+        let mut patch = Metadata::new();
+        patch.insert("status".into(), "published".into());
+        db.update_metadata("doc1", patch).expect("update");
+
+        // After patch: old filter misses, new filter matches
+        let count_draft = db.count_filtered(None, Some(&MetadataFilter::eq("status", "draft")));
+        assert_eq!(count_draft, 0);
+        let count_pub = db.count_filtered(None, Some(&MetadataFilter::eq("status", "published")));
+        assert_eq!(count_pub, 1);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn update_metadata_read_only_fails() {
+        let path = temp_file("update-metadata-ro");
+        {
+            let mut db = Database::create(&path, 3).expect("create");
+            db.upsert("doc1", vec![1.0, 0.0, 0.0], Metadata::new())
+                .expect("upsert");
+        }
+
+        let mut db = Database::open_read_only(&path).expect("open ro");
+        let mut patch = Metadata::new();
+        patch.insert("key".into(), "val".into());
+        let result = db.update_metadata("doc1", patch);
+        assert!(result.is_err());
+
+        cleanup(&path);
+    }
+
+    // ── Payload Index tests ──────────────────────────────────────────────
+
+    #[test]
+    fn create_keyword_index_returns_true_on_first_call() {
+        let path = temp_file("pidx-create-kw");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        let created = db
+            .create_index("source", PayloadIndexType::Keyword)
+            .expect("create_index");
+        assert!(created);
+
+        let indexes = db.list_indexes();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].0, "source");
+        assert!(matches!(indexes[0].1, PayloadIndexType::Keyword));
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn create_index_returns_false_on_duplicate() {
+        let path = temp_file("pidx-dup");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        let first = db
+            .create_index("source", PayloadIndexType::Keyword)
+            .expect("first");
+        assert!(first);
+
+        let second = db
+            .create_index("source", PayloadIndexType::Keyword)
+            .expect("second");
+        assert!(!second);
+
+        assert_eq!(db.list_indexes().len(), 1);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn create_numeric_index() {
+        let path = temp_file("pidx-numeric");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        let created = db
+            .create_index("price", PayloadIndexType::Numeric)
+            .expect("create");
+        assert!(created);
+
+        let indexes = db.list_indexes();
+        assert_eq!(indexes.len(), 1);
+        assert!(matches!(indexes[0].1, PayloadIndexType::Numeric));
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn drop_index_returns_true_and_removes() {
+        let path = temp_file("pidx-drop");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        db.create_index("source", PayloadIndexType::Keyword)
+            .expect("create");
+        assert_eq!(db.list_indexes().len(), 1);
+
+        let dropped = db.drop_index("source").expect("drop");
+        assert!(dropped);
+        assert_eq!(db.list_indexes().len(), 0);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn drop_index_returns_false_for_nonexistent() {
+        let path = temp_file("pidx-drop-missing");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        let dropped = db.drop_index("nope").expect("drop");
+        assert!(!dropped);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn list_indexes_empty_by_default() {
+        let path = temp_file("pidx-list-empty");
+        let db = Database::create(&path, 3).expect("create");
+        assert!(db.list_indexes().is_empty());
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn keyword_index_accelerates_eq_count() {
+        let path = temp_file("pidx-kw-eq");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        // Insert records with different sources
+        for i in 0..50 {
+            let mut meta = Metadata::new();
+            meta.insert("source".into(), format!("cat{}", i % 5).into());
+            meta.insert("idx".into(), MetadataValue::Integer(i));
+            db.upsert(format!("doc{}", i), vec![1.0, 0.0, 0.0], meta)
+                .expect("upsert");
+        }
+
+        // Create keyword index on "source"
+        db.create_index("source", PayloadIndexType::Keyword)
+            .expect("create");
+
+        // count_filtered with $eq should use the index
+        let count = db.count_filtered(None, Some(&MetadataFilter::eq("source", "cat0")));
+        assert_eq!(count, 10); // 0, 5, 10, 15, 20, 25, 30, 35, 40, 45
+
+        let count2 = db.count_filtered(None, Some(&MetadataFilter::eq("source", "cat3")));
+        assert_eq!(count2, 10);
+
+        // Non-matching value
+        let count3 = db.count_filtered(None, Some(&MetadataFilter::eq("source", "cat99")));
+        assert_eq!(count3, 0);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn keyword_index_accelerates_in_filter() {
+        let path = temp_file("pidx-kw-in");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        for i in 0..20 {
+            let mut meta = Metadata::new();
+            meta.insert("tag".into(), format!("t{}", i % 4).into());
+            db.upsert(format!("doc{}", i), vec![1.0, 0.0, 0.0], meta)
+                .expect("upsert");
+        }
+
+        db.create_index("tag", PayloadIndexType::Keyword)
+            .expect("create");
+
+        let filter = MetadataFilter::r#in(
+            "tag",
+            vec![
+                MetadataValue::String("t0".into()),
+                MetadataValue::String("t2".into()),
+            ],
+        );
+        let count = db.count_filtered(None, Some(&filter));
+        assert_eq!(count, 10); // t0: 5, t2: 5
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn numeric_index_accelerates_range_queries() {
+        let path = temp_file("pidx-num-range");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        for i in 0..100 {
+            let mut meta = Metadata::new();
+            meta.insert("score".into(), MetadataValue::Float(i as f64));
+            db.upsert(format!("doc{}", i), vec![1.0, 0.0, 0.0], meta)
+                .expect("upsert");
+        }
+
+        db.create_index("score", PayloadIndexType::Numeric)
+            .expect("create");
+
+        // $gt 90 → 91..99 = 9 records
+        let count_gt = db.count_filtered(None, Some(&MetadataFilter::gt("score", 90.0)));
+        assert_eq!(count_gt, 9);
+
+        // $gte 90 → 90..99 = 10 records
+        let count_gte = db.count_filtered(None, Some(&MetadataFilter::gte("score", 90.0)));
+        assert_eq!(count_gte, 10);
+
+        // $lt 10 → 0..9 = 10 records
+        let count_lt = db.count_filtered(None, Some(&MetadataFilter::lt("score", 10.0)));
+        assert_eq!(count_lt, 10);
+
+        // $lte 10 → 0..10 = 11 records
+        let count_lte = db.count_filtered(None, Some(&MetadataFilter::lte("score", 10.0)));
+        assert_eq!(count_lte, 11);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn numeric_index_eq_lookup() {
+        let path = temp_file("pidx-num-eq");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        for i in 0..20 {
+            let mut meta = Metadata::new();
+            meta.insert("priority".into(), MetadataValue::Float((i % 3) as f64));
+            db.upsert(format!("doc{}", i), vec![1.0, 0.0, 0.0], meta)
+                .expect("upsert");
+        }
+
+        db.create_index("priority", PayloadIndexType::Numeric)
+            .expect("create");
+
+        // $eq on numeric field via the index
+        let filter = MetadataFilter::eq("priority", MetadataValue::Float(0.0));
+        let count = db.count_filtered(None, Some(&filter));
+        // 0 % 3 == 0: i=0,3,6,9,12,15,18 → 7 records
+        assert_eq!(count, 7);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn payload_index_persists_across_reopen() {
+        let path = temp_file("pidx-persist");
+        {
+            let mut db = Database::create(&path, 3).expect("create");
+
+            let mut meta = Metadata::new();
+            meta.insert("source".into(), "blog".into());
+            db.upsert("doc1", vec![1.0, 0.0, 0.0], meta).expect("upsert");
+
+            let mut meta2 = Metadata::new();
+            meta2.insert("source".into(), "docs".into());
+            db.upsert("doc2", vec![0.0, 1.0, 0.0], meta2)
+                .expect("upsert");
+
+            db.create_index("source", PayloadIndexType::Keyword)
+                .expect("create");
+        }
+
+        // Reopen and verify index survives
+        let db = Database::open(&path).expect("reopen");
+        let indexes = db.list_indexes();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].0, "source");
+
+        // Index should be functional after reopen
+        let count = db.count_filtered(None, Some(&MetadataFilter::eq("source", "blog")));
+        assert_eq!(count, 1);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn payload_index_incremental_upsert_adds_to_index() {
+        let path = temp_file("pidx-incr-upsert");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        // Create index first (empty)
+        db.create_index("source", PayloadIndexType::Keyword)
+            .expect("create");
+
+        // Now upsert records — they should be indexed incrementally
+        let mut meta = Metadata::new();
+        meta.insert("source".into(), "blog".into());
+        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta).expect("upsert");
+
+        let count = db.count_filtered(None, Some(&MetadataFilter::eq("source", "blog")));
+        assert_eq!(count, 1);
+
+        // Upsert another
+        let mut meta2 = Metadata::new();
+        meta2.insert("source".into(), "blog".into());
+        db.upsert("doc2", vec![0.0, 1.0, 0.0], meta2)
+            .expect("upsert");
+
+        let count2 = db.count_filtered(None, Some(&MetadataFilter::eq("source", "blog")));
+        assert_eq!(count2, 2);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn payload_index_incremental_delete_removes_from_index() {
+        let path = temp_file("pidx-incr-delete");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        let mut meta = Metadata::new();
+        meta.insert("source".into(), "blog".into());
+        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta).expect("upsert");
+
+        let mut meta2 = Metadata::new();
+        meta2.insert("source".into(), "blog".into());
+        db.upsert("doc2", vec![0.0, 1.0, 0.0], meta2)
+            .expect("upsert");
+
+        db.create_index("source", PayloadIndexType::Keyword)
+            .expect("create");
+
+        assert_eq!(
+            db.count_filtered(None, Some(&MetadataFilter::eq("source", "blog"))),
+            2
+        );
+
+        // Delete one record
+        db.delete("doc1").expect("delete");
+
+        assert_eq!(
+            db.count_filtered(None, Some(&MetadataFilter::eq("source", "blog"))),
+            1
+        );
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn payload_index_incremental_upsert_replaces_old_value() {
+        let path = temp_file("pidx-incr-replace");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        let mut meta = Metadata::new();
+        meta.insert("source".into(), "blog".into());
+        db.upsert_in_namespace("", "doc1", vec![1.0, 0.0, 0.0], meta)
+            .expect("upsert");
+
+        db.create_index("source", PayloadIndexType::Keyword)
+            .expect("create");
+
+        assert_eq!(
+            db.count_filtered(None, Some(&MetadataFilter::eq("source", "blog"))),
+            1
+        );
+
+        // Upsert same id with different metadata value (uses upsert_in_namespace for true upsert)
+        let mut meta2 = Metadata::new();
+        meta2.insert("source".into(), "docs".into());
+        db.upsert_in_namespace("", "doc1", vec![1.0, 0.0, 0.0], meta2)
+            .expect("upsert replace");
+
+        // Old value gone
+        assert_eq!(
+            db.count_filtered(None, Some(&MetadataFilter::eq("source", "blog"))),
+            0
+        );
+        // New value present
+        assert_eq!(
+            db.count_filtered(None, Some(&MetadataFilter::eq("source", "docs"))),
+            1
+        );
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn payload_index_update_metadata_maintains_index() {
+        let path = temp_file("pidx-update-meta");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        let mut meta = Metadata::new();
+        meta.insert("status".into(), "draft".into());
+        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta).expect("upsert");
+
+        db.create_index("status", PayloadIndexType::Keyword)
+            .expect("create");
+
+        assert_eq!(
+            db.count_filtered(None, Some(&MetadataFilter::eq("status", "draft"))),
+            1
+        );
+
+        // update_metadata changes the indexed field
+        let mut patch = Metadata::new();
+        patch.insert("status".into(), "published".into());
+        db.update_metadata("doc1", patch).expect("update");
+
+        assert_eq!(
+            db.count_filtered(None, Some(&MetadataFilter::eq("status", "draft"))),
+            0
+        );
+        assert_eq!(
+            db.count_filtered(None, Some(&MetadataFilter::eq("status", "published"))),
+            1
+        );
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn payload_index_and_filter_intersection() {
+        let path = temp_file("pidx-and");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        // Insert records with source and priority
+        for i in 0..30 {
+            let mut meta = Metadata::new();
+            meta.insert("source".into(), if i % 2 == 0 { "blog" } else { "docs" }.into());
+            meta.insert("priority".into(), MetadataValue::Float((i % 3) as f64));
+            db.upsert(format!("doc{}", i), vec![1.0, 0.0, 0.0], meta)
+                .expect("upsert");
+        }
+
+        db.create_index("source", PayloadIndexType::Keyword)
+            .expect("create source");
+        db.create_index("priority", PayloadIndexType::Numeric)
+            .expect("create priority");
+
+        // AND(source == "blog", priority > 1) → source=blog(even i) AND priority=2(i%3==2)
+        // Even i where i%3==2: 2,8,14,20,26 → 5
+        let filter = MetadataFilter::and(vec![
+            MetadataFilter::eq("source", "blog"),
+            MetadataFilter::gt("priority", 1.0),
+        ]);
+        let count = db.count_filtered(None, Some(&filter));
+        assert_eq!(count, 5);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn payload_index_with_namespace_filtering() {
+        let path = temp_file("pidx-ns");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        let mut meta1 = Metadata::new();
+        meta1.insert("tag".into(), "rust".into());
+        db.upsert_in_namespace("ns1", "doc1", vec![1.0, 0.0, 0.0], meta1)
+            .expect("upsert");
+
+        let mut meta2 = Metadata::new();
+        meta2.insert("tag".into(), "rust".into());
+        db.upsert_in_namespace("ns2", "doc2", vec![0.0, 1.0, 0.0], meta2)
+            .expect("upsert");
+
+        db.create_index("tag", PayloadIndexType::Keyword)
+            .expect("create");
+
+        // Without namespace → both
+        assert_eq!(
+            db.count_filtered(None, Some(&MetadataFilter::eq("tag", "rust"))),
+            2
+        );
+
+        // With namespace → scoped
+        assert_eq!(
+            db.count_filtered(Some("ns1"), Some(&MetadataFilter::eq("tag", "rust"))),
+            1
+        );
+        assert_eq!(
+            db.count_filtered(Some("ns2"), Some(&MetadataFilter::eq("tag", "rust"))),
+            1
+        );
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn create_index_read_only_fails() {
+        let path = temp_file("pidx-ro");
+        {
+            let mut db = Database::create(&path, 3).expect("create");
+            db.upsert("doc1", vec![1.0, 0.0, 0.0], Metadata::new())
+                .expect("upsert");
+        }
+
+        let mut db = Database::open_read_only(&path).expect("open ro");
+        let result = db.create_index("source", PayloadIndexType::Keyword);
+        assert!(result.is_err());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn drop_index_read_only_fails() {
+        let path = temp_file("pidx-drop-ro");
+        {
+            let mut db = Database::create(&path, 3).expect("create");
+            db.create_index("source", PayloadIndexType::Keyword)
+                .expect("create");
+        }
+
+        let mut db = Database::open_read_only(&path).expect("open ro");
+        let result = db.drop_index("source");
+        assert!(result.is_err());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn multiple_indexes_independent() {
+        let path = temp_file("pidx-multi");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        db.create_index("source", PayloadIndexType::Keyword)
+            .expect("kw");
+        db.create_index("score", PayloadIndexType::Numeric)
+            .expect("num");
+
+        assert_eq!(db.list_indexes().len(), 2);
+
+        // Drop one, other remains
+        db.drop_index("source").expect("drop source");
+        let indexes = db.list_indexes();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].0, "score");
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn payload_index_search_returns_correct_results() {
+        let path = temp_file("pidx-search");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        // Insert records where only some match the filter
+        let mut meta1 = Metadata::new();
+        meta1.insert("category".into(), "tech".into());
+        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta1)
+            .expect("upsert");
+
+        let mut meta2 = Metadata::new();
+        meta2.insert("category".into(), "science".into());
+        db.upsert("doc2", vec![0.9, 0.1, 0.0], meta2)
+            .expect("upsert");
+
+        let mut meta3 = Metadata::new();
+        meta3.insert("category".into(), "tech".into());
+        db.upsert("doc3", vec![0.8, 0.2, 0.0], meta3)
+            .expect("upsert");
+
+        // Create keyword index on category
+        db.create_index("category", PayloadIndexType::Keyword)
+            .expect("create");
+
+        // Search with filter should only return tech records
+        let results = db
+            .search(
+                &[1.0, 0.0, 0.0],
+                SearchOptions {
+                    top_k: 10,
+                    filter: Some(MetadataFilter::eq("category", "tech")),
+                    truncate_dim: None,
+                },
+            )
+            .expect("search");
+        assert_eq!(results.len(), 2);
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"doc1"));
+        assert!(ids.contains(&"doc3"));
+        assert!(!ids.contains(&"doc2"));
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn payload_index_list_uses_index() {
+        let path = temp_file("pidx-list");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        for i in 0..20 {
+            let mut meta = Metadata::new();
+            meta.insert("type".into(), if i % 2 == 0 { "even" } else { "odd" }.into());
+            db.upsert(format!("doc{}", i), vec![1.0, 0.0, 0.0], meta)
+                .expect("upsert");
+        }
+
+        db.create_index("type", PayloadIndexType::Keyword)
+            .expect("create");
+
+        let records = db.list(None, Some(&MetadataFilter::eq("type", "even")), 0, 0);
+        assert_eq!(records.len(), 10);
+        for r in &records {
+            assert_eq!(
+                r.metadata.get("type"),
+                Some(&MetadataValue::String("even".into()))
+            );
+        }
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn payload_index_rebuild_on_create_with_existing_data() {
+        let path = temp_file("pidx-rebuild");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        // Insert data BEFORE creating the index
+        for i in 0..10 {
+            let mut meta = Metadata::new();
+            meta.insert("color".into(), if i < 4 { "red" } else { "blue" }.into());
+            db.upsert(format!("doc{}", i), vec![1.0, 0.0, 0.0], meta)
+                .expect("upsert");
+        }
+
+        // Create index AFTER data exists — should rebuild from existing records
+        db.create_index("color", PayloadIndexType::Keyword)
+            .expect("create");
+
+        let red_count = db.count_filtered(None, Some(&MetadataFilter::eq("color", "red")));
+        assert_eq!(red_count, 4);
+
+        let blue_count = db.count_filtered(None, Some(&MetadataFilter::eq("color", "blue")));
+        assert_eq!(blue_count, 6);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn numeric_index_combined_range() {
+        let path = temp_file("pidx-num-combined");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        for i in 0..50 {
+            let mut meta = Metadata::new();
+            meta.insert("val".into(), MetadataValue::Float(i as f64));
+            db.upsert(format!("doc{}", i), vec![1.0, 0.0, 0.0], meta)
+                .expect("upsert");
+        }
+
+        db.create_index("val", PayloadIndexType::Numeric)
+            .expect("create");
+
+        // AND(val >= 10, val < 20) → 10..19 = 10 records
+        let filter = MetadataFilter::and(vec![
+            MetadataFilter::gte("val", 10.0),
+            MetadataFilter::lt("val", 20.0),
+        ]);
+        let count = db.count_filtered(None, Some(&filter));
+        assert_eq!(count, 10);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn payload_index_sidecar_cleaned_on_drop_last_index() {
+        let path = temp_file("pidx-sidecar-clean");
+        let mut db = Database::create(&path, 3).expect("create");
+
+        db.create_index("source", PayloadIndexType::Keyword)
+            .expect("create");
+
+        // Sidecar should exist
+        let sidecar = path.with_extension("vdb.pidx");
+        assert!(sidecar.exists());
+
+        db.drop_index("source").expect("drop");
+
+        // After dropping the last index, sidecar might still exist (with empty content)
+        // but on reopen, list_indexes should be empty
+        drop(db);
+
+        let db2 = Database::open(&path).expect("reopen");
+        assert!(db2.list_indexes().is_empty());
+
+        cleanup(&path);
+    }
+
+    // -------------------------------------------------------------------
+    // TTL / Expiry tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn set_ttl_hides_record_from_get() {
+        let path = temp_file("ttl-get");
+        let mut db = Database::create(&path, 3).expect("create");
+        db.upsert("doc1", vec![1.0, 0.0, 0.0], Metadata::new())
+            .expect("upsert");
+
+        // Set TTL to 0 seconds — effectively already expired.
+        assert!(db.set_ttl("doc1", 0.0).expect("set_ttl"));
+        // Tiny sleep to ensure timestamp is strictly past
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(db.get("doc1").is_none());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn clear_ttl_makes_record_visible_again() {
+        let path = temp_file("ttl-clear");
+        let mut db = Database::create(&path, 3).expect("create");
+        db.upsert("doc1", vec![1.0, 0.0, 0.0], Metadata::new())
+            .expect("upsert");
+
+        db.set_ttl("doc1", 0.0).expect("set_ttl");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(db.get("doc1").is_none());
+
+        db.clear_ttl("doc1").expect("clear_ttl");
+        assert!(db.get("doc1").is_some());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn expired_records_excluded_from_count_and_list() {
+        let path = temp_file("ttl-count-list");
+        let mut db = Database::create(&path, 3).expect("create");
+        db.upsert("a", vec![1.0, 0.0, 0.0], Metadata::new())
+            .expect("upsert a");
+        db.upsert("b", vec![0.0, 1.0, 0.0], Metadata::new())
+            .expect("upsert b");
+
+        assert_eq!(db.count_filtered(None, None), 2);
+        assert_eq!(db.list(None, None, 0, 0).len(), 2);
+
+        db.set_ttl("a", 0.0).expect("set_ttl");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        assert_eq!(db.count_filtered(None, None), 1);
+        assert_eq!(db.list(None, None, 0, 0).len(), 1);
+        assert_eq!(db.list(None, None, 0, 0)[0].id, "b");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn expired_records_excluded_from_search() {
+        let path = temp_file("ttl-search");
+        let mut db = Database::create(&path, 3).expect("create");
+        db.upsert("a", vec![1.0, 0.0, 0.0], Metadata::new())
+            .expect("upsert a");
+        db.upsert("b", vec![0.0, 1.0, 0.0], Metadata::new())
+            .expect("upsert b");
+
+        db.set_ttl("a", 0.0).expect("set_ttl");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let results = db
+            .search(&[1.0, 0.0, 0.0], SearchOptions::default())
+            .expect("search");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "b");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ttl_persists_across_reopen() {
+        let path = temp_file("ttl-persist");
+        {
+            let mut db = Database::create(&path, 3).expect("create");
+            db.upsert("doc1", vec![1.0, 0.0, 0.0], Metadata::new())
+                .expect("upsert");
+            db.set_ttl("doc1", 0.0).expect("set_ttl");
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let db = Database::open(&path).expect("reopen");
+        assert!(db.get("doc1").is_none());
+        assert_eq!(db.count_filtered(None, None), 0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_removes_expired_records() {
+        let path = temp_file("ttl-compact");
+        let mut db = Database::create(&path, 3).expect("create");
+        db.upsert("a", vec![1.0, 0.0, 0.0], Metadata::new())
+            .expect("upsert a");
+        db.upsert("b", vec![0.0, 1.0, 0.0], Metadata::new())
+            .expect("upsert b");
+
+        db.set_ttl("a", 0.0).expect("set_ttl");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        db.compact().expect("compact");
+        // After compact, the expired record should be physically removed.
+        assert_eq!(db.len(), 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn set_ttl_on_nonexistent_record_returns_false() {
+        let path = temp_file("ttl-missing");
+        let mut db = Database::create(&path, 3).expect("create");
+        assert!(!db.set_ttl("ghost", 60.0).expect("set_ttl"));
+        assert!(!db.clear_ttl("ghost").expect("clear_ttl"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn upsert_with_expires_at() {
+        let path = temp_file("ttl-upsert-ea");
+        let mut db = Database::create(&path, 3).expect("create");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        // Already expired
+        let record = Record {
+            namespace: String::new(),
+            id: "doc1".into(),
+            vector: vec![1.0, 0.0, 0.0],
+            vectors: NamedVectors::new(),
+            sparse: SparseVector::new(),
+            metadata: Metadata::new(),
+            multi_vectors: MultiVectors::new(),
+            expires_at: Some(now - 1.0),
+        };
+        db.upsert_many(std::iter::once(record)).expect("upsert");
+        assert!(db.get("doc1").is_none());
+
+        // Far future — visible
+        let record2 = Record {
+            namespace: String::new(),
+            id: "doc2".into(),
+            vector: vec![0.0, 1.0, 0.0],
+            vectors: NamedVectors::new(),
+            sparse: SparseVector::new(),
+            metadata: Metadata::new(),
+            multi_vectors: MultiVectors::new(),
+            expires_at: Some(now + 86400.0),
+        };
+        db.upsert_many(std::iter::once(record2)).expect("upsert");
+        assert!(db.get("doc2").is_some());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn set_ttl_in_namespace() {
+        let path = temp_file("ttl-ns");
+        let mut db = Database::create(&path, 3).expect("create");
+        db.upsert_in_namespace("ns1", "doc1", vec![1.0, 0.0, 0.0], Metadata::new())
+            .expect("upsert");
+
+        assert!(db.set_ttl_in_namespace("ns1", "doc1", 0.0).expect("set"));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(db.get_in_namespace("ns1", "doc1").is_none());
+
+        // Wrong namespace returns false
+        assert!(!db.set_ttl_in_namespace("ns2", "doc1", 60.0).expect("set wrong ns"));
+
+        cleanup(&path);
+    }
+
+    // -------------------------------------------------------------------
+    // Cursor-based pagination tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn list_cursor_basic() {
+        let path = temp_file("cursor-basic");
+        let mut db = Database::create(&path, 3).expect("create");
+        for i in 0..5 {
+            db.upsert(
+                &format!("doc{i}"),
+                vec![1.0, 0.0, 0.0],
+                Metadata::new(),
+            )
+            .expect("upsert");
+        }
+
+        // First page of 2
+        let (page1, cursor1) = db.list_cursor(None, None, 2, None);
+        assert_eq!(page1.len(), 2);
+        assert!(cursor1.is_some());
+
+        // Second page of 2
+        let (page2, cursor2) = db.list_cursor(None, None, 2, cursor1.as_deref());
+        assert_eq!(page2.len(), 2);
+        assert!(cursor2.is_some());
+
+        // Third page (only 1 remaining)
+        let (page3, cursor3) = db.list_cursor(None, None, 2, cursor2.as_deref());
+        assert_eq!(page3.len(), 1);
+        assert!(cursor3.is_none());
+
+        // No duplicates across pages
+        let mut all_ids: Vec<String> = Vec::new();
+        for r in page1.iter().chain(page2.iter()).chain(page3.iter()) {
+            all_ids.push(r.id.clone());
+        }
+        all_ids.sort();
+        all_ids.dedup();
+        assert_eq!(all_ids.len(), 5);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn list_cursor_with_namespace() {
+        let path = temp_file("cursor-ns");
+        let mut db = Database::create(&path, 3).expect("create");
+        for i in 0..3 {
+            db.upsert_in_namespace("ns1", &format!("doc{i}"), vec![1.0, 0.0, 0.0], Metadata::new())
+                .expect("upsert");
+        }
+        for i in 0..2 {
+            db.upsert_in_namespace("ns2", &format!("doc{i}"), vec![0.0, 1.0, 0.0], Metadata::new())
+                .expect("upsert");
+        }
+
+        let (page1, cursor1) = db.list_cursor(Some("ns1"), None, 2, None);
+        assert_eq!(page1.len(), 2);
+        assert!(cursor1.is_some());
+
+        let (page2, cursor2) = db.list_cursor(Some("ns1"), None, 2, cursor1.as_deref());
+        assert_eq!(page2.len(), 1);
+        assert!(cursor2.is_none());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn list_cursor_excludes_expired() {
+        let path = temp_file("cursor-ttl");
+        let mut db = Database::create(&path, 3).expect("create");
+        for i in 0..5 {
+            db.upsert(
+                &format!("doc{i}"),
+                vec![1.0, 0.0, 0.0],
+                Metadata::new(),
+            )
+            .expect("upsert");
+        }
+
+        // Expire doc1
+        db.set_ttl("doc1", 0.0).expect("set ttl");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Paginate all — should get 4, not 5
+        let mut all = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (page, next) = db.list_cursor(None, None, 10, cursor.as_deref());
+            all.extend(page.into_iter().cloned());
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(all.len(), 4);
+        assert!(!all.iter().any(|r| r.id == "doc1"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn list_cursor_empty_database() {
+        let path = temp_file("cursor-empty");
+        let db = Database::create(&path, 3).expect("create");
+        let (page, cursor) = db.list_cursor(None, None, 10, None);
+        assert!(page.is_empty());
+        assert!(cursor.is_none());
         cleanup(&path);
     }
 }

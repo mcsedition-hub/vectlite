@@ -1,0 +1,26 @@
+[package]
+name = "vectlite-uniffi"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "UniFFI bindings for vectlite (Swift & Kotlin)."
+homepage = "https://vectlite.mcsedition.org/"
+repository = "https://github.com/mcsedition-hub/vectlite"
+publish = false
+
+[lib]
+name = "vectlite_uniffi"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bindgen.rs"
+
+[dependencies]
+uniffi = { version = "0.28", features = ["cli"] }
+thiserror = "1"
+vectlite = { package = "vectlite-core", path = "../../crates/vectlite-core" }
+serde_json = "1"
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }

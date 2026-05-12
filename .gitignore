@@ -4,6 +4,7 @@
 /dist
 /node_modules
 /.venv
+/pitch.md
 __pycache__/
 *.pyc
 bindings/python/vectlite/_vectlite*.so
@@ -13,3 +14,8 @@ bindings/node/vectlite.node
 bindings/node/native/
 bindings/node/prebuilds/
 *.dSYM/
+.DS_Store
+bindings/swift/.build/
+bindings/swift/.build-staging/
+bindings/kotlin/.gradle/
+bindings/kotlin/build/

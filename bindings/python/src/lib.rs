@@ -7,13 +7,14 @@ use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyList, PyModule, PyString};
 use vectlite::quantization::{
-    BinaryQuantizationConfig, ProductQuantizationConfig, QuantizationConfig,
-    ScalarQuantizationConfig,
+    BinaryQuantizationConfig, MultiVectorQuantizationConfig, ProductQuantizationConfig,
+    QuantizationConfig, ScalarQuantizationConfig, TwoBitQuantizationConfig,
 };
 use vectlite::{
-    Database as CoreDatabase, FusionStrategy, HybridSearchOptions, Metadata, MetadataFilter,
-    MetadataValue, NamedVectors, Record, SearchOutcome, SearchResult, SparseVector,
-    Store as CoreStore, WriteOperation,
+    Database as CoreDatabase, DistanceMetric, FusionStrategy, HybridSearchOptions, Metadata,
+    MetadataFilter, MetadataValue, MultiVectorSearchOptions, MultiVectors, NamedVectors,
+    PayloadIndexType, Record, SearchOutcome, SearchResult, SparseVector, Store as CoreStore,
+    WriteOperation,
 };
 
 create_exception!(vectlite, VectLiteError, PyException);
@@ -125,6 +126,12 @@ impl PyDatabase {
         Ok(database.dimension())
     }
 
+    #[getter]
+    fn metric(&self) -> PyResult<String> {
+        let database = self.read()?;
+        Ok(database.metric().name().to_owned())
+    }
+
     fn __len__(&self) -> PyResult<usize> {
         let database = self.read()?;
         Ok(database.len())
@@ -140,7 +147,7 @@ impl PyDatabase {
         ))
     }
 
-    #[pyo3(signature = (id, vector, metadata=None, namespace=None, sparse=None, vectors=None))]
+    #[pyo3(signature = (id, vector, metadata=None, namespace=None, sparse=None, vectors=None, ttl=None))]
     fn insert(
         &self,
         py: Python<'_>,
@@ -150,25 +157,29 @@ impl PyDatabase {
         namespace: Option<String>,
         sparse: Option<Py<PyAny>>,
         vectors: Option<Py<PyDict>>,
+        ttl: Option<f64>,
     ) -> PyResult<()> {
         let sparse = coerce_sparse_param(py, sparse)?;
         let metadata = parse_metadata_dict(metadata.as_ref().map(|dict| dict.bind(py)))?;
         let sparse = parse_sparse_dict(sparse.as_ref().map(|dict| dict.bind(py)))?;
         let vectors = parse_named_vectors_dict(vectors.as_ref().map(|dict| dict.bind(py)))?;
+        let expires_at = ttl_to_expires_at(ttl)?;
         let mut database = self.write_open()?;
-        database
-            .insert_with_vectors_in_namespace(
-                namespace.unwrap_or_default(),
-                id,
-                vector,
-                vectors,
-                sparse,
-                metadata,
-            )
-            .map_err(to_py_error)
+        let record = Record {
+            namespace: namespace.unwrap_or_default(),
+            id: id.to_owned(),
+            vector,
+            vectors,
+            sparse,
+            metadata,
+            multi_vectors: MultiVectors::new(),
+            expires_at,
+        };
+        database.insert_many(std::iter::once(record)).map_err(to_py_error)?;
+        Ok(())
     }
 
-    #[pyo3(signature = (id, vector, metadata=None, namespace=None, sparse=None, vectors=None))]
+    #[pyo3(signature = (id, vector, metadata=None, namespace=None, sparse=None, vectors=None, ttl=None))]
     fn upsert(
         &self,
         py: Python<'_>,
@@ -178,22 +189,26 @@ impl PyDatabase {
         namespace: Option<String>,
         sparse: Option<Py<PyAny>>,
         vectors: Option<Py<PyDict>>,
+        ttl: Option<f64>,
     ) -> PyResult<()> {
         let sparse = coerce_sparse_param(py, sparse)?;
         let metadata = parse_metadata_dict(metadata.as_ref().map(|dict| dict.bind(py)))?;
         let sparse = parse_sparse_dict(sparse.as_ref().map(|dict| dict.bind(py)))?;
         let vectors = parse_named_vectors_dict(vectors.as_ref().map(|dict| dict.bind(py)))?;
+        let expires_at = ttl_to_expires_at(ttl)?;
         let mut database = self.write_open()?;
-        database
-            .upsert_with_vectors_in_namespace(
-                namespace.unwrap_or_default(),
-                id,
-                vector,
-                vectors,
-                sparse,
-                metadata,
-            )
-            .map_err(to_py_error)
+        let record = Record {
+            namespace: namespace.unwrap_or_default(),
+            id: id.to_owned(),
+            vector,
+            vectors,
+            sparse,
+            metadata,
+            multi_vectors: MultiVectors::new(),
+            expires_at,
+        };
+        database.upsert_many(std::iter::once(record)).map_err(to_py_error)?;
+        Ok(())
     }
 
     #[pyo3(signature = (records, namespace=None))]
@@ -336,6 +351,117 @@ impl PyDatabase {
         }))
     }
 
+    // ---- Multi-vector / ColBERT-style late interaction ----
+
+    /// Upsert a record with multi-vector token embeddings (ColBERT-style).
+    ///
+    /// `multi_vectors` is a dict mapping space names to lists of token vectors,
+    /// e.g. `{"colbert": [[0.1, 0.2, ...], [0.3, 0.4, ...], ...]}`.
+    #[pyo3(signature = (id, vector, multi_vectors, metadata=None, namespace=None))]
+    fn upsert_multi_vectors(
+        &self,
+        py: Python<'_>,
+        id: &str,
+        vector: Vec<f32>,
+        multi_vectors: Py<PyDict>,
+        metadata: Option<Py<PyDict>>,
+        namespace: Option<String>,
+    ) -> PyResult<()> {
+        let metadata = parse_metadata_dict(metadata.as_ref().map(|dict| dict.bind(py)))?;
+        let mv = parse_multi_vectors_dict(py, Some(multi_vectors.bind(py)))?;
+        let mut database = self.write_open()?;
+        database
+            .upsert_multi_vectors_in_namespace(
+                namespace.unwrap_or_default(),
+                id,
+                vector,
+                metadata,
+                mv,
+            )
+            .map_err(to_py_error)
+    }
+
+    /// Search using multi-vector late interaction (MaxSim) scoring.
+    ///
+    /// `query_tokens` is a list of token-level query embedding vectors.
+    /// `space` identifies which multi-vector space to search in.
+    #[pyo3(signature = (space, query_tokens, k=10, filter=None, namespace=None))]
+    fn search_multi_vector(
+        &self,
+        py: Python<'_>,
+        space: &str,
+        query_tokens: Vec<Vec<f32>>,
+        k: usize,
+        filter: Option<Py<PyDict>>,
+        namespace: Option<String>,
+    ) -> PyResult<Py<PyList>> {
+        let filter = match filter {
+            Some(f) => Some(parse_filter_dict(f.bind(py))?),
+            None => None,
+        };
+        let options = MultiVectorSearchOptions {
+            top_k: k,
+            filter,
+            namespace,
+        };
+        let database = self.read()?;
+        let results = database
+            .search_multi_vector(space, &query_tokens, options)
+            .map_err(to_py_error)?;
+
+        let list = PyList::empty(py);
+        for result in results {
+            let dict = PyDict::new(py);
+            dict.set_item("id", &result.id)?;
+            dict.set_item("score", result.score)?;
+            dict.set_item("namespace", &result.namespace)?;
+            dict.set_item("metadata", metadata_to_pydict(py, &result.metadata)?)?;
+            list.append(dict)?;
+        }
+        Ok(list.into())
+    }
+
+    /// Enable 2-bit quantization for a multi-vector space.
+    ///
+    /// Currently only the "two_bit" method is supported, which provides ~16x
+    /// compression for ColBERT-style token embeddings.
+    #[pyo3(signature = (space, method="two_bit", rescore_multiplier=None))]
+    fn enable_multi_vector_quantization(
+        &self,
+        space: &str,
+        method: &str,
+        rescore_multiplier: Option<usize>,
+    ) -> PyResult<()> {
+        let config = match method {
+            "two_bit" => MultiVectorQuantizationConfig::TwoBit(TwoBitQuantizationConfig {
+                rescore_multiplier: rescore_multiplier.unwrap_or(4),
+            }),
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown multi-vector quantization method: {other}. Supported: two_bit"
+                )));
+            }
+        };
+        let mut database = self.write_open()?;
+        database
+            .enable_multi_vector_quantization(space, config)
+            .map_err(to_py_error)
+    }
+
+    /// Disable multi-vector quantization for a space.
+    fn disable_multi_vector_quantization(&self, space: &str) -> PyResult<()> {
+        let mut database = self.write_open()?;
+        database
+            .disable_multi_vector_quantization(space)
+            .map_err(to_py_error)
+    }
+
+    /// Returns True if multi-vector quantization is enabled for the given space.
+    fn is_multi_vector_quantized(&self, space: &str) -> PyResult<bool> {
+        let database = self.read()?;
+        Ok(database.is_multi_vector_quantized(space))
+    }
+
     #[getter]
     fn read_only(&self) -> PyResult<bool> {
         let database = self.read()?;
@@ -352,7 +478,7 @@ impl PyDatabase {
         database.backup(&dest).map_err(to_py_error)
     }
 
-    #[pyo3(signature = (query=None, k=10, filter=None, namespace=None, all_namespaces=false, sparse=None, dense_weight=1.0, sparse_weight=1.0, fetch_k=0, mmr_lambda=None, vector_name=None, fusion="linear", rrf_k=60, explain=false, rerank=None, rerank_k=0, query_vectors=None, vector_weights=None))]
+    #[pyo3(signature = (query=None, k=10, filter=None, namespace=None, all_namespaces=false, sparse=None, dense_weight=1.0, sparse_weight=1.0, fetch_k=0, mmr_lambda=None, vector_name=None, fusion="linear", rrf_k=60, truncate_dim=None, explain=false, rerank=None, rerank_k=0, query_vectors=None, vector_weights=None))]
     fn search(
         &self,
         py: Python<'_>,
@@ -369,6 +495,7 @@ impl PyDatabase {
         vector_name: Option<String>,
         fusion: &str,
         rrf_k: usize,
+        truncate_dim: Option<usize>,
         explain: bool,
         rerank: Option<Py<PyAny>>,
         rerank_k: usize,
@@ -383,6 +510,7 @@ impl PyDatabase {
             namespace.as_deref(),
             all_namespaces,
             vector_name.as_deref(),
+            truncate_dim,
             k,
             fusion,
             explain,
@@ -406,6 +534,7 @@ impl PyDatabase {
             mmr_lambda,
             vector_name,
             parse_fusion(fusion, rrf_k)?,
+            truncate_dim,
             multi,
         )?;
 
@@ -420,7 +549,7 @@ impl PyDatabase {
         )
     }
 
-    #[pyo3(signature = (query=None, k=10, filter=None, namespace=None, all_namespaces=false, sparse=None, dense_weight=1.0, sparse_weight=1.0, fetch_k=0, mmr_lambda=None, vector_name=None, fusion="linear", rrf_k=60, explain=false, rerank=None, rerank_k=0, query_vectors=None, vector_weights=None))]
+    #[pyo3(signature = (query=None, k=10, filter=None, namespace=None, all_namespaces=false, sparse=None, dense_weight=1.0, sparse_weight=1.0, fetch_k=0, mmr_lambda=None, vector_name=None, fusion="linear", rrf_k=60, truncate_dim=None, explain=false, rerank=None, rerank_k=0, query_vectors=None, vector_weights=None))]
     fn search_with_stats(
         &self,
         py: Python<'_>,
@@ -437,6 +566,7 @@ impl PyDatabase {
         vector_name: Option<String>,
         fusion: &str,
         rrf_k: usize,
+        truncate_dim: Option<usize>,
         explain: bool,
         rerank: Option<Py<PyAny>>,
         rerank_k: usize,
@@ -451,6 +581,7 @@ impl PyDatabase {
             namespace.as_deref(),
             all_namespaces,
             vector_name.as_deref(),
+            truncate_dim,
             k,
             fusion,
             explain,
@@ -474,6 +605,7 @@ impl PyDatabase {
             mmr_lambda,
             vector_name,
             parse_fusion(fusion, rrf_k)?,
+            truncate_dim,
             multi,
         )?;
 
@@ -508,9 +640,6 @@ impl PyDatabase {
             .as_ref()
             .map(|f| parse_filter_dict(f.bind(py)))
             .transpose()?;
-        if namespace.is_none() && filter.is_none() {
-            return self.__len__();
-        }
         let database = self.read()?;
         Ok(database.count_filtered(namespace.as_deref(), filter.as_ref()))
     }
@@ -568,6 +697,36 @@ impl PyDatabase {
         Ok(list.into())
     }
 
+    #[pyo3(signature = (namespace=None, filter=None, limit=100, cursor=None))]
+    fn list_cursor(
+        &self,
+        py: Python<'_>,
+        namespace: Option<String>,
+        filter: Option<Py<PyDict>>,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> PyResult<(Py<PyList>, Option<String>)> {
+        let filter = filter
+            .as_ref()
+            .map(|f| parse_filter_dict(f.bind(py)))
+            .transpose()?;
+        let (records, next_cursor) = {
+            let database = self.read()?;
+            let (recs, nc) = database.list_cursor(
+                namespace.as_deref(),
+                filter.as_ref(),
+                limit,
+                cursor.as_deref(),
+            );
+            (recs.into_iter().cloned().collect::<Vec<_>>(), nc)
+        };
+        let list = PyList::empty(py);
+        for record in &records {
+            list.append(record_to_pydict(py, record)?)?;
+        }
+        Ok((list.into(), next_cursor))
+    }
+
     #[pyo3(signature = (filter, namespace=None))]
     fn delete_by_filter(
         &self,
@@ -580,6 +739,69 @@ impl PyDatabase {
         database
             .delete_by_filter(namespace.as_deref(), &filter)
             .map_err(to_py_error)
+    }
+
+    #[pyo3(signature = (id, metadata, namespace=None))]
+    fn update_metadata(
+        &self,
+        py: Python<'_>,
+        id: &str,
+        metadata: Py<PyDict>,
+        namespace: Option<String>,
+    ) -> PyResult<bool> {
+        let patch = parse_metadata_dict(Some(metadata.bind(py)))?;
+        let mut database = self.write_open()?;
+        database
+            .update_metadata_in_namespace(namespace.unwrap_or_default(), id, patch)
+            .map_err(to_py_error)
+    }
+
+    // -------------------------------------------------------------------
+    // TTL / Expiry
+    // -------------------------------------------------------------------
+
+    #[pyo3(signature = (id, ttl, namespace=None))]
+    fn set_ttl(&self, id: &str, ttl: f64, namespace: Option<String>) -> PyResult<bool> {
+        let mut database = self.write_open()?;
+        database
+            .set_ttl_in_namespace(&namespace.unwrap_or_default(), id, ttl)
+            .map_err(to_py_error)
+    }
+
+    #[pyo3(signature = (id, namespace=None))]
+    fn clear_ttl(&self, id: &str, namespace: Option<String>) -> PyResult<bool> {
+        let mut database = self.write_open()?;
+        database
+            .clear_ttl_in_namespace(&namespace.unwrap_or_default(), id)
+            .map_err(to_py_error)
+    }
+
+    // -------------------------------------------------------------------
+    // Payload Indexes
+    // -------------------------------------------------------------------
+
+    #[pyo3(signature = (field, index_type))]
+    fn create_index(&self, field: &str, index_type: &str) -> PyResult<bool> {
+        let ty = parse_payload_index_type(index_type)?;
+        let mut database = self.write_open()?;
+        database.create_index(field, ty).map_err(to_py_error)
+    }
+
+    #[pyo3(signature = (field,))]
+    fn drop_index(&self, field: &str) -> PyResult<bool> {
+        let mut database = self.write_open()?;
+        database.drop_index(field).map_err(to_py_error)
+    }
+
+    fn list_indexes(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let database = self.read()?;
+        let indexes = database.list_indexes();
+        let list = PyList::empty(py);
+        for (field, index_type) in indexes {
+            let tuple = (field, index_type.name());
+            list.append(tuple.into_pyobject(py)?)?;
+        }
+        Ok(list.into())
     }
 
     fn transaction(&self) -> PyResult<PyTransaction> {
@@ -612,7 +834,7 @@ impl PyTransaction {
         Ok(false)
     }
 
-    #[pyo3(signature = (id, vector, metadata=None, namespace=None, sparse=None, vectors=None))]
+    #[pyo3(signature = (id, vector, metadata=None, namespace=None, sparse=None, vectors=None, ttl=None))]
     fn insert(
         &self,
         py: Python<'_>,
@@ -622,11 +844,13 @@ impl PyTransaction {
         namespace: Option<String>,
         sparse: Option<Py<PyAny>>,
         vectors: Option<Py<PyDict>>,
+        ttl: Option<f64>,
     ) -> PyResult<()> {
         let sparse = coerce_sparse_param(py, sparse)?;
         let metadata = parse_metadata_dict(metadata.as_ref().map(|dict| dict.bind(py)))?;
         let sparse = parse_sparse_dict(sparse.as_ref().map(|dict| dict.bind(py)))?;
         let vectors = parse_named_vectors_dict(vectors.as_ref().map(|dict| dict.bind(py)))?;
+        let expires_at = ttl_to_expires_at(ttl)?;
         self.stage(WriteOperation::Insert(Record {
             namespace: namespace.unwrap_or_default(),
             id: id.to_owned(),
@@ -634,10 +858,12 @@ impl PyTransaction {
             vectors,
             sparse,
             metadata,
+            multi_vectors: MultiVectors::new(),
+            expires_at,
         }))
     }
 
-    #[pyo3(signature = (id, vector, metadata=None, namespace=None, sparse=None, vectors=None))]
+    #[pyo3(signature = (id, vector, metadata=None, namespace=None, sparse=None, vectors=None, ttl=None))]
     fn upsert(
         &self,
         py: Python<'_>,
@@ -647,11 +873,13 @@ impl PyTransaction {
         namespace: Option<String>,
         sparse: Option<Py<PyAny>>,
         vectors: Option<Py<PyDict>>,
+        ttl: Option<f64>,
     ) -> PyResult<()> {
         let sparse = coerce_sparse_param(py, sparse)?;
         let metadata = parse_metadata_dict(metadata.as_ref().map(|dict| dict.bind(py)))?;
         let sparse = parse_sparse_dict(sparse.as_ref().map(|dict| dict.bind(py)))?;
         let vectors = parse_named_vectors_dict(vectors.as_ref().map(|dict| dict.bind(py)))?;
+        let expires_at = ttl_to_expires_at(ttl)?;
         self.stage(WriteOperation::Upsert(Record {
             namespace: namespace.unwrap_or_default(),
             id: id.to_owned(),
@@ -659,6 +887,8 @@ impl PyTransaction {
             vectors,
             sparse,
             metadata,
+            multi_vectors: MultiVectors::new(),
+            expires_at,
         }))
     }
 
@@ -808,6 +1038,7 @@ impl PyDatabase {
         mmr_lambda: Option<f32>,
         vector_name: Option<String>,
         fusion: FusionStrategy,
+        truncate_dim: Option<usize>,
         multi_vector_queries: std::collections::BTreeMap<String, (Vec<f32>, f32)>,
     ) -> PyResult<SearchOutcome> {
         let filter = filter
@@ -829,6 +1060,7 @@ impl PyDatabase {
             mmr_lambda,
             vector_name,
             fusion,
+            truncate_dim,
             multi_vector_queries,
         };
 
@@ -850,13 +1082,19 @@ impl PyDatabase {
     }
 }
 
-#[pyfunction(name = "open", signature = (path, dimension=None, read_only=false, lock_timeout=None))]
+#[pyfunction(name = "open", signature = (path, dimension=None, read_only=false, lock_timeout=None, metric=None))]
 fn open_database(
     path: String,
     dimension: Option<usize>,
     read_only: bool,
     lock_timeout: Option<f64>,
+    metric: Option<String>,
 ) -> PyResult<PyDatabase> {
+    let parsed_metric = match metric.as_deref() {
+        Some(name) => DistanceMetric::from_name(name).map_err(to_py_error)?,
+        None => DistanceMetric::Cosine,
+    };
+
     let database = if read_only {
         if !Path::new(&path).exists() {
             return Err(VectLiteError::new_err(
@@ -883,7 +1121,8 @@ fn open_database(
                 db
             }
             (Some(dimension), None) => {
-                CoreDatabase::open_or_create(&path, dimension).map_err(to_py_error)?
+                CoreDatabase::open_or_create_with_metric(&path, dimension, parsed_metric)
+                    .map_err(to_py_error)?
             }
             (None, Some(timeout)) => {
                 CoreDatabase::open_with_timeout(&path, timeout).map_err(to_py_error)?
@@ -896,7 +1135,7 @@ fn open_database(
                 "dimension is required when creating a new database",
             ));
         };
-        CoreDatabase::create(&path, dimension).map_err(to_py_error)?
+        CoreDatabase::create_with_metric(&path, dimension, parsed_metric).map_err(to_py_error)?
     };
 
     Ok(PyDatabase {
@@ -942,6 +1181,23 @@ fn parse_metadata_dict(dict: Option<&Bound<'_, PyDict>>) -> PyResult<Metadata> {
 
 /// Validate and coerce the `sparse` parameter. Accepts `None`, a `dict[str, float]`
 /// (returned by `sparse_terms()`), or raises a clear error for any other type.
+/// Convert an optional TTL (seconds from now) to an absolute `expires_at` timestamp.
+fn ttl_to_expires_at(ttl: Option<f64>) -> PyResult<Option<f64>> {
+    match ttl {
+        None => Ok(None),
+        Some(t) if t < 0.0 || t.is_nan() => Err(PyValueError::new_err(
+            "ttl must be a non-negative finite number",
+        )),
+        Some(t) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            Ok(Some(now + t))
+        }
+    }
+}
+
 fn coerce_sparse_param(py: Python<'_>, sparse: Option<Py<PyAny>>) -> PyResult<Option<Py<PyDict>>> {
     let Some(sparse) = sparse else {
         return Ok(None);
@@ -1184,6 +1440,7 @@ fn record_to_pydict<'py>(py: Python<'py>, record: &Record) -> PyResult<Bound<'py
     dict.set_item("vectors", named_vectors_to_pydict(py, &record.vectors)?)?;
     dict.set_item("sparse", sparse_to_pydict(py, &record.sparse)?)?;
     dict.set_item("metadata", metadata_to_pydict(py, &record.metadata)?)?;
+    dict.set_item("expires_at", record.expires_at)?;
     Ok(dict)
 }
 
@@ -1209,6 +1466,13 @@ fn parse_record_batch(
         let vectors = parse_optional_named_vectors_item(record.get_item("vectors")?)?;
         let sparse = parse_optional_sparse_item(record.get_item("sparse")?)?;
         let metadata = parse_optional_metadata_item(record.get_item("metadata")?)?;
+        let multi_vectors =
+            parse_optional_multi_vectors_item(py, record.get_item("multi_vectors")?)?;
+        let ttl = record
+            .get_item("ttl")?
+            .map(|v| v.extract::<f64>())
+            .transpose()?;
+        let expires_at = ttl_to_expires_at(ttl)?;
 
         parsed.push(Record {
             namespace,
@@ -1217,6 +1481,8 @@ fn parse_record_batch(
             vectors,
             sparse,
             metadata,
+            multi_vectors,
+            expires_at,
         });
     }
 
@@ -1260,6 +1526,41 @@ fn parse_optional_named_vectors_item(item: Option<Bound<'_, PyAny>>) -> PyResult
 
     let dict = item.downcast::<PyDict>()?;
     parse_named_vectors_dict(Some(&dict))
+}
+
+fn parse_optional_multi_vectors_item(
+    py: Python<'_>,
+    item: Option<Bound<'_, PyAny>>,
+) -> PyResult<MultiVectors> {
+    let Some(item) = item else {
+        return Ok(MultiVectors::new());
+    };
+    if item.is_none() {
+        return Ok(MultiVectors::new());
+    }
+    let dict = item.downcast::<PyDict>()?;
+    parse_multi_vectors_dict(py, Some(dict))
+}
+
+fn parse_multi_vectors_dict(
+    _py: Python<'_>,
+    dict: Option<&Bound<'_, PyDict>>,
+) -> PyResult<MultiVectors> {
+    let Some(dict) = dict else {
+        return Ok(MultiVectors::new());
+    };
+    let mut multi_vectors = MultiVectors::new();
+    for (key, value) in dict.iter() {
+        let space_name: String = key.extract()?;
+        let token_list = value.downcast::<PyList>()?;
+        let mut token_vectors = Vec::with_capacity(token_list.len());
+        for token_item in token_list.iter() {
+            let vec: Vec<f32> = token_item.extract()?;
+            token_vectors.push(vec);
+        }
+        multi_vectors.insert(space_name, token_vectors);
+    }
+    Ok(multi_vectors)
 }
 
 fn search_result_to_pydict<'py>(
@@ -1347,6 +1648,8 @@ fn search_stats_to_pydict<'py>(
     dict.set_item("ann_loaded_from_disk", stats.ann_loaded_from_disk)?;
     dict.set_item("wal_entries_replayed", stats.wal_entries_replayed)?;
     dict.set_item("fusion", &stats.fusion)?;
+    dict.set_item("effective_dimension", stats.effective_dimension)?;
+    dict.set_item("matryoshka_truncated", stats.matryoshka_truncated)?;
     dict.set_item("rerank_applied", false)?;
     dict.set_item("rerank_count", 0)?;
     let timings = PyDict::new(py);
@@ -1419,6 +1722,7 @@ fn build_query_payload<'py>(
     namespace: Option<&str>,
     all_namespaces: bool,
     vector_name: Option<&str>,
+    truncate_dim: Option<usize>,
     k: usize,
     fusion: &str,
     explain: bool,
@@ -1439,6 +1743,10 @@ fn build_query_payload<'py>(
     match vector_name {
         Some(vector_name) => dict.set_item("vector_name", vector_name)?,
         None => dict.set_item("vector_name", py.None())?,
+    }
+    match truncate_dim {
+        Some(truncate_dim) => dict.set_item("truncate_dim", truncate_dim)?,
+        None => dict.set_item("truncate_dim", py.None())?,
     }
     dict.set_item("all_namespaces", all_namespaces)?;
     dict.set_item("k", k)?;
@@ -1643,4 +1951,8 @@ fn parse_quantization_config(
             "unknown quantization method '{other}'. Expected: 'scalar', 'binary', or 'product'"
         ))),
     }
+}
+
+fn parse_payload_index_type(name: &str) -> PyResult<PayloadIndexType> {
+    PayloadIndexType::from_name(name).map_err(to_py_error)
 }

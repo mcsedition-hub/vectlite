@@ -8,7 +8,7 @@
 
 **Embedded vector store for local-first AI applications.**
 
-vectlite is a single-file vector database written in Rust with language bindings for Python and Node.js. Dense + sparse hybrid search, HNSW indexing, MongoDB-style metadata filters, transactions, crash-safe persistence, and file locking -- all in a portable `.vdb` file. No server, no Docker, no network calls.
+vectlite is a single-file vector database written in Rust with language bindings for Python and Node.js, plus experimental UniFFI bindings for Swift and Kotlin. Dense + sparse hybrid search, HNSW indexing, MongoDB-style metadata filters, transactions, crash-safe persistence, and file locking -- all in a portable `.vdb` file. No server, no Docker, no network calls.
 
 ## Install
 
@@ -43,6 +43,33 @@ Add to your `Cargo.toml`:
 vectlite = { path = "crates/vectlite-core" }
 ```
 
+### Swift (Experimental)
+
+The Swift package lives in `bindings/swift` and uses a UniFFI-generated wrapper plus `VectLiteFFI.xcframework`.
+
+```bash
+cd bindings/swift
+swift test
+```
+
+Rebuild the XCFramework after changing the Rust FFI surface:
+
+```bash
+cd bindings/swift
+./build-xcframework.sh --release
+```
+
+### Kotlin/JVM (Experimental)
+
+The Kotlin package lives in `bindings/kotlin` and compiles the UniFFI-generated source from `bindings/uniffi/generated/kotlin`.
+
+```bash
+cd bindings/kotlin
+gradle test
+```
+
+The Kotlin binding uses JNA to load `libvectlite_uniffi`; the Gradle test task builds the native library and sets `uniffi.component.vectlite.libraryOverride` automatically.
+
 ## Quick Start (Python)
 
 ```python
@@ -71,6 +98,66 @@ console.log(db.count({ filter: { source: 'blog' } }))
 db.close()
 ```
 
+## Quick Start (Swift)
+
+```swift
+import VectLite
+
+let db = try Database.openOrCreate(path: "knowledge.vdb", dimension: 384, metric: "cosine")
+
+try db.upsert(
+    id: "doc1",
+    vector: embedding,
+    metadataJson: #"{"source":"blog","title":"Auth Guide"}"#,
+    namespace: nil,
+    ttl: nil
+)
+
+let results = try db.search(
+    query: queryEmbedding,
+    k: 5,
+    filterJson: #"{"source":"blog"}"#,
+    namespace: nil,
+    sparseJson: nil,
+    fusion: nil,
+    denseWeight: nil,
+    sparseWeight: nil,
+    mmrLambda: nil
+)
+
+try db.close()
+```
+
+## Quick Start (Kotlin)
+
+```kotlin
+import uniffi.vectlite.Database
+
+val db = Database.openOrCreate("knowledge.vdb", 384u, "cosine")
+
+db.upsert(
+    "doc1",
+    embedding,
+    """{"source":"blog","title":"Auth Guide"}""",
+    null,
+    null,
+)
+
+val results = db.search(
+    queryEmbedding,
+    5u,
+    """{"source":"blog"}""",
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+)
+
+db.close()
+```
+
 ## Features
 
 ### Storage & Durability
@@ -86,13 +173,18 @@ db.close()
 - **Backup / Restore** -- full backup with ANN sidecars and restore to a new path
 - **Physical collections** -- `open_store()` manages a directory of independent databases
 - **Bulk ingestion** -- `bulk_ingest()` with deferred index rebuilds for fast imports
+- **TTL / Expiry** -- `set_ttl()` / `clear_ttl()` or `ttl=` on insert/upsert; expired records auto-filtered from reads and GC'd on compact
+- **Cursor-based pagination** -- `list_cursor()` for efficient iteration over large collections without offset overhead
+- **Schema validation** -- optional typed metadata schemas with sidecar persistence and validated write wrappers
 
 ### Search & Retrieval
 
-- **Dense vectors** -- cosine similarity with automatic HNSW indexing
+- **Distance metrics** -- cosine (default), euclidean (L2), dot product (inner product), manhattan (L1) with SIMD acceleration
+- **Dense vectors** -- automatic HNSW indexing with metric-aware distance functions
 - **Sparse vectors** -- BM25-scored inverted index for keyword retrieval
 - **Hybrid search** -- dense + sparse fusion via linear combination or reciprocal rank fusion (RRF)
 - **Vector quantization** -- scalar (int8, 4x), binary (32x), and product quantization (PQ) with 2-stage rescoring
+- **Multi-vector / ColBERT** -- late interaction search with per-token MaxSim scoring and 2-bit quantization (~16x compression)
 - **Named vectors** -- multiple vector spaces per record (`"title"`, `"body"`, ...)
 - **Multi-vector queries** -- weighted search across vector spaces in a single call
 - **MMR diversification** -- tunable relevance vs. diversity trade-off
@@ -106,21 +198,52 @@ db.close()
 - **Nested access** -- dot-path traversal (`author.name`), `$elemMatch`, `$size`
 - **Filtered counts & listing** -- scan records with `count(...)` and `list(...)` without running a vector search
 - **Delete by filter** -- remove whole slices of data with metadata filters plus optional namespace scoping
+- **Partial metadata updates** -- `update_metadata()` merges a patch into existing metadata without re-writing the vector or rebuilding indexes
+- **Payload indexes** -- keyword and numeric indexes on metadata fields accelerate filtered queries on large collections
 
 ### Reranking & Observability
 
 - **Built-in rerankers** -- `text_match()`, `metadata_boost()`, `cross_encoder()`, `bi_encoder()`
+- **ONNX cross-encoder** -- local reranking with `onnx_cross_encoder()` (ONNX Runtime, no PyTorch)
 - **Composable** -- chain rerankers sequentially or with RRF via `compose()`
 - **Search diagnostics** -- `search_with_stats()` returns timings, BM25 term scores, ANN stats
 - **Explain mode** -- per-result scoring breakdown with ranks, matched terms, and rerank traces
+- **OpenTelemetry** -- optional span-based tracing for search operations; `@opentelemetry/api` (Node) / `opentelemetry-api` (Python) loaded lazily, never a required dependency
 
 ### Text Processing
 
 - **Text helpers** -- `upsert_text()` and `search_text()` handle embedding + sparse terms
 - **Analyzers** -- configurable tokenizer pipeline with stopwords (en/fr), stemming (Snowball), n-grams, custom filters
 - **Weighted fields** -- `sparse_terms_weighted()` for per-field term boosting
+- **Embedding providers** -- plug-in factories for OpenAI, Cohere, Voyage, FastEmbed, Sentence Transformers, Ollama
+- **CLI** -- `python -m vectlite` or `vectlite` command: stats, list, dump, search, compact, verify, bench, import-jsonl, import-csv
+
+### Integrations
+
+- **LangChain** -- `vectlite.langchain.VectLiteVectorStore` drop-in vector store
+- **LlamaIndex** -- `vectlite.llamaindex.VectLiteVectorStore` drop-in vector store
 
 ## Python API
+
+### Distance Metrics
+
+```python
+# Default is cosine similarity
+db = vectlite.open("knowledge.vdb", dimension=384)
+
+# Choose a different metric at creation time
+db = vectlite.open("knowledge.vdb", dimension=384, metric="euclidean")  # L2 distance
+db = vectlite.open("knowledge.vdb", dimension=384, metric="dotproduct") # inner product
+db = vectlite.open("knowledge.vdb", dimension=384, metric="manhattan")  # L1 distance
+
+# Aliases work too: "l2", "dot", "ip", "l1"
+db = vectlite.open("knowledge.vdb", dimension=384, metric="l2")
+
+# Check the active metric
+print(db.metric)  # "euclidean"
+```
+
+The metric is persisted in the database file. Reopening an existing database automatically uses its original metric. Scores are always oriented so that **higher is better** (distance metrics are negated internally).
 
 ### Hybrid Search with Reranking
 
@@ -216,6 +339,9 @@ recent_docs = db.list(namespace="docs", filter={"stale": False}, limit=20)
 doc_count = db.count(namespace="docs", filter={"source": "blog"})
 deleted = db.delete_by_filter({"stale": True}, namespace="docs")
 
+# Partial metadata update (merge patch -- only touches specified keys)
+db.update_metadata("doc1", {"status": "reviewed", "score": 0.95})
+
 db.close()
 ```
 
@@ -261,9 +387,207 @@ db.disable_quantization()
 
 Quantization parameters persist across reopens in a `.vdb.quant` sidecar file. The quantized index auto-rebuilds on inserts and upserts.
 
+### Multi-Vector / ColBERT Search
+
+Store token-level embeddings (ColBERT, ColPali) and search with MaxSim late interaction scoring.
+
+```python
+# Upsert a document with per-token embeddings
+db.upsert_multi_vectors(
+    "doc1",
+    dense_vector,                              # standard dense embedding
+    {"colbert": [token_vec_1, token_vec_2, ...]},  # token-level vectors
+    metadata={"source": "paper"},
+)
+
+# MaxSim search: for each query token, find max cosine vs doc tokens, then sum
+results = db.search_multi_vector("colbert", query_token_vectors, k=10)
+
+# Enable 2-bit quantization for ColBERT tokens (~16x compression)
+db.enable_multi_vector_quantization("colbert")
+
+# Check status
+print(db.is_multi_vector_quantized("colbert"))  # True
+
+# Disable
+db.disable_multi_vector_quantization("colbert")
+```
+
+Multi-vector quantization parameters persist in `.vdb.mvquant.<space>` sidecar files and auto-rebuild on mutation.
+
+### TTL / Expiry
+
+Records can automatically expire after a time-to-live. Expired records are transparently filtered from all reads and permanently removed on `compact()`.
+
+```python
+# Set TTL on insert/upsert (seconds)
+db.upsert("session1", embedding, {"user": "alice"}, ttl=3600)  # expires in 1 hour
+
+# Set/clear TTL on existing records
+db.set_ttl("doc1", 86400)    # expire in 24 hours
+db.clear_ttl("doc1")          # remove expiry
+
+# Expired records are invisible to get/list/count/search
+record = db.get("session1")   # None after TTL elapses
+
+# compact() garbage-collects expired records from disk
+db.compact()
+```
+
+### Cursor-Based Pagination
+
+Efficiently iterate over large collections without offset overhead.
+
+```python
+# Paginate 100 records at a time
+cursor = None
+while True:
+    page = db.list_cursor(limit=100, cursor=cursor)
+    for record in page["records"]:
+        process(record)
+    cursor = page["cursor"]
+    if cursor is None:
+        break
+
+# Works with namespace and filter
+page = db.list_cursor(namespace="docs", filter={"source": "blog"}, limit=50)
+```
+
+### Embedding Providers
+
+Built-in factories for popular embedding APIs. Each provider lazily imports its SDK.
+
+```python
+from vectlite import embedders
+
+# OpenAI
+embed = embedders.openai(model="text-embedding-3-small", api_key="sk-...")
+
+# Sentence Transformers (local)
+embed = embedders.sentence_transformer("all-MiniLM-L6-v2")
+
+# Use with upsert_text / search_text
+vectlite.upsert_text(db, "doc1", "Auth setup guide", embed, {"source": "docs"})
+results = vectlite.search_text(db, "how to authenticate", embed, k=5)
+```
+
+Also available: `embedders.cohere()`, `embedders.voyage()`, `embedders.fastembed()`, `embedders.ollama()`.
+
+### Schema Validation
+
+Define typed metadata schemas for validation before writes.
+
+```python
+from vectlite import schema
+
+s = schema.Schema({
+    "price": "number",
+    "title": "string",
+    "tags": "array<string>",
+    "author": {"name": "string", "age": "number"},
+})
+
+s.validate({"price": 9.99, "title": "Hello"})           # OK
+s.validate({"price": "not a number"})                    # raises SchemaError
+
+# Persist alongside the database
+s.save(db)                    # writes knowledge.vdb.schema.json
+loaded = schema.load(db)     # reads it back
+
+# Validated wrapper auto-checks every write
+vdb = schema.validated(db, s)
+vdb.upsert("id", vector, {"price": 9.99})               # validates then writes
+```
+
+### OpenTelemetry (Python)
+
+Optional tracing for search operations. `opentelemetry-api` is loaded lazily -- not a runtime dependency.
+
+```python
+import vectlite
+
+# Auto-detect tracer from opentelemetry.trace if installed
+tracer = vectlite.configure_opentelemetry()
+
+# Or supply your own tracer / custom name
+vectlite.configure_opentelemetry({"tracer": my_tracer})
+vectlite.configure_opentelemetry({"tracer_name": "my-app"})
+
+# Disable
+vectlite.configure_opentelemetry(False)
+```
+
+### LangChain Integration
+
+```python
+from vectlite.langchain import VectLiteVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+store = VectLiteVectorStore(
+    path="knowledge.vdb",
+    embedding=OpenAIEmbeddings(),
+    dimension=1536,
+)
+store.add_texts(["Auth guide", "Billing docs"], metadatas=[{"source": "docs"}] * 2)
+results = store.similarity_search("authentication", k=5)
+```
+
+### LlamaIndex Integration
+
+```python
+from vectlite.llamaindex import VectLiteVectorStore
+from llama_index.core import VectorStoreIndex, StorageContext
+
+vector_store = VectLiteVectorStore(path="knowledge.vdb", dimension=1536)
+storage_context = StorageContext.from_defaults(vector_store=vector_store)
+index = VectorStoreIndex.from_documents(documents, storage_context=storage_context)
+```
+
+### CLI
+
+```bash
+# Database stats
+vectlite stats knowledge.vdb
+
+# List records (with optional filter)
+vectlite list knowledge.vdb --limit 20 --filter '{"source": "blog"}'
+
+# Stream all records via cursor pagination
+vectlite dump knowledge.vdb > backup.jsonl
+
+# Search (requires a JSON vector)
+vectlite search knowledge.vdb --vector '[0.1, 0.2, ...]' --k 10
+
+# Maintenance
+vectlite compact knowledge.vdb
+vectlite verify knowledge.vdb
+
+# Benchmarking
+vectlite bench knowledge.vdb --queries 1000
+
+# Import data
+vectlite import-jsonl knowledge.vdb data.jsonl --dimension 384
+vectlite import-csv knowledge.vdb data.csv --dimension 384 --vector-column embedding
+```
+
 ## Node.js API
 
-### Hybrid Search
+### Distance Metrics (Node)
+
+```js
+// Default is cosine similarity
+const db = vectlite.open('knowledge.vdb', { dimension: 384 })
+
+// Choose a different metric at creation time
+const db2 = vectlite.open('knowledge.vdb', { dimension: 384, metric: 'euclidean' })
+const db3 = vectlite.open('knowledge.vdb', { dimension: 384, metric: 'dotproduct' })
+const db4 = vectlite.open('knowledge.vdb', { dimension: 384, metric: 'manhattan' })
+
+// Check the active metric
+console.log(db2.metric) // "euclidean"
+```
+
+### Hybrid Search (Node)
 
 ```js
 const vectlite = require('vectlite')
@@ -286,7 +610,7 @@ const results = db.search(queryEmbedding, {
 })
 ```
 
-### Collections
+### Collections (Node)
 
 ```js
 const store = vectlite.openStore('./my_collections')
@@ -297,7 +621,7 @@ const logs = store.openOrCreateCollection('logs', 128)
 console.log(store.collections()) // ["logs", "products"]
 ```
 
-### Transactions
+### Transactions (Node)
 
 ```js
 const tx = db.transaction()
@@ -312,7 +636,7 @@ try {
 }
 ```
 
-### Text Helpers
+### Text Helpers (Node)
 
 ```js
 async function run() {
@@ -322,7 +646,7 @@ async function run() {
 }
 ```
 
-### Listing, Counts, and Lifecycle
+### Listing, Counts, and Lifecycle (Node)
 
 ```js
 const db = vectlite.open('knowledge.vdb', { dimension: 384, lockTimeout: 5 })
@@ -331,10 +655,13 @@ const docs = db.list({ namespace: 'docs', filter: { stale: false }, limit: 20 })
 const count = db.count({ namespace: 'docs', filter: { source: 'blog' } })
 const deleted = db.deleteByFilter({ stale: true }, { namespace: 'docs' })
 
+// Partial metadata update (merge patch -- only touches specified keys)
+db.updateMetadata('doc1', { status: 'reviewed', score: 0.95 })
+
 db.close()
 ```
 
-### Search Diagnostics
+### Search Diagnostics (Node)
 
 ```js
 const outcome = db.searchWithStats(query, {
@@ -348,7 +675,7 @@ console.log(outcome.stats.used_ann)     // true
 console.log(outcome.results[0].explain) // Detailed scoring breakdown
 ```
 
-### Vector Quantization
+### Vector Quantization (Node)
 
 ```js
 // Scalar quantization (int8) -- 4x memory reduction
@@ -368,13 +695,111 @@ console.log(db.quantizationMethod)  // "scalar", "binary", or "product"
 db.disableQuantization()
 ```
 
+### Multi-Vector / ColBERT Search (Node)
+
+```js
+// Upsert with per-token ColBERT embeddings
+db.upsertMultiVectors('doc1', denseVector,
+  JSON.stringify({ colbert: [tokenVec1, tokenVec2] }),
+  JSON.stringify({ metadata: { source: 'paper' } })
+)
+
+// MaxSim search
+const results = JSON.parse(
+  db.searchMultiVector('colbert', JSON.stringify(queryTokenVectors))
+)
+
+// Enable 2-bit quantization (~16x compression)
+db.enableMultiVectorQuantization('colbert')
+
+// Check and disable
+console.log(db.isMultiVectorQuantized('colbert'))  // true
+db.disableMultiVectorQuantization('colbert')
+```
+
+### TTL / Expiry (Node)
+
+```js
+// Set TTL on insert/upsert (seconds)
+db.upsert('session1', embedding, { user: 'alice' }, { ttl: 3600 }) // expires in 1 hour
+
+// Set/clear TTL on existing records
+db.setTtl('doc1', 86400)    // expire in 24 hours
+db.clearTtl('doc1')          // remove expiry
+
+// Expired records are invisible to get/list/count/search
+const record = db.get('session1') // null after TTL elapses
+
+// compact() garbage-collects expired records from disk
+db.compact()
+```
+
+### Cursor-Based Pagination (Node)
+
+```js
+// Paginate 100 records at a time
+let cursor = null
+do {
+  const page = db.listCursor({ limit: 100, cursor })
+  for (const record of page.records) {
+    process(record)
+  }
+  cursor = page.cursor
+} while (cursor !== null)
+
+// Works with namespace and filter
+const page = db.listCursor({ namespace: 'docs', filter: { source: 'blog' }, limit: 50 })
+```
+
+### Async API (Node)
+
+Non-blocking versions of heavy operations that run on the libuv threadpool.
+
+```js
+// Async search (returns a Promise)
+const results = await db.searchAsync(queryEmbedding, { k: 10, filter: { source: 'blog' } })
+
+// Async search with stats
+const outcome = await db.searchWithStatsAsync(queryEmbedding, { k: 10 })
+
+// Async maintenance
+await db.flushAsync()
+await db.compactAsync()
+
+// Async bulk ingestion
+const count = await db.bulkIngestAsync(records, { batchSize: 5000 })
+```
+
+### OpenTelemetry (Node)
+
+Optional tracing for search operations. `@opentelemetry/api` is loaded lazily -- not a runtime dependency.
+
+```js
+const vectlite = require('vectlite')
+
+// Auto-detect tracer from @opentelemetry/api if installed
+const tracer = vectlite.configureOpenTelemetry()
+
+// Or supply your own tracer / custom name
+vectlite.configureOpenTelemetry({ tracer: myTracer })
+vectlite.configureOpenTelemetry({ tracerName: 'my-app' })
+
+// Disable
+vectlite.configureOpenTelemetry(false)
+```
+
 ## Rust API
 
 ```rust
-use vectlite::Database;
+use vectlite::{Database, DistanceMetric};
 
 fn main() -> vectlite::Result<()> {
+    // Default cosine metric
     let mut db = Database::open_or_create("knowledge.vdb", 384)?;
+
+    // Or choose a specific metric
+    let mut db = Database::open_or_create_with_metric("knowledge.vdb", 384, DistanceMetric::Euclidean)?;
+    println!("metric: {}", db.metric()); // "euclidean"
 
     let mut metadata = vectlite::Metadata::new();
     metadata.insert("source".into(), "blog".into());
@@ -408,13 +833,16 @@ cargo run -p vectlite-cli -- search demo.vdb 1.0,0.0,0.0 5 title~auth
 
 ## Repository Layout
 
-```
+```text
 crates/
   vectlite-core/    # Rust storage engine (the reusable core)
   vectlite-cli/     # CLI for smoke testing and file inspection
 bindings/
   python/           # Python package (PyO3 + maturin)
   node/             # Node.js package (napi-rs)
+  uniffi/           # Shared UniFFI crate and generated Swift/Kotlin bindings
+  swift/            # Swift Package + XCFramework
+  kotlin/           # Kotlin/JVM Gradle package
 scripts/            # Release and CI scripts
 .github/workflows/  # CI: cross-platform wheel builds, tests
 ```
@@ -429,6 +857,8 @@ Each database consists of:
 | `*.vdb.wal` | Write-ahead log for crash-safe recovery |
 | `*.vdb.ann.*` | HNSW sidecar files (acceleration artifacts, regenerated if missing) |
 | `*.vdb.quant` | Quantization parameters (calibration ranges, PQ codebooks) |
+| `*.vdb.mvquant.*` | Multi-vector quantization parameters (2-bit boundaries per space) |
+| `*.vdb.schema.json` | Optional typed metadata schema (JSON sidecar for schema validation) |
 | `*.vdb.lock` | Advisory lock file for concurrency control |
 
 The snapshot + WAL are the source of truth. ANN and quantization sidecars are acceleration artifacts that are regenerated if missing. Small collections (<128 records) use exact dense search.
@@ -439,8 +869,8 @@ The snapshot + WAL are the source of truth. ANN and quantization sidecars are ac
 |----------|--------|---------|
 | Python | Available | [`pip install vectlite`](https://pypi.org/project/vectlite/) |
 | Node.js | Available | [`npm install vectlite`](https://www.npmjs.com/package/vectlite) |
-| Swift | Planned | After FFI layer stabilizes |
-| Kotlin | Planned | After FFI layer stabilizes |
+| Swift | Experimental | `bindings/swift` |
+| Kotlin/JVM | Experimental | `bindings/kotlin` |
 
 ## Contributing
 
@@ -465,6 +895,14 @@ pytest bindings/python/tests/
 # Node.js development
 cd bindings/node
 npm test
+
+# Swift UniFFI smoke tests
+cd bindings/swift
+swift test
+
+# Kotlin UniFFI smoke tests
+cd bindings/kotlin
+gradle test
 ```
 
 ## Links

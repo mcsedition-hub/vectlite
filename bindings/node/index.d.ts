@@ -21,6 +21,7 @@ export interface Record {
   vectors: NamedVectors
   sparse: SparseVector
   metadata: Metadata
+  expires_at: number | null
 }
 
 export interface SearchTimings {
@@ -41,6 +42,8 @@ export interface SearchStats {
   ann_loaded_from_disk: boolean
   wal_entries_replayed: number
   fusion: string
+  effective_dimension: number
+  matryoshka_truncated: boolean
   rerank_applied: boolean
   rerank_count: number
   timings: SearchTimings
@@ -80,6 +83,7 @@ export interface WriteOptions {
   namespace?: string | null
   sparse?: SparseVector | null
   vectors?: NamedVectors | null
+  ttl?: number | null
 }
 
 export interface CountOptions {
@@ -90,6 +94,16 @@ export interface CountOptions {
 export interface ListOptions extends CountOptions {
   limit?: number | null
   offset?: number | null
+}
+
+export interface ListCursorOptions extends CountOptions {
+  limit?: number | null
+  cursor?: string | null
+}
+
+export interface ListCursorResult {
+  records: Record[]
+  cursor: string | null
 }
 
 export interface BulkIngestOptions {
@@ -110,15 +124,19 @@ export interface SearchOptions {
   vectorName?: string | null
   fusion?: 'linear' | 'rrf'
   rrfK?: number
+  truncateDim?: number | null
   explain?: boolean
   queryVectors?: { [name: string]: number[] } | null
   vectorWeights?: { [name: string]: number } | null
 }
 
+export type DistanceMetric = 'cosine' | 'euclidean' | 'dotproduct' | 'manhattan' | 'l2' | 'dot' | 'ip' | 'l1'
+
 export interface OpenOptions {
   dimension?: number | null
   readOnly?: boolean
   lockTimeout?: number | null
+  metric?: DistanceMetric | null
 }
 
 export class VectLiteError extends Error {}
@@ -139,12 +157,14 @@ export class Database {
   readonly path: string
   readonly walPath: string
   readonly dimension: number
+  readonly metric: string
   readonly readOnly: boolean
 
   count(options?: CountOptions): number
   namespaces(): string[]
   close(): void
   list(options?: ListOptions): Record[]
+  listCursor(options?: ListCursorOptions): ListCursorResult
   transaction(): Transaction
   insert(id: string, vector: number[], metadata?: Metadata | null, options?: WriteOptions): void
   upsert(id: string, vector: number[], metadata?: Metadata | null, options?: WriteOptions): void
@@ -155,12 +175,23 @@ export class Database {
   delete(id: string, options?: { namespace?: string | null }): boolean
   deleteMany(ids: string[], options?: { namespace?: string | null }): number
   deleteByFilter(filter: Filter, options?: { namespace?: string | null }): number
+  updateMetadata(id: string, metadata: Metadata, options?: { namespace?: string | null }): boolean
+  setTtl(id: string, ttl: number, options?: { namespace?: string | null }): boolean
+  clearTtl(id: string, options?: { namespace?: string | null }): boolean
+  createIndex(field: string, indexType: 'keyword' | 'numeric'): boolean
+  dropIndex(field: string): boolean
+  listIndexes(): Array<{ field: string; type: 'keyword' | 'numeric' }>
   flush(): void
   compact(): void
   snapshot(dest: string): void
   backup(dest: string): void
   search(query?: number[] | null, options?: SearchOptions): SearchResult[]
   searchWithStats(query?: number[] | null, options?: SearchOptions): SearchResponse
+  searchAsync(query?: number[] | null, options?: SearchOptions): Promise<SearchResult[]>
+  searchWithStatsAsync(query?: number[] | null, options?: SearchOptions): Promise<SearchResponse>
+  flushAsync(): Promise<void>
+  compactAsync(): Promise<void>
+  bulkIngestAsync(records: Record[], options?: BulkIngestOptions): Promise<number>
 }
 
 export class Store {
@@ -176,6 +207,30 @@ export class Store {
 export function open(path: string, options?: OpenOptions): Database
 export function openStore(root: string): Store
 export function restore(source: string, dest: string): Database
+export interface OpenTelemetryOptions {
+  /** Pass `false` or `{ enabled: false }` to disable tracing. */
+  enabled?: boolean
+  /** Supply your own OTel `Tracer` instance. */
+  tracer?: unknown
+  /** Tracer name used when auto-resolving via `@opentelemetry/api`. Defaults to `'vectlite'`. */
+  tracerName?: string
+}
+
+/**
+ * Configure optional OpenTelemetry tracing for search operations.
+ *
+ * When a tracer is active, every `search`, `searchWithStats`, `searchAsync`,
+ * and `searchWithStatsAsync` call is wrapped in a span with semantic
+ * `db.system` / `db.operation.name` attributes and search-specific metrics.
+ *
+ * `@opentelemetry/api` is loaded lazily via `require()` -- it is **not** a
+ * runtime dependency. If the package is not installed the function returns
+ * `null` and search calls remain un-instrumented.
+ *
+ * @returns The resolved tracer, or `null` if tracing could not be configured.
+ */
+export function configureOpenTelemetry(options?: OpenTelemetryOptions | false): unknown | null
+
 export function sparseTerms(text: string): SparseVector
 export function upsertText(
   db: Database,
