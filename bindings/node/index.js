@@ -182,7 +182,59 @@ function withSearchSpan(query, options, fn) {
 }
 
 function asArray(values) {
+  if (
+    values != null &&
+    typeof values === 'object' &&
+    !Array.isArray(values) &&
+    !ArrayBuffer.isView(values) &&
+    typeof values[Symbol.iterator] !== 'function' &&
+    typeof values.length !== 'number'
+  ) {
+    throw new TypeError('vector must be an array-like or iterable of numbers')
+  }
   return Array.from(values)
+}
+
+function encodeNativeOptions(value) {
+  return typeof value === 'string' ? value : encode(value)
+}
+
+const SEARCH_OPTION_KEYS = new Set([
+  'query',
+  'k',
+  'filter',
+  'namespace',
+  'allNamespaces',
+  'sparse',
+  'denseWeight',
+  'sparseWeight',
+  'fetchK',
+  'mmrLambda',
+  'vectorName',
+  'fusion',
+  'rrfK',
+  'truncateDim',
+  'explain',
+  'queryVectors',
+  'vectorWeights',
+])
+
+function isSearchRequestObject(value) {
+  return (
+    value != null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    !ArrayBuffer.isView(value) &&
+    [...SEARCH_OPTION_KEYS].some((key) => Object.prototype.hasOwnProperty.call(value, key))
+  )
+}
+
+function normalizeSearchArgs(query, options) {
+  if (isSearchRequestObject(query) && (options == null || Object.keys(options).length === 0)) {
+    const { query: normalizedQuery = null, ...normalizedOptions } = query
+    return { query: normalizedQuery, options: normalizedOptions }
+  }
+  return { query, options: options ?? {} }
 }
 
 function isPromiseLike(value) {
@@ -406,6 +458,52 @@ class Database {
     return wrapError(() => decode(this._native.listIndexes()))
   }
 
+  enableQuantization(method = 'scalar', options = {}) {
+    return wrapError(() => this._native.enableQuantization(method, encodeNativeOptions(options)))
+  }
+
+  disableQuantization() {
+    return wrapError(() => this._native.disableQuantization())
+  }
+
+  get isQuantized() {
+    return wrapError(() => this._native.isQuantized)
+  }
+
+  get quantizationMethod() {
+    return wrapError(() => this._native.quantizationMethod)
+  }
+
+  validNumSubVectors() {
+    return wrapError(() => this._native.validNumSubVectors())
+  }
+
+  upsertMultiVectors(id, vector, multiVectors, options = {}) {
+    return wrapError(() =>
+      this._native.upsertMultiVectors(id, asArray(vector), encode(multiVectors), encode(options)),
+    )
+  }
+
+  searchMultiVector(space, queryTokens, options = {}) {
+    return wrapError(() =>
+      decode(this._native.searchMultiVector(space, encode(queryTokens), encode(options))),
+    )
+  }
+
+  enableMultiVectorQuantization(space, options = {}) {
+    return wrapError(() =>
+      this._native.enableMultiVectorQuantization(space, encodeNativeOptions(options)),
+    )
+  }
+
+  disableMultiVectorQuantization(space) {
+    return wrapError(() => this._native.disableMultiVectorQuantization(space))
+  }
+
+  isMultiVectorQuantized(space) {
+    return wrapError(() => this._native.isMultiVectorQuantized(space))
+  }
+
   flush() {
     return wrapError(() => this._native.flush())
   }
@@ -423,31 +521,53 @@ class Database {
   }
 
   search(query = null, options = {}) {
-    return withSearchSpan(query, options, () =>
-      wrapError(() => decode(this._native.search(query == null ? null : asArray(query), encode(options)))),
+    const normalized = normalizeSearchArgs(query, options)
+    return withSearchSpan(normalized.query, normalized.options, () =>
+      wrapError(() =>
+        decode(
+          this._native.search(
+            normalized.query == null ? null : asArray(normalized.query),
+            encode(normalized.options),
+          ),
+        ),
+      ),
     )
   }
 
   searchWithStats(query = null, options = {}) {
-    return withSearchSpan(query, options, () =>
+    const normalized = normalizeSearchArgs(query, options)
+    return withSearchSpan(normalized.query, normalized.options, () =>
       wrapError(() =>
-        decode(this._native.searchWithStats(query == null ? null : asArray(query), encode(options))),
+        decode(
+          this._native.searchWithStats(
+            normalized.query == null ? null : asArray(normalized.query),
+            encode(normalized.options),
+          ),
+        ),
       ),
     )
   }
 
   searchAsync(query = null, options = {}) {
-    return withSearchSpan(query, options, () =>
+    const normalized = normalizeSearchArgs(query, options)
+    return withSearchSpan(normalized.query, normalized.options, () =>
       wrapAsync(
-        this._native.searchAsync(query == null ? null : asArray(query), encode(options)),
+        this._native.searchAsync(
+          normalized.query == null ? null : asArray(normalized.query),
+          encode(normalized.options),
+        ),
       ).then(decode),
     )
   }
 
   searchWithStatsAsync(query = null, options = {}) {
-    return withSearchSpan(query, options, () =>
+    const normalized = normalizeSearchArgs(query, options)
+    return withSearchSpan(normalized.query, normalized.options, () =>
       wrapAsync(
-        this._native.searchWithStatsAsync(query == null ? null : asArray(query), encode(options)),
+        this._native.searchWithStatsAsync(
+          normalized.query == null ? null : asArray(normalized.query),
+          encode(normalized.options),
+        ),
       ).then(decode),
     )
   }
@@ -498,6 +618,10 @@ class Store {
 
   collections() {
     return wrapError(() => this._native.collections())
+  }
+
+  close() {
+    return wrapError(() => this._native.close())
   }
 }
 

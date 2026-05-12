@@ -1028,7 +1028,7 @@ fn parse_quantization_config(
                 .and_then(Value::as_u64)
                 .unwrap_or(10) as usize,
         })),
-        "product" => Ok(QuantizationConfig::Product(ProductQuantizationConfig {
+        "product" | "pq" => Ok(QuantizationConfig::Product(ProductQuantizationConfig {
             num_sub_vectors: opts
                 .get("numSubVectors")
                 .or_else(|| opts.get("num_sub_vectors"))
@@ -1051,7 +1051,7 @@ fn parse_quantization_config(
                 .unwrap_or(4) as usize,
         })),
         other => Err(json_err(format!(
-            "unknown quantization method: {other}; valid: scalar, binary, product"
+            "unknown quantization method: {other}; valid: scalar, binary, product (alias: pq)"
         ))),
     }
 }

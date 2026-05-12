@@ -9,6 +9,7 @@ use serde_json::{Map, Number, Value, json};
 use vectlite::quantization::{
     BinaryQuantizationConfig, MultiVectorQuantizationConfig, ProductQuantizationConfig,
     QuantizationConfig, ScalarQuantizationConfig, TwoBitQuantizationConfig,
+    default_product_num_sub_vectors,
 };
 use vectlite::{
     Database as CoreDatabase, DistanceMetric, FusionStrategy, HybridSearchOptions, Metadata,
@@ -108,6 +109,13 @@ impl NativeStore {
     #[napi]
     pub fn collections(&self) -> Result<Vec<String>> {
         self.inner.collections().map_err(to_napi_error)
+    }
+
+    /// Close the store. This is a no-op (the store holds no open file handles)
+    /// but is provided for symmetry with `Database.close()`.
+    #[napi]
+    pub fn close(&self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -477,14 +485,15 @@ impl NativeDatabase {
         let method = method.as_deref().unwrap_or("scalar");
         let (rescore_multiplier, num_sub_vectors, num_centroids, training_iterations) =
             parse_quantization_options(options_json.as_deref())?;
+        let mut database = self.write_open()?;
         let config = build_quantization_config(
             method,
             rescore_multiplier,
             num_sub_vectors,
             num_centroids,
             training_iterations,
+            database.dimension(),
         )?;
-        let mut database = self.write_open()?;
         database.enable_quantization(config).map_err(to_napi_error)
     }
 
@@ -511,6 +520,23 @@ impl NativeDatabase {
             QuantizationConfig::Binary(_) => "binary".to_owned(),
             QuantizationConfig::Product(_) => "product".to_owned(),
         }))
+    }
+
+    /// Returns valid Product Quantization num_sub_vectors values for this database.
+    #[napi(js_name = "validNumSubVectors")]
+    pub fn valid_num_sub_vectors(&self) -> Result<Vec<u32>> {
+        let database = self.read()?;
+        database
+            .valid_num_sub_vectors()
+            .into_iter()
+            .map(|value| {
+                u32::try_from(value).map_err(|_| {
+                    to_napi_error(vectlite::VectLiteError::InvalidFormat(
+                        "num_sub_vectors value exceeds u32".to_owned(),
+                    ))
+                })
+            })
+            .collect()
     }
 
     // ---- Multi-vector / ColBERT-style late interaction ----
@@ -655,6 +681,7 @@ impl NativeDatabase {
                 .to_string();
             let rescore = opts
                 .get("rescoreMultiplier")
+                .or_else(|| opts.get("rescore_multiplier"))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
             (method, rescore)
@@ -1998,22 +2025,34 @@ fn build_quantization_config(
     num_sub_vectors: Option<usize>,
     num_centroids: Option<usize>,
     training_iterations: Option<usize>,
+    dimension: usize,
 ) -> Result<QuantizationConfig> {
-    match method {
-        "scalar" | "int8" => Ok(QuantizationConfig::Scalar(ScalarQuantizationConfig {
-            rescore_multiplier: rescore_multiplier.unwrap_or(5),
-        })),
-        "binary" => Ok(QuantizationConfig::Binary(BinaryQuantizationConfig {
-            rescore_multiplier: rescore_multiplier.unwrap_or(10),
-        })),
-        "product" | "pq" => Ok(QuantizationConfig::Product(ProductQuantizationConfig {
-            num_sub_vectors: num_sub_vectors.unwrap_or(16),
-            num_centroids: num_centroids.unwrap_or(256),
-            training_iterations: training_iterations.unwrap_or(20),
-            rescore_multiplier: rescore_multiplier.unwrap_or(10),
-        })),
-        other => Err(err(format!(
-            "unknown quantization method '{other}'. Expected: 'scalar', 'binary', or 'product'"
+    let normalized = method.to_ascii_lowercase();
+    match normalized.as_str() {
+        "scalar" | "int8" => {
+            let default = ScalarQuantizationConfig::default();
+            Ok(QuantizationConfig::Scalar(ScalarQuantizationConfig {
+                rescore_multiplier: rescore_multiplier.unwrap_or(default.rescore_multiplier),
+            }))
+        }
+        "binary" => {
+            let default = BinaryQuantizationConfig::default();
+            Ok(QuantizationConfig::Binary(BinaryQuantizationConfig {
+                rescore_multiplier: rescore_multiplier.unwrap_or(default.rescore_multiplier),
+            }))
+        }
+        "product" | "pq" => {
+            let default = ProductQuantizationConfig::default();
+            Ok(QuantizationConfig::Product(ProductQuantizationConfig {
+                num_sub_vectors: num_sub_vectors
+                    .unwrap_or_else(|| default_product_num_sub_vectors(dimension)),
+                num_centroids: num_centroids.unwrap_or(default.num_centroids),
+                training_iterations: training_iterations.unwrap_or(default.training_iterations),
+                rescore_multiplier: rescore_multiplier.unwrap_or(default.rescore_multiplier),
+            }))
+        }
+        _ => Err(err(format!(
+            "unknown quantization method '{method}'. Expected: 'scalar', 'binary', or 'pq' (alias: 'product')"
         ))),
     }
 }

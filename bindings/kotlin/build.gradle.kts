@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "org.mcsedition"
-version = "0.9.0"
+version = "0.9.1"
 
 val workspaceDir = layout.projectDirectory.dir("../..").asFile
 val nativeProfile = providers.gradleProperty("nativeProfile").orElse("debug").get()
@@ -49,6 +49,10 @@ val prepareUniffiKotlin by tasks.registering {
 }
 
 kotlin {
+    // Pin the JVM toolchain so Gradle auto-provisions a compatible JDK
+    // regardless of what JAVA_HOME points to.  Without this, JDK 25+
+    // causes Kotlin 2.0.x to crash during compilation.
+    jvmToolchain(17)
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }

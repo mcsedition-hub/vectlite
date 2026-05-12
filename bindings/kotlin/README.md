@@ -8,6 +8,11 @@ The generated Kotlin source lives in `../uniffi/generated/kotlin` and is compile
 -Duniffi.component.vectlite.libraryOverride=/absolute/path/to/libvectlite_uniffi.dylib
 ```
 
+## Requirements
+
+- **JDK 17+** -- the build uses `jvmToolchain(17)`, so Gradle will auto-provision a compatible JDK even if `JAVA_HOME` points to a newer version (e.g. JDK 25).
+- **Rust toolchain** -- Cargo is invoked automatically by the `buildNative` Gradle task.
+
 ## Development
 
 ```bash

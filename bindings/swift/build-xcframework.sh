@@ -42,10 +42,29 @@ TARGETS=(
     x86_64-apple-ios            # iOS simulator x86_64
 )
 
-# Build each target
+# Deployment targets — keep in sync with Package.swift platforms.
+MACOS_DEPLOYMENT_TARGET="12.0"
+IOS_DEPLOYMENT_TARGET="15.0"
+
+# Build each target with the correct deployment target so the resulting
+# binaries don't carry a higher minimum OS version than what Package.swift
+# declares.  Without this, the XCFramework inherits the build machine's OS
+# version, producing linker warnings (or load failures) on older systems.
 for target in "${TARGETS[@]}"; do
     echo "--- Building for $target ---"
-    cargo build -p vectlite-uniffi $CARGO_FLAG --target "$target"
+    case "$target" in
+        *-apple-darwin*)
+            MACOSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
+                cargo build -p vectlite-uniffi $CARGO_FLAG --target "$target"
+            ;;
+        *-apple-ios*)
+            IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+                cargo build -p vectlite-uniffi $CARGO_FLAG --target "$target"
+            ;;
+        *)
+            cargo build -p vectlite-uniffi $CARGO_FLAG --target "$target"
+            ;;
+    esac
 done
 
 LIB_NAME="libvectlite_uniffi.a"

@@ -860,7 +860,8 @@ def test_scalar_quantization(tmp_path: Path) -> None:
 
     # Enable scalar quantization
     db.enable_quantization("scalar", rescore_multiplier=5)
-    assert db.is_quantized is True
+    assert callable(db.is_quantized)
+    assert db.is_quantized() is True
     assert db.quantization_method == "scalar"
 
     # Search should return correct results
@@ -873,7 +874,7 @@ def test_scalar_quantization(tmp_path: Path) -> None:
     # Close and reopen: quantization should persist
     db.close()
     db2 = vectlite.open(str(path))
-    assert db2.is_quantized is True
+    assert db2.is_quantized() is True
     assert db2.quantization_method == "scalar"
     results2 = db2.search(query, k=5)
     assert results2[0]["id"] == "doc0"
@@ -896,6 +897,34 @@ def test_binary_quantization(tmp_path: Path) -> None:
     results = db.search(query, k=5)
     assert results[0]["id"] == "doc0"
     db.close()
+
+
+def test_quantization_rescore_multiplier_controls_candidate_count(tmp_path: Path) -> None:
+    """rescore_multiplier controls the exact-rescore candidate budget."""
+    for method in ("scalar", "binary"):
+        path = tmp_path / f"quant_rescore_{method}.vdb"
+        db = vectlite.open(str(path), dimension=32)
+
+        records = []
+        for i in range(200):
+            vector = [1.0 if (i * 17 + j * 31) % 23 < 11 else -1.0 for j in range(32)]
+            records.append({"id": f"doc{i}", "vector": vector})
+        db.upsert_many(records)
+
+        query = records[0]["vector"]
+
+        db.enable_quantization(method, rescore_multiplier=1)
+        outcome = db.search_with_stats(query, k=10)
+        assert outcome["stats"]["used_ann"] is True
+        assert outcome["stats"]["ann_candidate_count"] == 10
+
+        db.disable_quantization()
+        db.enable_quantization(method, rescore_multiplier=4)
+        outcome = db.search_with_stats(query, k=10)
+        assert outcome["stats"]["used_ann"] is True
+        assert outcome["stats"]["ann_candidate_count"] == 40
+
+        db.close()
 
 
 def test_product_quantization(tmp_path: Path) -> None:
@@ -921,6 +950,34 @@ def test_product_quantization(tmp_path: Path) -> None:
     db.close()
 
 
+def test_product_quantization_invalid_subvectors_returns_vectlite_error(tmp_path: Path) -> None:
+    """Invalid PQ partitioning returns a typed error instead of a Rust panic."""
+    path = tmp_path / "quant_pq_invalid_subvectors.vdb"
+    db = vectlite.open(str(path), dimension=146)
+
+    assert db.valid_num_sub_vectors() == [1, 2, 73, 146]
+
+    for i in range(8):
+        db.upsert(f"doc{i}", [0.1 + (i + j) / 100.0 for j in range(146)])
+
+    with pytest.raises(
+        vectlite.VectLiteError,
+        match=r"dimension \(146\) must be divisible by num_sub_vectors \(7\)",
+    ):
+        db.enable_quantization(
+            "pq",
+            num_sub_vectors=7,
+            num_centroids=4,
+            training_iterations=1,
+        )
+
+    assert db.is_quantized() is False
+
+    db.enable_quantization("PQ", num_centroids=4, training_iterations=1)
+    assert db.quantization_method == "product"
+    db.close()
+
+
 def test_disable_quantization(tmp_path: Path) -> None:
     """Disabling quantization removes sidecar and stops quantized search."""
     path = tmp_path / "quant_disable.vdb"
@@ -930,10 +987,10 @@ def test_disable_quantization(tmp_path: Path) -> None:
         db.upsert(f"doc{i}", [float(i + j) for j in range(8)])
 
     db.enable_quantization("scalar")
-    assert db.is_quantized is True
+    assert db.is_quantized() is True
 
     db.disable_quantization()
-    assert db.is_quantized is False
+    assert db.is_quantized() is False
     assert db.quantization_method is None
 
     # Search still works without quantization
@@ -959,7 +1016,10 @@ def test_quantization_invalid_method_raises(tmp_path: Path) -> None:
     db = vectlite.open(str(path), dimension=4)
     db.upsert("doc1", [1.0, 0.0, 0.0, 0.0])
 
-    with pytest.raises(ValueError, match="unknown quantization method"):
+    with pytest.raises(
+        ValueError,
+        match=r"Expected: 'scalar', 'binary', or 'pq' \(alias: 'product'\)",
+    ):
         db.enable_quantization("invalid_method")
 
     db.close()
@@ -2026,3 +2086,67 @@ def test_validated_database(tmp_path: Path) -> None:
     # doc2 should NOT have been written
     assert vdb.get("doc2") is None
     db.close()
+
+
+# -------------------------------------------------------------------
+# Bug #14: zero-norm query vector should be rejected for cosine
+# -------------------------------------------------------------------
+
+
+def test_search_zero_norm_query_raises(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "zero.vdb"), dimension=3)
+    db.upsert("a", [1.0, 0.0, 0.0])
+    db.upsert("b", [0.0, 1.0, 0.0])
+
+    with pytest.raises(vectlite.VectLiteError, match="zero norm"):
+        db.search([0.0, 0.0, 0.0], k=5)
+    db.close()
+
+
+def test_search_zero_norm_euclidean_allowed(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "zero-euc.vdb"), dimension=3, metric="euclidean")
+    db.upsert("a", [1.0, 0.0, 0.0])
+    results = db.search([0.0, 0.0, 0.0], k=5)
+    assert len(results) == 1
+    db.close()
+
+
+# -------------------------------------------------------------------
+# Bug #15: dimension mismatch in search query should be rejected
+# -------------------------------------------------------------------
+
+
+def test_search_wrong_dimension_raises(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "dim.vdb"), dimension=4)
+    db.upsert("a", [1.0, 0.0, 0.0, 0.0])
+
+    # Undersized query (dim=2 vs db dim=4)
+    with pytest.raises(vectlite.VectLiteError, match="dimension mismatch"):
+        db.search([1.0, 0.0], k=5)
+
+    # Oversized query (dim=6 vs db dim=4)
+    with pytest.raises(vectlite.VectLiteError, match="dimension mismatch"):
+        db.search([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], k=5)
+    db.close()
+
+
+def test_search_undersized_query_with_truncate_dim_ok(tmp_path: Path) -> None:
+    db = vectlite.open(str(tmp_path / "dim-trunc.vdb"), dimension=4)
+    db.upsert("a", [1.0, 0.0, 0.0, 0.0])
+    results = db.search([1.0, 0.0], k=5, truncate_dim=2)
+    assert len(results) == 1
+    db.close()
+
+
+# -------------------------------------------------------------------
+# Bug #16: Store.close() should exist
+# -------------------------------------------------------------------
+
+
+def test_store_has_close(tmp_path: Path) -> None:
+    store = vectlite.open_store(str(tmp_path / "store"))
+    db = store.create_collection("c", 3)
+    db.upsert("a", [1.0, 0.0, 0.0])
+    db.close()
+    # Store.close() should not raise
+    store.close()

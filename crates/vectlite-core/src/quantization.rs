@@ -1,14 +1,16 @@
 //! Vector quantization module for memory-efficient similarity search.
 //!
 //! Supports three quantization strategies:
-//! - **Scalar (int8)**: 4x memory reduction with minimal recall loss
-//! - **Binary**: 32x memory reduction, uses Hamming distance for fast filtering
+//! - **Scalar (int8)**: compact in-memory candidate index with minimal recall loss
+//! - **Binary**: smallest in-memory candidate index, uses Hamming distance for fast filtering
 //! - **Product Quantization (PQ)**: Configurable compression for very large datasets
 //!
 //! All strategies support a 2-stage pipeline: fast quantized search followed by
 //! exact float32 rescoring of top candidates.
 
-use std::io::{Read, Write};
+use std::io::{Error, ErrorKind, Read, Write};
+
+use crate::{DistanceMetric, Result, VectLiteError};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -18,10 +20,10 @@ use std::io::{Read, Write};
 #[derive(Clone, Debug, PartialEq)]
 pub enum QuantizationConfig {
     /// Scalar quantization: maps each f32 dimension to int8 using per-dimension
-    /// min/max calibration. 4x memory reduction.
+    /// min/max calibration for a compact in-memory candidate index.
     Scalar(ScalarQuantizationConfig),
     /// Binary quantization: maps each f32 dimension to a single bit.
-    /// 32x memory reduction. Best for high-dimensional normalized embeddings.
+    /// Smallest in-memory candidate index. Best for high-dimensional normalized embeddings.
     Binary(BinaryQuantizationConfig),
     /// Product quantization: splits vector into sub-vectors and quantizes each
     /// to a centroid index. Highest compression for large datasets.
@@ -31,14 +33,14 @@ pub enum QuantizationConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScalarQuantizationConfig {
     /// Number of top candidates from quantized search to rescore with float32.
-    /// Default: 5x top_k (minimum 100).
+    /// Default: 10x top_k.
     pub rescore_multiplier: usize,
 }
 
 impl Default for ScalarQuantizationConfig {
     fn default() -> Self {
         Self {
-            rescore_multiplier: 5,
+            rescore_multiplier: 10,
         }
     }
 }
@@ -46,7 +48,7 @@ impl Default for ScalarQuantizationConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BinaryQuantizationConfig {
     /// Number of top candidates from Hamming search to rescore with float32.
-    /// Default: 10x top_k (minimum 100).
+    /// Default: 10x top_k.
     pub rescore_multiplier: usize,
 }
 
@@ -69,6 +71,7 @@ pub struct ProductQuantizationConfig {
     /// Number of k-means training iterations.
     pub training_iterations: usize,
     /// Number of top candidates from PQ search to rescore with float32.
+    /// Default: 10x top_k.
     pub rescore_multiplier: usize,
 }
 
@@ -81,6 +84,53 @@ impl Default for ProductQuantizationConfig {
             rescore_multiplier: 10,
         }
     }
+}
+
+/// Choose a valid default PQ sub-vector count for a database dimension.
+///
+/// Prefer the historical default of 16 when possible, then fall back to smaller
+/// common divisors so dimensions such as 100, 146, and 200 do not require an
+/// explicit `num_sub_vectors`.
+pub fn default_product_num_sub_vectors(dimension: usize) -> usize {
+    [16, 12, 10, 8, 6, 4, 3, 2, 1]
+        .into_iter()
+        .find(|candidate| dimension % candidate == 0)
+        .unwrap_or(1)
+}
+
+/// List every valid PQ sub-vector count for a database dimension.
+pub fn valid_product_num_sub_vectors(dimension: usize) -> Vec<usize> {
+    if dimension == 0 {
+        return Vec::new();
+    }
+
+    (1..=dimension)
+        .filter(|candidate| dimension % candidate == 0)
+        .collect()
+}
+
+/// Validate quantization settings before an index build can panic.
+pub fn validate_quantization_config(config: &QuantizationConfig, dimension: usize) -> Result<()> {
+    if let QuantizationConfig::Product(cfg) = config {
+        if cfg.num_sub_vectors == 0 {
+            return Err(VectLiteError::InvalidFormat(
+                "num_sub_vectors must be greater than 0".to_owned(),
+            ));
+        }
+        if dimension % cfg.num_sub_vectors != 0 {
+            return Err(VectLiteError::InvalidFormat(format!(
+                "dimension ({dimension}) must be divisible by num_sub_vectors ({})",
+                cfg.num_sub_vectors
+            )));
+        }
+        if cfg.num_centroids == 0 || cfg.num_centroids > 256 {
+            return Err(VectLiteError::InvalidFormat(
+                "num_centroids must be between 1 and 256".to_owned(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -173,18 +223,27 @@ impl ScalarQuantizer {
             .collect()
     }
 
-    /// Compute approximate cosine distance between a quantized query and all stored vectors.
+    /// Compute approximate cosine similarity between the query and all stored vectors.
     /// Returns indices sorted by approximate similarity (best first).
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(usize, f32)> {
-        let rescore_count = (top_k * self.config.rescore_multiplier)
-            .max(100)
-            .min(self.count);
-        let query_quantized = self.quantize_query(query);
+        self.search_with_metric(query, top_k, DistanceMetric::Cosine)
+    }
+
+    /// Compute approximate metric scores between the query and all stored vectors.
+    /// Returns indices sorted by approximate score (best first).
+    pub fn search_with_metric(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        metric: DistanceMetric,
+    ) -> Vec<(usize, f32)> {
+        assert_eq!(query.len(), self.dimension);
+        let rescore_count = rescore_count(top_k, self.config.rescore_multiplier, self.count);
         let mut scores: Vec<(usize, f32)> = (0..self.count)
             .map(|idx| {
                 let offset = idx * self.dimension;
                 let code_slice = &self.codes[offset..offset + self.dimension];
-                let sim = scalar_quantized_dot(&query_quantized, code_slice);
+                let sim = self.approximate_score(query, code_slice, metric);
                 (idx, sim)
             })
             .collect();
@@ -193,6 +252,71 @@ impl ScalarQuantizer {
         scores.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         scores.truncate(rescore_count);
         scores
+    }
+
+    fn approximate_score(&self, query: &[f32], code_slice: &[u8], metric: DistanceMetric) -> f32 {
+        match metric {
+            DistanceMetric::Cosine => {
+                let mut dot = 0.0_f32;
+                let mut query_norm = 0.0_f32;
+                let mut vector_norm = 0.0_f32;
+
+                for (((&query_value, &code), &min), &scale) in query
+                    .iter()
+                    .zip(code_slice.iter())
+                    .zip(self.mins.iter())
+                    .zip(self.scales.iter())
+                {
+                    let value = dequantize_scalar(code, min, scale);
+                    dot += query_value * value;
+                    query_norm += query_value * query_value;
+                    vector_norm += value * value;
+                }
+
+                if query_norm == 0.0 || vector_norm == 0.0 {
+                    0.0
+                } else {
+                    dot / (query_norm.sqrt() * vector_norm.sqrt())
+                }
+            }
+            DistanceMetric::Euclidean => {
+                let mut sum = 0.0_f32;
+                for (((&query_value, &code), &min), &scale) in query
+                    .iter()
+                    .zip(code_slice.iter())
+                    .zip(self.mins.iter())
+                    .zip(self.scales.iter())
+                {
+                    let delta = query_value - dequantize_scalar(code, min, scale);
+                    sum += delta * delta;
+                }
+                -sum.sqrt()
+            }
+            DistanceMetric::DotProduct => {
+                let mut dot = 0.0_f32;
+                for (((&query_value, &code), &min), &scale) in query
+                    .iter()
+                    .zip(code_slice.iter())
+                    .zip(self.mins.iter())
+                    .zip(self.scales.iter())
+                {
+                    dot += query_value * dequantize_scalar(code, min, scale);
+                }
+                dot
+            }
+            DistanceMetric::Manhattan => {
+                let mut sum = 0.0_f32;
+                for (((&query_value, &code), &min), &scale) in query
+                    .iter()
+                    .zip(code_slice.iter())
+                    .zip(self.mins.iter())
+                    .zip(self.scales.iter())
+                {
+                    sum += (query_value - dequantize_scalar(code, min, scale)).abs();
+                }
+                -sum
+            }
+        }
     }
 
     /// Rebuild codes from training vectors (used after deserialization with new vectors).
@@ -311,9 +435,7 @@ impl BinaryQuantizer {
     /// Search using Hamming distance. Returns candidate indices sorted by
     /// Hamming similarity (fewest differing bits first).
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(usize, u32)> {
-        let rescore_count = (top_k * self.config.rescore_multiplier)
-            .max(100)
-            .min(self.count);
+        let rescore_count = rescore_count(top_k, self.config.rescore_multiplier, self.count);
         let query_binary = self.binarize_query(query);
         let mut distances: Vec<(usize, u32)> = (0..self.count)
             .map(|idx| {
@@ -476,9 +598,7 @@ impl ProductQuantizer {
     /// Search using asymmetric distance computation (ADC).
     /// Returns candidate indices sorted by approximate L2 distance.
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(usize, f32)> {
-        let rescore_count = (top_k * self.config.rescore_multiplier)
-            .max(100)
-            .min(self.count);
+        let rescore_count = rescore_count(top_k, self.config.rescore_multiplier, self.count);
         let distance_table = self.compute_distance_table(query);
 
         let mut distances: Vec<(usize, f32)> = (0..self.count)
@@ -542,6 +662,20 @@ impl ProductQuantizer {
         let num_centroids = read_usize(reader)?;
         let training_iterations = read_usize(reader)?;
         let rescore_multiplier = read_usize(reader)?;
+        if num_sub_vectors == 0 || dimension % num_sub_vectors != 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "dimension ({dimension}) must be divisible by num_sub_vectors ({num_sub_vectors})"
+                ),
+            ));
+        }
+        if num_centroids == 0 || num_centroids > 256 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "num_centroids must be between 1 and 256",
+            ));
+        }
         let sub_dimension = dimension / num_sub_vectors;
 
         // Read codebooks
@@ -586,7 +720,7 @@ impl ProductQuantizer {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TwoBitQuantizationConfig {
     /// Number of top candidate docs from quantized search to rescore with
-    /// exact float32 MaxSim. Default: 4x top_k (minimum 50).
+    /// exact float32 MaxSim. Default: 4x top_k.
     pub rescore_multiplier: usize,
 }
 
@@ -668,9 +802,7 @@ impl TwoBitQuantizer {
     /// Search for top-k candidates using approximate 2-bit dot products.
     /// Returns (index, approx_score) pairs sorted best-first.
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(usize, i32)> {
-        let rescore_count = (top_k * self.config.rescore_multiplier)
-            .max(50)
-            .min(self.count);
+        let rescore_count = rescore_count(top_k, self.config.rescore_multiplier, self.count);
         let query_codes = self.quantize_vector(query);
 
         let mut scores: Vec<(usize, i32)> = (0..self.count)
@@ -823,9 +955,11 @@ impl MultiVectorQuantizedIndex {
 
     /// Search: returns candidate document indices sorted by approximate MaxSim.
     pub fn search(&self, query_tokens: &[&[f32]], top_k: usize) -> Vec<usize> {
-        let rescore_count = (top_k * self.quantizer.config.rescore_multiplier)
-            .max(50)
-            .min(self.doc_ranges.len());
+        let rescore_count = rescore_count(
+            top_k,
+            self.quantizer.config.rescore_multiplier,
+            self.doc_ranges.len(),
+        );
         if query_tokens.is_empty() || self.doc_ranges.is_empty() {
             return Vec::new();
         }
@@ -932,10 +1066,23 @@ impl QuantizedIndex {
     /// Search the quantized index. Returns candidate indices sorted by
     /// approximate similarity (best first), to be rescored with exact vectors.
     pub fn search_candidates(&self, query: &[f32], top_k: usize) -> Vec<usize> {
+        self.search_candidates_with_metric(query, top_k, DistanceMetric::Cosine)
+    }
+
+    /// Search the quantized index with the database metric.
+    /// Returns candidate indices sorted by approximate score (best first).
+    pub fn search_candidates_with_metric(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        metric: DistanceMetric,
+    ) -> Vec<usize> {
         match self {
-            QuantizedIndex::Scalar(q) => {
-                q.search(query, top_k).into_iter().map(|(i, _)| i).collect()
-            }
+            QuantizedIndex::Scalar(q) => q
+                .search_with_metric(query, top_k, metric)
+                .into_iter()
+                .map(|(i, _)| i)
+                .collect(),
             QuantizedIndex::Binary(q) => {
                 q.search(query, top_k).into_iter().map(|(i, _)| i).collect()
             }
@@ -1016,6 +1163,14 @@ impl QuantizedIndex {
 // Internal helper functions
 // ---------------------------------------------------------------------------
 
+#[inline]
+fn rescore_count(top_k: usize, rescore_multiplier: usize, count: usize) -> usize {
+    top_k
+        .max(1)
+        .saturating_mul(rescore_multiplier.max(1))
+        .min(count)
+}
+
 /// Quantize a single f32 value to u8 using the given min and scale.
 #[inline]
 fn quantize_scalar(val: f32, min: f32, scale: f32) -> u8 {
@@ -1026,15 +1181,13 @@ fn quantize_scalar(val: f32, min: f32, scale: f32) -> u8 {
     }
 }
 
-/// Approximate dot product between two u8-quantized vectors.
-/// Higher value = more similar (analogous to cosine similarity for normalized vectors).
 #[inline]
-fn scalar_quantized_dot(a: &[u8], b: &[u8]) -> f32 {
-    let mut sum = 0i32;
-    for (&ai, &bi) in a.iter().zip(b.iter()) {
-        sum += (ai as i32) * (bi as i32);
+fn dequantize_scalar(code: u8, min: f32, scale: f32) -> f32 {
+    if scale == 0.0 {
+        min
+    } else {
+        min + (code as f32 / scale)
     }
-    sum as f32
 }
 
 /// Convert a float vector to a binary representation (1 bit per dimension).
@@ -1252,6 +1405,39 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].0, 0); // First result should be index 0
         assert_eq!(results[0].1, 0); // Hamming distance 0
+    }
+
+    #[test]
+    fn rescore_multiplier_controls_candidate_count_without_hidden_floor() {
+        let vectors = random_vectors(200, 64, 7);
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+
+        let scalar = ScalarQuantizer::train(
+            &refs,
+            64,
+            ScalarQuantizationConfig {
+                rescore_multiplier: 1,
+            },
+        );
+        assert_eq!(scalar.search(&vectors[0], 10).len(), 10);
+
+        let scalar = ScalarQuantizer::train(
+            &refs,
+            64,
+            ScalarQuantizationConfig {
+                rescore_multiplier: 4,
+            },
+        );
+        assert_eq!(scalar.search(&vectors[0], 10).len(), 40);
+
+        let mut binary = BinaryQuantizer::new(
+            64,
+            BinaryQuantizationConfig {
+                rescore_multiplier: 2,
+            },
+        );
+        binary.add_vectors(&refs);
+        assert_eq!(binary.search(&vectors[0], 10).len(), 20);
     }
 
     #[test]

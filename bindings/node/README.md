@@ -138,6 +138,10 @@ products.upsert('p1', embedding, { name: 'Widget', price: 9.99 })
 
 const logs = store.openOrCreateCollection('logs', 128)
 console.log(store.collections()) // ["logs", "products"]
+
+products.close()
+logs.close()
+store.close()
 ```
 
 ### Transactions
@@ -231,20 +235,22 @@ db.dropIndex('score')
 
 ### Vector Quantization
 
-Reduce memory usage and accelerate search with quantized vectors. All methods use a 2-stage pipeline: fast quantized candidate selection followed by exact float32 rescoring.
+Reduce in-memory candidate-index usage and accelerate search with quantized vectors. All methods use a 2-stage pipeline: fast quantized candidate selection followed by exact float32 rescoring.
 
 ```js
-// Scalar quantization (int8) -- 4x memory reduction, minimal recall loss
+// Scalar quantization (int8) -- smaller in-memory candidate index, minimal recall loss
 db.enableQuantization('scalar')
 
-// Binary quantization -- 32x memory reduction, best for normalized embeddings
-db.enableQuantization('binary', JSON.stringify({ rescoreMultiplier: 10 }))
+// Binary quantization -- smallest in-memory candidate index, best for normalized embeddings
+db.enableQuantization('binary', { rescoreMultiplier: 10 })
 
-// Product quantization -- configurable compression for very large datasets
-db.enableQuantization('product', JSON.stringify({ numSubVectors: 16, numCentroids: 256 }))
+// Product quantization -- "pq" and "product" are accepted case-insensitively
+console.log(db.validNumSubVectors()) // valid PQ partitions for this dimension
+db.enableQuantization('pq', { numSubVectors: 16, numCentroids: 256 })
 
 // Search works exactly the same -- quantization accelerates it transparently
 const results = db.search(queryEmbedding, { k: 10 })
+const sameResults = db.search({ query: queryEmbedding, k: 10 })
 
 // Check quantization status
 console.log(db.isQuantized)         // true
@@ -254,7 +260,11 @@ console.log(db.quantizationMethod)  // "scalar", "binary", or "product"
 db.disableQuantization()
 ```
 
-Quantization parameters persist across reopens in a `.vdb.quant` sidecar file. The quantized index auto-rebuilds on inserts and upserts.
+`rescoreMultiplier` controls the number of quantized candidates rescored with exact float32 scoring: `k * rescoreMultiplier`, capped at the collection size. Increase it to trade latency for recall.
+
+For PQ, `numSubVectors` must divide the database dimension. If omitted, Vectlite chooses a compatible default; use `db.validNumSubVectors()` to inspect all valid values.
+
+Quantization does not shrink the `.vdb` file on disk. Vectlite keeps the original float32 vectors for exact rescoring and stores quantization parameters in a `.vdb.quant` sidecar file, so total disk footprint can increase slightly. The quantized index auto-rebuilds on inserts and upserts.
 
 ### Multi-Vector / ColBERT Search
 
@@ -263,14 +273,12 @@ Store token-level embeddings (ColBERT, ColPali) and search with MaxSim late inte
 ```js
 // Upsert with per-token ColBERT embeddings
 db.upsertMultiVectors('doc1', denseVector,
-  JSON.stringify({ colbert: [tokenVec1, tokenVec2] }),
-  JSON.stringify({ metadata: { source: 'paper' } })
+  { colbert: [tokenVec1, tokenVec2] },
+  { metadata: { source: 'paper' } }
 )
 
 // MaxSim search
-const results = JSON.parse(
-  db.searchMultiVector('colbert', JSON.stringify(queryTokenVectors))
-)
+const results = db.searchMultiVector('colbert', queryTokenVectors)
 
 // Enable 2-bit quantization (~16x compression)
 db.enableMultiVectorQuantization('colbert')
@@ -403,7 +411,7 @@ before re-throwing.
 | Method | Description |
 |---|---|
 | `db.get(id, { namespace })` | Get a single record by id |
-| `db.search(query, options)` | Search and return a list of results |
+| `db.search(query, options)` or `db.search({ query, ...options })` | Search and return a list of results |
 | `db.searchWithStats(query, options)` | Search with detailed performance stats |
 | `db.count({ namespace, filter })` | Count records, optionally scoped by namespace/filter |
 | `db.list({ namespace, filter, limit, offset })` | List records without issuing a vector query |
@@ -426,10 +434,14 @@ before re-throwing.
 
 | Method | Description |
 |---|---|
-| `db.enableQuantization(method, optionsJson)` | Enable quantization (`'scalar'`, `'binary'`, or `'product'`) |
+| `db.enableQuantization(method, options)` | Enable quantization (`'scalar'`, `'binary'`, or `'pq'` / `'product'`) |
 | `db.disableQuantization()` | Disable quantization and remove persisted parameters |
 | `db.isQuantized` | Whether quantization is enabled (property) |
 | `db.quantizationMethod` | Active method name or `null` (property) |
+| `db.validNumSubVectors()` | Valid PQ `numSubVectors` values for this database dimension |
+| `db.enableMultiVectorQuantization(space, options)` | Enable 2-bit quantization for a multi-vector space |
+| `db.disableMultiVectorQuantization(space)` | Disable multi-vector quantization for a space |
+| `db.isMultiVectorQuantized(space)` | Whether multi-vector quantization is enabled for a space |
 
 ### Maintenance Methods
 

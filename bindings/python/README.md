@@ -173,6 +173,10 @@ products.upsert("p1", embedding, {"name": "Widget", "price": 9.99})
 
 logs = store.open_or_create_collection("logs", dimension=128)
 print(store.collections())  # ["logs", "products"]
+
+products.close()
+logs.close()
+store.close()
 ```
 
 ### Transactions
@@ -263,30 +267,35 @@ print(outcome["results"][0]["explain"])  # Detailed scoring breakdown
 
 ### Vector Quantization
 
-Reduce memory usage and accelerate search with quantized vectors. All methods use a 2-stage pipeline: fast quantized candidate selection followed by exact float32 rescoring.
+Reduce in-memory candidate-index usage and accelerate search with quantized vectors. All methods use a 2-stage pipeline: fast quantized candidate selection followed by exact float32 rescoring.
 
 ```python
-# Scalar quantization (int8) -- 4x memory reduction, minimal recall loss
+# Scalar quantization (int8) -- smaller in-memory candidate index, minimal recall loss
 db.enable_quantization("scalar")
 
-# Binary quantization -- 32x memory reduction, best for normalized embeddings
+# Binary quantization -- smallest in-memory candidate index, best for normalized embeddings
 db.enable_quantization("binary", rescore_multiplier=10)
 
-# Product quantization -- configurable compression for very large datasets
-db.enable_quantization("product", num_sub_vectors=16, num_centroids=256)
+# Product quantization -- "pq" and "product" are accepted case-insensitively
+print(db.valid_num_sub_vectors())  # valid PQ partitions for this dimension
+db.enable_quantization("pq", num_sub_vectors=16, num_centroids=256)
 
 # Search is transparently accelerated
 results = db.search(query_embedding, k=10)
 
 # Check status
-print(db.is_quantized)         # True
+print(db.is_quantized())       # True
 print(db.quantization_method)  # "scalar", "binary", or "product"
 
 # Disable
 db.disable_quantization()
 ```
 
-Quantization parameters persist across reopens in a `.vdb.quant` sidecar file.
+`rescore_multiplier` controls the number of quantized candidates rescored with exact float32 scoring: `k * rescore_multiplier`, capped at the collection size. Increase it to trade latency for recall.
+
+For PQ, `num_sub_vectors` must divide the database dimension. If omitted, Vectlite chooses a compatible default; use `db.valid_num_sub_vectors()` to inspect all valid values.
+
+Quantization does not shrink the `.vdb` file on disk. Vectlite keeps the original float32 vectors for exact rescoring and stores quantization parameters in a `.vdb.quant` sidecar file, so total disk footprint can increase slightly.
 
 ### Multi-Vector / ColBERT Search
 
@@ -560,6 +569,11 @@ before re-raising.
 
 ## Database Methods Reference
 
+The Python API exposes passive database metadata as properties (`db.path`,
+`db.wal_path`, `db.dimension`, `db.metric`, `db.read_only`,
+`db.quantization_method`) and operations as methods (`db.count()`,
+`db.search()`, `db.flush()`, `db.close()`, `db.is_quantized()`).
+
 ### Write Methods
 
 | Method | Description |
@@ -589,6 +603,7 @@ before re-raising.
 | `db.namespaces()` | List all namespaces |
 | `db.dimension` | Vector dimension (property) |
 | `db.path` | Database file path (property) |
+| `db.wal_path` | WAL file path (property) |
 | `db.metric` | Distance metric name: `"cosine"`, `"euclidean"`, `"dotproduct"`, or `"manhattan"` (property) |
 | `db.read_only` | Whether the database is read-only (property) |
 
@@ -604,10 +619,11 @@ before re-raising.
 
 | Method | Description |
 |--------|-------------|
-| `db.enable_quantization(method, ...)` | Enable quantization (`"scalar"`, `"binary"`, or `"product"`) |
+| `db.enable_quantization(method, ...)` | Enable quantization (`"scalar"`, `"binary"`, or `"pq"` / `"product"`) |
 | `db.disable_quantization()` | Disable quantization and remove persisted parameters |
-| `db.is_quantized` | Whether quantization is enabled (property) |
+| `db.is_quantized()` | Whether quantization is enabled |
 | `db.quantization_method` | Active method name or `None` (property) |
+| `db.valid_num_sub_vectors()` | Valid PQ `num_sub_vectors` values for this database dimension |
 
 ### Maintenance Methods
 

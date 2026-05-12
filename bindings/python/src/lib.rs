@@ -9,6 +9,7 @@ use pyo3::types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyList, PyModule, PyStr
 use vectlite::quantization::{
     BinaryQuantizationConfig, MultiVectorQuantizationConfig, ProductQuantizationConfig,
     QuantizationConfig, ScalarQuantizationConfig, TwoBitQuantizationConfig,
+    default_product_num_sub_vectors,
 };
 use vectlite::{
     Database as CoreDatabase, DistanceMetric, FusionStrategy, HybridSearchOptions, Metadata,
@@ -97,6 +98,12 @@ impl PyStore {
 
     fn collections(&self) -> PyResult<Vec<String>> {
         self.inner.collections().map_err(to_py_error)
+    }
+
+    /// Close the store. This is a no-op (the store holds no open file handles)
+    /// but is provided for symmetry with ``Database.close()``.
+    fn close(&self) -> PyResult<()> {
+        Ok(())
     }
 }
 
@@ -320,14 +327,15 @@ impl PyDatabase {
         num_centroids: Option<usize>,
         training_iterations: Option<usize>,
     ) -> PyResult<()> {
+        let mut database = self.write_open()?;
         let config = parse_quantization_config(
             method,
             rescore_multiplier,
             num_sub_vectors,
             num_centroids,
             training_iterations,
+            database.dimension(),
         )?;
-        let mut database = self.write_open()?;
         database.enable_quantization(config).map_err(to_py_error)
     }
 
@@ -338,7 +346,6 @@ impl PyDatabase {
     }
 
     /// Returns True if quantization is enabled.
-    #[getter]
     fn is_quantized(&self) -> PyResult<bool> {
         let database = self.read()?;
         Ok(database.is_quantized())
@@ -353,6 +360,12 @@ impl PyDatabase {
             QuantizationConfig::Binary(_) => "binary".to_owned(),
             QuantizationConfig::Product(_) => "product".to_owned(),
         }))
+    }
+
+    /// Returns valid Product Quantization num_sub_vectors values for this database.
+    fn valid_num_sub_vectors(&self) -> PyResult<Vec<usize>> {
+        let database = self.read()?;
+        Ok(database.valid_num_sub_vectors())
     }
 
     // ---- Multi-vector / ColBERT-style late interaction ----
@@ -1937,22 +1950,34 @@ fn parse_quantization_config(
     num_sub_vectors: Option<usize>,
     num_centroids: Option<usize>,
     training_iterations: Option<usize>,
+    dimension: usize,
 ) -> PyResult<QuantizationConfig> {
-    match method {
-        "scalar" | "int8" => Ok(QuantizationConfig::Scalar(ScalarQuantizationConfig {
-            rescore_multiplier: rescore_multiplier.unwrap_or(5),
-        })),
-        "binary" => Ok(QuantizationConfig::Binary(BinaryQuantizationConfig {
-            rescore_multiplier: rescore_multiplier.unwrap_or(10),
-        })),
-        "product" | "pq" => Ok(QuantizationConfig::Product(ProductQuantizationConfig {
-            num_sub_vectors: num_sub_vectors.unwrap_or(16),
-            num_centroids: num_centroids.unwrap_or(256),
-            training_iterations: training_iterations.unwrap_or(20),
-            rescore_multiplier: rescore_multiplier.unwrap_or(10),
-        })),
-        other => Err(PyValueError::new_err(format!(
-            "unknown quantization method '{other}'. Expected: 'scalar', 'binary', or 'product'"
+    let normalized = method.to_ascii_lowercase();
+    match normalized.as_str() {
+        "scalar" | "int8" => {
+            let default = ScalarQuantizationConfig::default();
+            Ok(QuantizationConfig::Scalar(ScalarQuantizationConfig {
+                rescore_multiplier: rescore_multiplier.unwrap_or(default.rescore_multiplier),
+            }))
+        }
+        "binary" => {
+            let default = BinaryQuantizationConfig::default();
+            Ok(QuantizationConfig::Binary(BinaryQuantizationConfig {
+                rescore_multiplier: rescore_multiplier.unwrap_or(default.rescore_multiplier),
+            }))
+        }
+        "product" | "pq" => {
+            let default = ProductQuantizationConfig::default();
+            Ok(QuantizationConfig::Product(ProductQuantizationConfig {
+                num_sub_vectors: num_sub_vectors
+                    .unwrap_or_else(|| default_product_num_sub_vectors(dimension)),
+                num_centroids: num_centroids.unwrap_or(default.num_centroids),
+                training_iterations: training_iterations.unwrap_or(default.training_iterations),
+                rescore_multiplier: rescore_multiplier.unwrap_or(default.rescore_multiplier),
+            }))
+        }
+        _ => Err(PyValueError::new_err(format!(
+            "unknown quantization method '{method}'. Expected: 'scalar', 'binary', or 'pq' (alias: 'product')"
         ))),
     }
 }

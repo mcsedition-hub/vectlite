@@ -6,6 +6,27 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-05-12
+
+### Fixed
+
+- Python quantization introspection now exposes `db.is_quantized()` as a method, matching the rest of the quantization helper API, and the type stubs now include `db.quantization_method`.
+- Python documentation now explicitly marks passive database metadata (`db.metric`, `db.dimension`, `db.read_only`, `db.path`, `db.wal_path`) as properties.
+- Scalar quantized search now ranks candidates with dequantized metric-aware scores before exact float32 rescoring, avoiding large recall loss from raw `u8` dot-product bias.
+- Quantization `rescore_multiplier` now directly controls the rescoring budget (`k * rescore_multiplier`, capped at collection size) instead of being hidden by an internal 100-candidate floor.
+- Quantization documentation now clarifies that memory savings apply to the in-memory candidate index, not to `.vdb` disk footprint, because float32 vectors are retained for exact rescoring.
+- Node `Database` wrapper now exposes quantization and multi-vector quantization methods that were previously only available on the private `_native` handle.
+- Node search now accepts both `db.search(query, options)` and `db.search({ query, ...options })`, with the same support on stats and async variants.
+- Product quantization validates invalid `num_sub_vectors` settings as catchable errors instead of panicking, and Python/Node choose a dimension-compatible PQ default when `num_sub_vectors` is omitted.
+- Python and Node now expose valid PQ partition helpers (`db.valid_num_sub_vectors()` / `db.validNumSubVectors()`), and quantization method names are parsed case-insensitively with `pq` documented as the primary PQ alias.
+- Search with an all-zeros query vector now raises a `VectLiteError` for cosine and dot-product metrics instead of silently returning arbitrary results with score 0. Euclidean and Manhattan metrics are unaffected since distance from the origin is well-defined.
+- Search now rejects query vectors whose dimension does not match the database dimension, returning a `DimensionMismatch` error. Previously, undersized queries were silently truncated via Matryoshka logic even without an explicit `truncate_dim` parameter. Users must now pass `truncate_dim` to opt into prefix search.
+- `Store.close()` is now available in Python, Node, Swift, and Kotlin bindings for symmetry with `Database.close()`. The method is a no-op (the store holds no open file handles) but prevents `AttributeError` / missing-method surprises.
+- HNSW sidecar files no longer use triple-dot filenames (`c.vdb.ann...hnsw.data`). Empty namespace and vector-name components now produce `_` sentinels (e.g. `c.vdb.ann._._.hnsw.data`). Existing triple-dot files are orphaned and the ANN index rebuilds automatically on next use.
+- Swift and Kotlin bindings now accept the `"pq"` alias for product quantization in `enableQuantization()`, matching Python and Node behaviour. The error message also lists the alias.
+- `build-xcframework.sh` now sets `MACOSX_DEPLOYMENT_TARGET=12.0` and `IPHONEOS_DEPLOYMENT_TARGET=15.0` when building the XCFramework, preventing linker warnings when the framework is consumed on older OS versions.
+- Kotlin `build.gradle.kts` now declares `jvmToolchain(17)` so Gradle auto-provisions a compatible JDK, fixing build failures when `JAVA_HOME` points to JDK 25+.
+
 ## [0.9.0] - 2026-05-11
 
 ### Added
@@ -152,15 +173,15 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ### Added
 
-- **Vector quantization** with three strategies for trading memory for search speed:
-  - **Scalar quantization (int8)** -- 4x memory reduction with minimal recall loss.
-  - **Binary quantization** -- 32x memory reduction using Hamming distance filtering, best for normalized embeddings.
+- **Vector quantization** with three strategies for trading in-memory candidate-index size for search speed:
+  - **Scalar quantization (int8)** -- compact in-memory candidate index with minimal recall loss.
+  - **Binary quantization** -- smallest in-memory candidate index using Hamming distance filtering, best for normalized embeddings.
   - **Product quantization (PQ)** -- configurable compression via k-means sub-vector clustering for very large datasets.
 - All quantization methods use a 2-stage pipeline: fast quantized candidate selection followed by exact float32 cosine rescoring.
 - Quantization parameters (calibration ranges, PQ codebooks) persist in a `.vdb.quant` sidecar file and auto-load on database open.
 - Quantized indexes automatically rebuild on inserts, upserts, and bulk ingestion.
 - Rust core: `enable_quantization()`, `disable_quantization()`, `is_quantized()`, `quantization_config()` on `Database`.
-- Python binding: `db.enable_quantization(method, ...)`, `db.disable_quantization()`, `db.is_quantized`, `db.quantization_method`.
+- Python binding: `db.enable_quantization(method, ...)`, `db.disable_quantization()`, `db.is_quantized()`, `db.quantization_method`.
 - Node binding: `db.enableQuantization(method, optionsJson)`, `db.disableQuantization()`, `db.isQuantized`, `db.quantizationMethod`.
 - New `crates/vectlite-core/src/quantization.rs` module with `ScalarQuantizer`, `BinaryQuantizer`, `ProductQuantizer`, and `QuantizedIndex`.
 - Rust unit tests for all three quantizers including serialization roundtrips.

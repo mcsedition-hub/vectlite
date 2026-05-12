@@ -9,6 +9,7 @@ export type MetadataValue =
 export type Metadata = { [key: string]: MetadataValue }
 export type SparseVector = { [term: string]: number }
 export type NamedVectors = { [name: string]: number[] }
+export type MultiVectors = { [space: string]: number[][] }
 export type Filter = { [key: string]: unknown }
 export type TextEmbedding = ArrayLike<number>
 export type TextEmbeddingResult = TextEmbedding | Promise<TextEmbedding>
@@ -130,6 +131,46 @@ export interface SearchOptions {
   vectorWeights?: { [name: string]: number } | null
 }
 
+export interface SearchRequest extends SearchOptions {
+  query?: number[] | null
+}
+
+export type QuantizationMethod = 'scalar' | 'int8' | 'binary' | 'product' | 'pq'
+export interface QuantizationOptions {
+  rescoreMultiplier?: number
+  rescore_multiplier?: number
+  numSubVectors?: number
+  num_sub_vectors?: number
+  numCentroids?: number
+  num_centroids?: number
+  trainingIterations?: number
+  training_iterations?: number
+}
+
+export interface MultiVectorWriteOptions {
+  namespace?: string | null
+  metadata?: Metadata | null
+}
+
+export interface MultiVectorSearchOptions {
+  k?: number
+  filter?: Filter | null
+  namespace?: string | null
+}
+
+export interface MultiVectorSearchResult {
+  namespace: string
+  id: string
+  score: number
+  metadata: Metadata
+}
+
+export interface MultiVectorQuantizationOptions {
+  method?: 'two_bit'
+  rescoreMultiplier?: number
+  rescore_multiplier?: number
+}
+
 export type DistanceMetric = 'cosine' | 'euclidean' | 'dotproduct' | 'manhattan' | 'l2' | 'dot' | 'ip' | 'l1'
 
 export interface OpenOptions {
@@ -181,13 +222,27 @@ export class Database {
   createIndex(field: string, indexType: 'keyword' | 'numeric'): boolean
   dropIndex(field: string): boolean
   listIndexes(): Array<{ field: string; type: 'keyword' | 'numeric' }>
+  readonly isQuantized: boolean
+  readonly quantizationMethod: 'scalar' | 'binary' | 'product' | null
+  enableQuantization(method?: QuantizationMethod, options?: QuantizationOptions | string): void
+  disableQuantization(): void
+  validNumSubVectors(): number[]
+  upsertMultiVectors(id: string, vector: number[], multiVectors: MultiVectors, options?: MultiVectorWriteOptions): void
+  searchMultiVector(space: string, queryTokens: number[][], options?: MultiVectorSearchOptions): MultiVectorSearchResult[]
+  enableMultiVectorQuantization(space: string, options?: MultiVectorQuantizationOptions | string): void
+  disableMultiVectorQuantization(space: string): void
+  isMultiVectorQuantized(space: string): boolean
   flush(): void
   compact(): void
   snapshot(dest: string): void
   backup(dest: string): void
+  search(request: SearchRequest): SearchResult[]
   search(query?: number[] | null, options?: SearchOptions): SearchResult[]
+  searchWithStats(request: SearchRequest): SearchResponse
   searchWithStats(query?: number[] | null, options?: SearchOptions): SearchResponse
+  searchAsync(request: SearchRequest): Promise<SearchResult[]>
   searchAsync(query?: number[] | null, options?: SearchOptions): Promise<SearchResult[]>
+  searchWithStatsAsync(request: SearchRequest): Promise<SearchResponse>
   searchWithStatsAsync(query?: number[] | null, options?: SearchOptions): Promise<SearchResponse>
   flushAsync(): Promise<void>
   compactAsync(): Promise<void>
@@ -202,6 +257,7 @@ export class Store {
   openCollectionReadOnly(name: string): Database
   dropCollection(name: string): boolean
   collections(): string[]
+  close(): void
 }
 
 export function open(path: string, options?: OpenOptions): Database

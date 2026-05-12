@@ -94,6 +94,8 @@ db.upsert('doc1', embedding, { source: 'blog', title: 'Auth Guide' })
 db.upsert('doc2', embedding2, { source: 'notes', title: 'Billing' })
 
 const results = db.search(queryEmbedding, { k: 5, filter: { source: 'blog' } })
+// Equivalent object form:
+const sameResults = db.search({ query: queryEmbedding, k: 5, filter: { source: 'blog' } })
 console.log(db.count({ filter: { source: 'blog' } }))
 db.close()
 ```
@@ -302,6 +304,10 @@ products.upsert("p1", embedding, {"name": "Widget", "price": 9.99})
 
 logs = store.open_or_create_collection("logs", dimension=128)
 print(store.collections())  # ["logs", "products"]
+
+products.close()
+logs.close()
+store.close()
 ```
 
 ### Transactions
@@ -362,30 +368,35 @@ print(outcome["results"][0]["explain"])  # Detailed scoring breakdown
 
 ### Vector Quantization
 
-Reduce memory usage and accelerate search with quantized vectors. All methods use a 2-stage pipeline: fast quantized candidate selection followed by exact float32 rescoring.
+Reduce in-memory candidate-index usage and accelerate search with quantized vectors. All methods use a 2-stage pipeline: fast quantized candidate selection followed by exact float32 rescoring.
 
 ```python
-# Scalar quantization (int8) -- 4x memory reduction, minimal recall loss
+# Scalar quantization (int8) -- smaller in-memory candidate index, minimal recall loss
 db.enable_quantization("scalar")
 
-# Binary quantization -- 32x memory reduction, best for normalized embeddings
+# Binary quantization -- smallest in-memory candidate index, best for normalized embeddings
 db.enable_quantization("binary", rescore_multiplier=10)
 
-# Product quantization -- configurable compression for very large datasets
-db.enable_quantization("product", num_sub_vectors=16, num_centroids=256)
+# Product quantization -- "pq" and "product" are accepted case-insensitively
+print(db.valid_num_sub_vectors())  # valid PQ partitions for this dimension
+db.enable_quantization("pq", num_sub_vectors=16, num_centroids=256)
 
 # Search works exactly the same -- quantization accelerates it transparently
 results = db.search(query_embedding, k=10)
 
 # Check quantization status
-print(db.is_quantized)         # True
+print(db.is_quantized())       # True
 print(db.quantization_method)  # "scalar", "binary", or "product"
 
 # Disable quantization
 db.disable_quantization()
 ```
 
-Quantization parameters persist across reopens in a `.vdb.quant` sidecar file. The quantized index auto-rebuilds on inserts and upserts.
+`rescore_multiplier` controls the number of quantized candidates rescored with exact float32 scoring: `k * rescore_multiplier`, capped at the collection size. Increase it to trade latency for recall.
+
+For PQ, `num_sub_vectors` must divide the database dimension. If omitted, Vectlite chooses a compatible default; use `db.valid_num_sub_vectors()` to inspect all valid values.
+
+Quantization does not shrink the `.vdb` file on disk. Vectlite keeps the original float32 vectors for exact rescoring and stores quantization parameters in a `.vdb.quant` sidecar file, so total disk footprint can increase slightly. The quantized index auto-rebuilds on inserts and upserts.
 
 ### Multi-Vector / ColBERT Search
 
@@ -619,6 +630,10 @@ products.upsert('p1', embedding, { name: 'Widget', price: 9.99 })
 
 const logs = store.openOrCreateCollection('logs', 128)
 console.log(store.collections()) // ["logs", "products"]
+
+products.close()
+logs.close()
+store.close()
 ```
 
 ### Transactions (Node)
@@ -678,14 +693,15 @@ console.log(outcome.results[0].explain) // Detailed scoring breakdown
 ### Vector Quantization (Node)
 
 ```js
-// Scalar quantization (int8) -- 4x memory reduction
+// Scalar quantization (int8) -- compact in-memory candidate index
 db.enableQuantization('scalar')
 
-// Binary quantization -- 32x memory reduction
-db.enableQuantization('binary', JSON.stringify({ rescoreMultiplier: 10 }))
+// Binary quantization -- smallest in-memory candidate index
+db.enableQuantization('binary', { rescoreMultiplier: 10 })
 
-// Product quantization
-db.enableQuantization('product', JSON.stringify({ numSubVectors: 16, numCentroids: 256 }))
+// Product quantization -- "pq" and "product" are accepted case-insensitively
+console.log(db.validNumSubVectors()) // valid PQ partitions for this dimension
+db.enableQuantization('pq', { numSubVectors: 16, numCentroids: 256 })
 
 // Check status
 console.log(db.isQuantized)         // true
@@ -695,19 +711,21 @@ console.log(db.quantizationMethod)  // "scalar", "binary", or "product"
 db.disableQuantization()
 ```
 
+`rescoreMultiplier` controls the exact-rescore candidate budget (`k * rescoreMultiplier`, capped at collection size). Quantization keeps the original float32 vectors in the `.vdb` file and adds a `.vdb.quant` sidecar, so it is not a disk compression mode.
+
+For PQ, `numSubVectors` must divide the database dimension. If omitted, Vectlite chooses a compatible default; use `db.validNumSubVectors()` to inspect all valid values.
+
 ### Multi-Vector / ColBERT Search (Node)
 
 ```js
 // Upsert with per-token ColBERT embeddings
 db.upsertMultiVectors('doc1', denseVector,
-  JSON.stringify({ colbert: [tokenVec1, tokenVec2] }),
-  JSON.stringify({ metadata: { source: 'paper' } })
+  { colbert: [tokenVec1, tokenVec2] },
+  { metadata: { source: 'paper' } }
 )
 
 // MaxSim search
-const results = JSON.parse(
-  db.searchMultiVector('colbert', JSON.stringify(queryTokenVectors))
-)
+const results = db.searchMultiVector('colbert', queryTokenVectors)
 
 // Enable 2-bit quantization (~16x compression)
 db.enableMultiVectorQuantization('colbert')

@@ -14,6 +14,7 @@ use simsimd::SpatialSimilarity;
 
 use quantization::{
     MultiVectorQuantizationConfig, MultiVectorQuantizedIndex, QuantizationConfig, QuantizedIndex,
+    valid_product_num_sub_vectors, validate_quantization_config,
 };
 
 const MAGIC: &[u8; 4] = b"VDB1";
@@ -2290,6 +2291,18 @@ impl Database {
                 "search requires a dense query, a sparse query, or both".to_owned(),
             ));
         }
+        // Reject zero-norm query vectors for metrics where similarity is undefined.
+        if let Some(query) = dense_query {
+            if self.metric.is_similarity() {
+                let norm_sq: f32 = query.iter().map(|v| v * v).sum();
+                if norm_sq == 0.0 {
+                    return Err(VectLiteError::InvalidFormat(
+                        "query vector has zero norm; cosine/dot-product similarity is undefined"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
         if let Some(mmr_lambda) = options.mmr_lambda {
             if !(0.0..=1.0).contains(&mmr_lambda) {
                 return Err(VectLiteError::InvalidFormat(
@@ -2532,6 +2545,7 @@ impl Database {
                 "cannot enable quantization on an empty database".to_owned(),
             ));
         }
+        validate_quantization_config(&config, self.dimension)?;
         self.quantization_config = Some(config);
         self.rebuild_quantized_index();
         self.persist_quantization_params()?;
@@ -2560,6 +2574,11 @@ impl Database {
     /// Returns the quantization configuration if enabled.
     pub fn quantization_config(&self) -> Option<&QuantizationConfig> {
         self.quantization_config.as_ref()
+    }
+
+    /// Returns all valid Product Quantization `num_sub_vectors` values for this database.
+    pub fn valid_num_sub_vectors(&self) -> Vec<usize> {
+        valid_product_num_sub_vectors(self.dimension)
     }
 
     /// Rebuild the quantized index from current records.
@@ -2645,7 +2664,7 @@ impl Database {
             return None;
         }
 
-        let candidate_indices = index.search_candidates(query, top_k);
+        let candidate_indices = index.search_candidates_with_metric(query, top_k, self.metric);
         Some(
             candidate_indices
                 .into_iter()
@@ -3759,7 +3778,17 @@ impl Database {
                 )));
             }
             Some(dim) => dim,
-            None => query.len(),
+            None => {
+                // Without explicit truncate_dim, require exact dimension match.
+                // Users must pass truncate_dim to opt into Matryoshka truncation.
+                if query.len() != self.dimension {
+                    return Err(VectLiteError::DimensionMismatch {
+                        expected: self.dimension,
+                        found: query.len(),
+                    });
+                }
+                query.len()
+            }
         };
 
         Ok(Some(effective))
@@ -4645,11 +4674,13 @@ fn ann_basename(path: &Path, namespace: Option<&str>, vector_name: &str) -> Stri
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("vectlite");
-    format!(
-        "{stem}.ann.{}.{}",
-        hex_encode(namespace.unwrap_or(DEFAULT_NAMESPACE).as_bytes()),
-        hex_encode(vector_name.as_bytes())
-    )
+    let ns_hex = hex_encode(namespace.unwrap_or(DEFAULT_NAMESPACE).as_bytes());
+    let vn_hex = hex_encode(vector_name.as_bytes());
+    // Use "_" sentinel for empty components to avoid triple-dot filenames
+    // like "c.vdb.ann...hnsw.data".
+    let ns_part = if ns_hex.is_empty() { "_" } else { &ns_hex };
+    let vn_part = if vn_hex.is_empty() { "_" } else { &vn_hex };
+    format!("{stem}.ann.{ns_part}.{vn_part}")
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -5379,7 +5410,7 @@ fn usize_from_u64(value: u64) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Database, HybridSearchOptions, Metadata, MetadataFilter, MetadataValue,
+        Database, DistanceMetric, HybridSearchOptions, Metadata, MetadataFilter, MetadataValue,
         MultiVectorSearchOptions, MultiVectors, NamedVectors, PayloadIndexType, Record,
         SearchOptions, SparseVector, VectLiteError,
     };
@@ -6076,6 +6107,54 @@ mod tests {
     }
 
     #[test]
+    fn scalar_quantization_keeps_signed_cosine_neighbor_in_candidate_set() {
+        use super::quantization::{QuantizationConfig, ScalarQuantizationConfig};
+
+        let path = temp_file("quant-scalar-signed-recall");
+        let dim = 146;
+
+        let mut query = vec![-1.0_f32; dim];
+        for value in &mut query[..10] {
+            *value = 1.0;
+        }
+
+        let mut db = Database::create(&path, dim).expect("create");
+        for i in 0..120 {
+            db.upsert(format!("high{i:03}"), vec![2.0_f32; dim], Metadata::new())
+                .expect("upsert high distractor");
+        }
+
+        let mut calibration_low = vec![2.0_f32; dim];
+        for value in &mut calibration_low[..10] {
+            *value = -1.0;
+        }
+        db.upsert("calibration-low", calibration_low, Metadata::new())
+            .expect("upsert calibration low");
+        db.upsert("target", query.clone(), Metadata::new())
+            .expect("upsert target");
+
+        db.enable_quantization(QuantizationConfig::Scalar(ScalarQuantizationConfig {
+            rescore_multiplier: 1,
+        }))
+        .expect("enable quant");
+
+        let results = db
+            .search(
+                &query,
+                SearchOptions {
+                    top_k: 1,
+                    filter: None,
+                    truncate_dim: None,
+                },
+            )
+            .expect("search");
+
+        assert_eq!(results[0].id, "target");
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn binary_quantization_enables_search() {
         use super::quantization::{BinaryQuantizationConfig, QuantizationConfig};
 
@@ -6211,6 +6290,40 @@ mod tests {
             ScalarQuantizationConfig::default(),
         ));
         assert!(result.is_err());
+        assert!(!db.is_quantized());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn product_quantization_invalid_subvector_count_returns_error() {
+        use super::quantization::{ProductQuantizationConfig, QuantizationConfig};
+
+        let path = temp_file("quant-pq-invalid-subvectors");
+        let mut db = Database::create(&path, 146).expect("create");
+        for i in 0..4 {
+            db.upsert(
+                format!("doc{i}"),
+                vec![0.1_f32 + i as f32; 146],
+                Metadata::new(),
+            )
+            .expect("upsert");
+        }
+        assert_eq!(db.valid_num_sub_vectors(), vec![1, 2, 73, 146]);
+
+        let result =
+            db.enable_quantization(QuantizationConfig::Product(ProductQuantizationConfig {
+                num_sub_vectors: 16,
+                num_centroids: 4,
+                training_iterations: 1,
+                rescore_multiplier: 1,
+            }));
+
+        assert!(matches!(
+            result,
+            Err(VectLiteError::InvalidFormat(message))
+                if message.contains("dimension (146) must be divisible by num_sub_vectors (16)")
+        ));
         assert!(!db.is_quantized());
 
         cleanup(&path);
@@ -6833,6 +6946,7 @@ mod tests {
                 None,
                 HybridSearchOptions {
                     top_k: 2,
+                    truncate_dim: Some(2),
                     ..HybridSearchOptions::default()
                 },
             )
@@ -8140,6 +8254,155 @@ mod tests {
         let (page, cursor) = db.list_cursor(None, None, 10, None);
         assert!(page.is_empty());
         assert!(cursor.is_none());
+        cleanup(&path);
+    }
+
+    // ---------------------------------------------------------------
+    // Bug #14: zero-norm query vector should be rejected for cosine
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn search_zero_norm_query_cosine_rejected() {
+        let path = temp_file("zero-norm-cosine");
+        let mut db = Database::create(&path, 3).expect("create");
+        db.insert("a", vec![1.0, 0.0, 0.0], Metadata::new())
+            .expect("insert");
+
+        let result = db.search(
+            &[0.0, 0.0, 0.0],
+            SearchOptions {
+                top_k: 5,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err(), "zero-norm cosine search should fail");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("zero norm"),
+            "error should mention zero norm: {err_msg}"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn search_zero_norm_query_dotproduct_rejected() {
+        let path = temp_file("zero-norm-dot");
+        let mut db =
+            Database::create_with_metric(&path, 3, DistanceMetric::DotProduct).expect("create");
+        db.insert("a", vec![1.0, 0.0, 0.0], Metadata::new())
+            .expect("insert");
+
+        let result = db.search(
+            &[0.0, 0.0, 0.0],
+            SearchOptions {
+                top_k: 5,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err(), "zero-norm dotproduct search should fail");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn search_zero_norm_query_euclidean_allowed() {
+        let path = temp_file("zero-norm-euclidean");
+        let mut db =
+            Database::create_with_metric(&path, 3, DistanceMetric::Euclidean).expect("create");
+        db.insert("a", vec![1.0, 0.0, 0.0], Metadata::new())
+            .expect("insert");
+
+        // Euclidean distance from the origin is well-defined; should succeed.
+        let result = db.search(
+            &[0.0, 0.0, 0.0],
+            SearchOptions {
+                top_k: 5,
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "zero-norm euclidean search should succeed: {:?}",
+            result.err()
+        );
+        cleanup(&path);
+    }
+
+    // ---------------------------------------------------------------
+    // Bug #15: dimension mismatch in search query should be rejected
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn search_undersized_query_rejected() {
+        let path = temp_file("dim-under");
+        let mut db = Database::create(&path, 4).expect("create");
+        db.insert("a", vec![1.0, 0.0, 0.0, 0.0], Metadata::new())
+            .expect("insert");
+
+        // Query dim=2 on a dim=4 database without truncate_dim.
+        let result = db.search(
+            &[1.0, 0.0],
+            SearchOptions {
+                top_k: 5,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err(), "undersized query should fail");
+        match result.unwrap_err() {
+            VectLiteError::DimensionMismatch { expected, found } => {
+                assert_eq!(expected, 4);
+                assert_eq!(found, 2);
+            }
+            other => panic!("expected DimensionMismatch, got: {other}"),
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn search_oversized_query_rejected() {
+        let path = temp_file("dim-over");
+        let mut db = Database::create(&path, 3).expect("create");
+        db.insert("a", vec![1.0, 0.0, 0.0], Metadata::new())
+            .expect("insert");
+
+        let result = db.search(
+            &[1.0, 0.0, 0.0, 0.0, 0.0],
+            SearchOptions {
+                top_k: 5,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err(), "oversized query should fail");
+        match result.unwrap_err() {
+            VectLiteError::DimensionMismatch { expected, found } => {
+                assert_eq!(expected, 3);
+                assert_eq!(found, 5);
+            }
+            other => panic!("expected DimensionMismatch, got: {other}"),
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn search_undersized_query_with_truncate_dim_allowed() {
+        let path = temp_file("dim-matryoshka");
+        let mut db = Database::create(&path, 4).expect("create");
+        db.insert("a", vec![1.0, 0.0, 0.0, 0.0], Metadata::new())
+            .expect("insert");
+
+        // With explicit truncate_dim, undersized queries are Matryoshka-truncated.
+        let result = db.search(
+            &[1.0, 0.0],
+            SearchOptions {
+                top_k: 5,
+                truncate_dim: Some(2),
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "truncate_dim query should succeed: {:?}",
+            result.err()
+        );
         cleanup(&path);
     }
 }
