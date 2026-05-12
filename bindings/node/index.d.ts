@@ -237,12 +237,16 @@ export class Database {
   snapshot(dest: string): void
   backup(dest: string): void
   search(request: SearchRequest): SearchResult[]
+  search(query: number[], k: number): SearchResult[]
   search(query?: number[] | null, options?: SearchOptions): SearchResult[]
   searchWithStats(request: SearchRequest): SearchResponse
+  searchWithStats(query: number[], k: number): SearchResponse
   searchWithStats(query?: number[] | null, options?: SearchOptions): SearchResponse
   searchAsync(request: SearchRequest): Promise<SearchResult[]>
+  searchAsync(query: number[], k: number): Promise<SearchResult[]>
   searchAsync(query?: number[] | null, options?: SearchOptions): Promise<SearchResult[]>
   searchWithStatsAsync(request: SearchRequest): Promise<SearchResponse>
+  searchWithStatsAsync(query: number[], k: number): Promise<SearchResponse>
   searchWithStatsAsync(query?: number[] | null, options?: SearchOptions): Promise<SearchResponse>
   flushAsync(): Promise<void>
   compactAsync(): Promise<void>

@@ -30,6 +30,15 @@ test('database crud and search', () => {
   assert.equal(objectResults.length, 1)
   assert.equal(objectResults[0].id, 'doc1')
 
+  // search(query, k) shorthand
+  const shorthandResults = db.search([1, 0], 2)
+  assert.equal(shorthandResults.length, 2)
+  assert.equal(shorthandResults[0].id, 'doc1')
+
+  const shorthandStats = db.searchWithStats([1, 0], 2)
+  assert.equal(shorthandStats.results.length, 2)
+  assert.equal(typeof shorthandStats.stats.used_ann, 'boolean')
+
   const outcome = db.searchWithStats([1, 0], { k: 2, sparse: { auth: 1 }, fusion: 'rrf' })
   assert.equal(Array.isArray(outcome.results), true)
   assert.equal(typeof outcome.stats.used_ann, 'boolean')

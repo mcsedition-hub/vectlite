@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "org.mcsedition"
-version = "0.9.1"
+version = "0.9.2"
 
 val workspaceDir = layout.projectDirectory.dir("../..").asFile
 val nativeProfile = providers.gradleProperty("nativeProfile").orElse("debug").get()
@@ -49,10 +49,11 @@ val prepareUniffiKotlin by tasks.registering {
 }
 
 kotlin {
-    // Pin the JVM toolchain so Gradle auto-provisions a compatible JDK
-    // regardless of what JAVA_HOME points to.  Without this, JDK 25+
-    // causes Kotlin 2.0.x to crash during compilation.
-    jvmToolchain(17)
+    // Compile with whatever JDK the host provides but emit JDK 17 bytecode
+    // so the library runs on Java 17+.  We intentionally do NOT set
+    // jvmToolchain(17) because that forces Gradle to locate or provision a
+    // JDK 17, which breaks on machines that only have a newer JDK (e.g. 20+)
+    // and no toolchain resolver configured.
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }

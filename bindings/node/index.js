@@ -234,6 +234,9 @@ function normalizeSearchArgs(query, options) {
     const { query: normalizedQuery = null, ...normalizedOptions } = query
     return { query: normalizedQuery, options: normalizedOptions }
   }
+  if (typeof options === 'number') {
+    return { query, options: { k: options } }
+  }
   return { query, options: options ?? {} }
 }
 

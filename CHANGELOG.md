@@ -6,6 +6,13 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-05-12
+
+### Fixed
+
+- Node `Database.search*` methods now accept the shorthand `db.search(query, k)` in addition to `db.search(query, options)` and `db.search({ query, ...options })`.
+- Kotlin builds no longer force Gradle to locate or provision a JDK 17 toolchain. The binding now compiles with the host JDK while still emitting Java 17-compatible bytecode.
+
 ## [0.9.1] - 2026-05-12
 
 ### Fixed
