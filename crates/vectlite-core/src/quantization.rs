@@ -619,11 +619,7 @@ pub struct TwoBitQuantizer {
 
 impl TwoBitQuantizer {
     /// Train a 2-bit quantizer by computing per-dimension quartiles.
-    pub fn train(
-        vectors: &[&[f32]],
-        dimension: usize,
-        config: TwoBitQuantizationConfig,
-    ) -> Self {
+    pub fn train(vectors: &[&[f32]], dimension: usize, config: TwoBitQuantizationConfig) -> Self {
         assert!(!vectors.is_empty(), "need at least one vector to train");
 
         // Collect values per dimension and compute quartile boundaries
@@ -691,8 +687,11 @@ impl TwoBitQuantizer {
         self.codes.clear();
         self.codes.reserve(vectors.len() * self.bytes_per_vector);
         for vector in vectors {
-            self.codes
-                .extend_from_slice(&quantize_two_bit(vector, &self.boundaries, self.bytes_per_vector));
+            self.codes.extend_from_slice(&quantize_two_bit(
+                vector,
+                &self.boundaries,
+                self.bytes_per_vector,
+            ));
         }
         self.count = vectors.len();
     }
@@ -846,10 +845,7 @@ impl MultiVectorQuantizedIndex {
     }
 
     /// Rebuild from document token vectors (after loading parameters from disk).
-    pub fn rebuild(
-        &mut self,
-        doc_token_vectors: &[&[Vec<f32>]],
-    ) {
+    pub fn rebuild(&mut self, doc_token_vectors: &[&[Vec<f32>]]) {
         let all_tokens: Vec<&[f32]> = doc_token_vectors
             .iter()
             .flat_map(|tokens| tokens.iter().map(|v| v.as_slice()))
@@ -1520,7 +1516,10 @@ mod tests {
         for (a, b) in original.boundaries.iter().zip(restored.boundaries.iter()) {
             assert!((a - b).abs() < 1e-6);
         }
-        assert_eq!(original.config.rescore_multiplier, restored.config.rescore_multiplier);
+        assert_eq!(
+            original.config.rescore_multiplier,
+            restored.config.rescore_multiplier
+        );
     }
 
     #[test]

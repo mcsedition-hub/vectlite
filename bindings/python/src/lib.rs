@@ -175,7 +175,9 @@ impl PyDatabase {
             multi_vectors: MultiVectors::new(),
             expires_at,
         };
-        database.insert_many(std::iter::once(record)).map_err(to_py_error)?;
+        database
+            .insert_many(std::iter::once(record))
+            .map_err(to_py_error)?;
         Ok(())
     }
 
@@ -207,7 +209,9 @@ impl PyDatabase {
             multi_vectors: MultiVectors::new(),
             expires_at,
         };
-        database.upsert_many(std::iter::once(record)).map_err(to_py_error)?;
+        database
+            .upsert_many(std::iter::once(record))
+            .map_err(to_py_error)?;
         Ok(())
     }
 

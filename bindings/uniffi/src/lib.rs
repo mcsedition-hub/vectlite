@@ -4,14 +4,14 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use serde_json::{json, Map, Number, Value};
-use vectlite::{
-    Database as CoreDatabase, DistanceMetric, FusionStrategy, HybridSearchOptions, Metadata,
-    MetadataFilter, MetadataValue, PayloadIndexType, Record, SparseVector,
-    Store as CoreStore, WriteOperation,
-};
 use vectlite::quantization::{
     BinaryQuantizationConfig, ProductQuantizationConfig, QuantizationConfig,
     ScalarQuantizationConfig,
+};
+use vectlite::{
+    Database as CoreDatabase, DistanceMetric, FusionStrategy, HybridSearchOptions, Metadata,
+    MetadataFilter, MetadataValue, PayloadIndexType, Record, SparseVector, Store as CoreStore,
+    WriteOperation,
 };
 
 // ---------------------------------------------------------------------------
@@ -39,30 +39,22 @@ pub enum VectLiteError {
 impl From<vectlite::VectLiteError> for VectLiteError {
     fn from(err: vectlite::VectLiteError) -> Self {
         match err {
-            vectlite::VectLiteError::Io(e) => VectLiteError::Io {
-                msg: e.to_string(),
-            },
-            vectlite::VectLiteError::InvalidFormat(msg) => {
-                VectLiteError::InvalidFormat { msg }
-            }
+            vectlite::VectLiteError::Io(e) => VectLiteError::Io { msg: e.to_string() },
+            vectlite::VectLiteError::InvalidFormat(msg) => VectLiteError::InvalidFormat { msg },
             vectlite::VectLiteError::DimensionMismatch { expected, found } => {
                 VectLiteError::DimensionMismatch {
                     msg: format!("expected {expected}, found {found}"),
                 }
             }
-            vectlite::VectLiteError::DuplicateId { namespace, id } => {
-                VectLiteError::DuplicateId {
-                    msg: if namespace.is_empty() {
-                        format!("id '{id}' already exists")
-                    } else {
-                        format!("id '{id}' already exists in namespace '{namespace}'")
-                    },
-                }
-            }
+            vectlite::VectLiteError::DuplicateId { namespace, id } => VectLiteError::DuplicateId {
+                msg: if namespace.is_empty() {
+                    format!("id '{id}' already exists")
+                } else {
+                    format!("id '{id}' already exists in namespace '{namespace}'")
+                },
+            },
             vectlite::VectLiteError::ReadOnly => VectLiteError::ReadOnly,
-            vectlite::VectLiteError::LockContention(msg) => {
-                VectLiteError::LockContention { msg }
-            }
+            vectlite::VectLiteError::LockContention(msg) => VectLiteError::LockContention { msg },
         }
     }
 }
@@ -111,7 +103,11 @@ pub struct Database {
 impl Database {
     // -- Constructors --
 
-    fn open_or_create(path: String, dimension: u32, metric: Option<String>) -> Result<Self, VectLiteError> {
+    fn open_or_create(
+        path: String,
+        dimension: u32,
+        metric: Option<String>,
+    ) -> Result<Self, VectLiteError> {
         let metric = match metric {
             Some(m) => DistanceMetric::from_name(&m)?,
             None => DistanceMetric::Cosine,
@@ -209,9 +205,15 @@ impl Database {
         Ok(self.write().delete_in_namespace(ns, &id)?)
     }
 
-    fn delete_many(&self, ids: Vec<String>, namespace: Option<String>) -> Result<u32, VectLiteError> {
+    fn delete_many(
+        &self,
+        ids: Vec<String>,
+        namespace: Option<String>,
+    ) -> Result<u32, VectLiteError> {
         let ns = namespace.as_deref().unwrap_or("");
-        Ok(self.write().delete_many_in_namespace(ns, ids.iter().map(String::as_str))? as u32)
+        Ok(self
+            .write()
+            .delete_many_in_namespace(ns, ids.iter().map(String::as_str))? as u32)
     }
 
     fn delete_by_filter(
@@ -232,7 +234,9 @@ impl Database {
     ) -> Result<bool, VectLiteError> {
         let metadata = parse_metadata(&metadata_json)?;
         let ns = namespace.as_deref().unwrap_or("");
-        Ok(self.write().update_metadata_in_namespace(ns, &id, metadata)?)
+        Ok(self
+            .write()
+            .update_metadata_in_namespace(ns, &id, metadata)?)
     }
 
     fn set_ttl(
@@ -259,9 +263,7 @@ impl Database {
     }
 
     fn count(&self, namespace: Option<String>, filter_json: Option<String>) -> u32 {
-        let filter = filter_json
-            .as_ref()
-            .and_then(|j| parse_filter(j).ok());
+        let filter = filter_json.as_ref().and_then(|j| parse_filter(j).ok());
         let ns = namespace.as_deref();
         let db = self.read();
         db.count_filtered(ns, filter.as_ref()) as u32
@@ -274,9 +276,7 @@ impl Database {
         limit: u32,
         offset: u32,
     ) -> Vec<RecordResult> {
-        let filter = filter_json
-            .as_ref()
-            .and_then(|j| parse_filter(j).ok());
+        let filter = filter_json.as_ref().and_then(|j| parse_filter(j).ok());
         let ns = namespace.as_deref();
         let db = self.read();
         let records = db.list(
@@ -295,10 +295,7 @@ impl Database {
         limit: u32,
         cursor: Option<String>,
     ) -> Result<CursorPage, VectLiteError> {
-        let filter = filter_json
-            .as_ref()
-            .map(|j| parse_filter(j))
-            .transpose()?;
+        let filter = filter_json.as_ref().map(|j| parse_filter(j)).transpose()?;
         let ns = namespace.as_deref();
         let db = self.read();
         let (records, next_cursor) = db.list_cursor(
@@ -331,10 +328,7 @@ impl Database {
         sparse_weight: Option<f32>,
         mmr_lambda: Option<f32>,
     ) -> Result<Vec<SearchResult>, VectLiteError> {
-        let filter = filter_json
-            .as_ref()
-            .map(|j| parse_filter(j))
-            .transpose()?;
+        let filter = filter_json.as_ref().map(|j| parse_filter(j)).transpose()?;
         let sparse: Option<SparseVector> = match &sparse_json {
             Some(j) => Some(parse_sparse(j)?),
             None => None,
@@ -361,17 +355,9 @@ impl Database {
             multi_vector_queries: BTreeMap::new(),
         };
 
-        let results = db.hybrid_search_in_namespace(
-            ns,
-            Some(&query),
-            sparse.as_ref(),
-            options,
-        )?;
+        let results = db.hybrid_search_in_namespace(ns, Some(&query), sparse.as_ref(), options)?;
 
-        Ok(results
-            .into_iter()
-            .map(core_result_to_ffi)
-            .collect())
+        Ok(results.into_iter().map(core_result_to_ffi).collect())
     }
 
     fn search_with_stats(
@@ -386,10 +372,7 @@ impl Database {
         sparse_weight: Option<f32>,
         mmr_lambda: Option<f32>,
     ) -> Result<SearchStatsResult, VectLiteError> {
-        let filter = filter_json
-            .as_ref()
-            .map(|j| parse_filter(j))
-            .transpose()?;
+        let filter = filter_json.as_ref().map(|j| parse_filter(j)).transpose()?;
         let sparse: Option<SparseVector> = match &sparse_json {
             Some(j) => Some(parse_sparse(j)?),
             None => None,
@@ -416,12 +399,8 @@ impl Database {
             multi_vector_queries: BTreeMap::new(),
         };
 
-        let outcome = db.hybrid_search_in_namespace_with_stats(
-            ns,
-            Some(&query),
-            sparse.as_ref(),
-            options,
-        )?;
+        let outcome =
+            db.hybrid_search_in_namespace_with_stats(ns, Some(&query), sparse.as_ref(), options)?;
 
         let stats_json = serde_json::to_string(&json!({
             "used_ann": outcome.stats.used_ann,
@@ -442,7 +421,11 @@ impl Database {
         .map_err(|e| json_err(e.to_string()))?;
 
         Ok(SearchStatsResult {
-            results: outcome.results.into_iter().map(core_result_to_ffi).collect(),
+            results: outcome
+                .results
+                .into_iter()
+                .map(core_result_to_ffi)
+                .collect(),
             stats_json,
         })
     }
@@ -464,9 +447,7 @@ impl Database {
         let indexes: Vec<Value> = db
             .list_indexes()
             .into_iter()
-            .map(|(field, idx_type)| {
-                json!({ "field": field, "type": idx_type.name() })
-            })
+            .map(|(field, idx_type)| json!({ "field": field, "type": idx_type.name() }))
             .collect();
         serde_json::to_string(&indexes).unwrap_or_else(|_| "[]".to_owned())
     }
@@ -577,10 +558,7 @@ impl Database {
                         .get("id")
                         .and_then(Value::as_str)
                         .ok_or_else(|| json_err("delete operation must have an 'id' field"))?;
-                    let namespace = obj
-                        .get("namespace")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
+                    let namespace = obj.get("namespace").and_then(Value::as_str).unwrap_or("");
                     ops.push(WriteOperation::Delete {
                         namespace: namespace.to_owned(),
                         id: id.to_owned(),
@@ -629,7 +607,11 @@ impl Store {
         self.inner.root().display().to_string()
     }
 
-    fn create_collection(&self, name: String, dimension: u32) -> Result<Arc<Database>, VectLiteError> {
+    fn create_collection(
+        &self,
+        name: String,
+        dimension: u32,
+    ) -> Result<Arc<Database>, VectLiteError> {
         let db = self.inner.create_collection(&name, dimension as usize)?;
         Ok(Arc::new(Database {
             inner: RwLock::new(db),
@@ -695,7 +677,9 @@ fn sparse_terms(text: String) -> String {
 
 fn restore(source: String, dest: String) -> Result<Arc<Database>, VectLiteError> {
     let db = CoreDatabase::restore(&source, &dest)?;
-    Ok(Arc::new(Database { inner: RwLock::new(db) }))
+    Ok(Arc::new(Database {
+        inner: RwLock::new(db),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -841,7 +825,10 @@ fn parse_field_filter(key: &str, value: &Value) -> Result<MetadataFilter, VectLi
                     }
                 }
                 "$elemMatch" => {
-                    let sub = if operand.as_object().map_or(false, |o| o.keys().all(|k| k.starts_with('$'))) {
+                    let sub = if operand
+                        .as_object()
+                        .map_or(false, |o| o.keys().all(|k| k.starts_with('$')))
+                    {
                         parse_field_filter("_", operand)?
                     } else {
                         json_to_filter(operand)?

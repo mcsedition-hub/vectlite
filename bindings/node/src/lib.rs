@@ -303,9 +303,7 @@ impl NativeDatabase {
         let indexes = database.list_indexes();
         let arr: Vec<Value> = indexes
             .into_iter()
-            .map(|(field, index_type)| {
-                json!({ "field": field, "type": index_type.name() })
-            })
+            .map(|(field, index_type)| json!({ "field": field, "type": index_type.name() }))
             .collect();
         serde_json::to_string(&arr).map_err(|e| err(format!("JSON serialize: {e}")))
     }
@@ -535,8 +533,9 @@ impl NativeDatabase {
         let mv = json_to_multi_vectors(&mv_value)?;
 
         let (metadata, namespace) = if let Some(opts) = options_json {
-            let opts: Value = serde_json::from_str(&opts)
-                .map_err(|e| to_napi_error(vectlite::VectLiteError::InvalidFormat(e.to_string())))?;
+            let opts: Value = serde_json::from_str(&opts).map_err(|e| {
+                to_napi_error(vectlite::VectLiteError::InvalidFormat(e.to_string()))
+            })?;
             let metadata = opts
                 .get("metadata")
                 .map(|v| json_to_metadata(v))
@@ -570,11 +569,11 @@ impl NativeDatabase {
     ) -> Result<String> {
         let qt_value: Value = serde_json::from_str(&query_tokens_json)
             .map_err(|e| to_napi_error(vectlite::VectLiteError::InvalidFormat(e.to_string())))?;
-        let qt_arr = qt_value
-            .as_array()
-            .ok_or_else(|| to_napi_error(vectlite::VectLiteError::InvalidFormat(
+        let qt_arr = qt_value.as_array().ok_or_else(|| {
+            to_napi_error(vectlite::VectLiteError::InvalidFormat(
                 "query_tokens must be a JSON array of arrays".to_owned(),
-            )))?;
+            ))
+        })?;
         let query_tokens: Vec<Vec<f32>> = qt_arr
             .iter()
             .map(|v| {
@@ -586,26 +585,22 @@ impl NativeDatabase {
                     })?
                     .iter()
                     .map(|n| {
-                        n.as_f64()
-                            .map(|f| f as f32)
-                            .ok_or_else(|| {
-                                to_napi_error(vectlite::VectLiteError::InvalidFormat(
-                                    "token values must be numbers".to_owned(),
-                                ))
-                            })
+                        n.as_f64().map(|f| f as f32).ok_or_else(|| {
+                            to_napi_error(vectlite::VectLiteError::InvalidFormat(
+                                "token values must be numbers".to_owned(),
+                            ))
+                        })
                     })
                     .collect::<Result<Vec<f32>>>()
             })
             .collect::<Result<Vec<Vec<f32>>>>()?;
 
         let (top_k, filter, namespace) = if let Some(opts) = options_json {
-            let opts: Value = serde_json::from_str(&opts)
-                .map_err(|e| to_napi_error(vectlite::VectLiteError::InvalidFormat(e.to_string())))?;
+            let opts: Value = serde_json::from_str(&opts).map_err(|e| {
+                to_napi_error(vectlite::VectLiteError::InvalidFormat(e.to_string()))
+            })?;
             let top_k = opts.get("k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-            let filter = opts
-                .get("filter")
-                .map(|v| json_to_filter(v))
-                .transpose()?;
+            let filter = opts.get("filter").map(|v| json_to_filter(v)).transpose()?;
             let namespace = opts
                 .get("namespace")
                 .and_then(|v| v.as_str())
@@ -650,8 +645,9 @@ impl NativeDatabase {
         options_json: Option<String>,
     ) -> Result<()> {
         let (method, rescore_multiplier) = if let Some(opts) = options_json {
-            let opts: Value = serde_json::from_str(&opts)
-                .map_err(|e| to_napi_error(vectlite::VectLiteError::InvalidFormat(e.to_string())))?;
+            let opts: Value = serde_json::from_str(&opts).map_err(|e| {
+                to_napi_error(vectlite::VectLiteError::InvalidFormat(e.to_string()))
+            })?;
             let method = opts
                 .get("method")
                 .and_then(|v| v.as_str())
@@ -672,7 +668,9 @@ impl NativeDatabase {
             }),
             other => {
                 return Err(to_napi_error(vectlite::VectLiteError::InvalidFormat(
-                    format!("unknown multi-vector quantization method: {other}. Supported: two_bit"),
+                    format!(
+                        "unknown multi-vector quantization method: {other}. Supported: two_bit"
+                    ),
                 )));
             }
         };
@@ -1622,9 +1620,7 @@ fn json_to_record(object: &Map<String, Value>, default_namespace: Option<&str>) 
         .transpose()?
         .unwrap_or_default();
 
-    let ttl = object
-        .get("ttl")
-        .and_then(|v| v.as_f64());
+    let ttl = object.get("ttl").and_then(|v| v.as_f64());
     let expires_at = ttl_to_expires_at(ttl)?;
 
     Ok(Record {
@@ -1910,9 +1906,7 @@ fn value_to_f32(value: &Value, label: &str) -> Result<f32> {
 fn ttl_to_expires_at(ttl: Option<f64>) -> Result<Option<f64>> {
     match ttl {
         None => Ok(None),
-        Some(t) if t < 0.0 || t.is_nan() => {
-            Err(err("ttl must be a non-negative finite number"))
-        }
+        Some(t) if t < 0.0 || t.is_nan() => Err(err("ttl must be a non-negative finite number")),
         Some(t) => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

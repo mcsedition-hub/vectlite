@@ -233,7 +233,10 @@ fn scalar_manhattan_distance(left: &[f32], right: &[f32]) -> f32 {
 #[derive(Clone, Debug)]
 enum WalOp {
     Upsert(Record),
-    Delete { namespace: String, id: String },
+    Delete {
+        namespace: String,
+        id: String,
+    },
     UpdateMetadata {
         namespace: String,
         id: String,
@@ -1147,7 +1150,10 @@ impl NumericIndex {
     /// Return keys where value > threshold.
     fn range_gt(&self, threshold: f64) -> HashSet<RecordKey> {
         let mut result = HashSet::new();
-        for (_, set) in self.tree.range((std::ops::Bound::Excluded(OrdF64(threshold)), std::ops::Bound::Unbounded)) {
+        for (_, set) in self.tree.range((
+            std::ops::Bound::Excluded(OrdF64(threshold)),
+            std::ops::Bound::Unbounded,
+        )) {
             result.extend(set.iter().cloned());
         }
         result
@@ -1255,9 +1261,9 @@ impl AnnHnsw {
             AnnHnsw::DotProduct(h) => h.file_dump(directory, basename),
             AnnHnsw::Manhattan(h) => h.file_dump(directory, basename),
         };
-        result
-            .map(|_| ())
-            .map_err(|err| VectLiteError::InvalidFormat(format!("failed to persist ANN index: {err}")))
+        result.map(|_| ()).map_err(|err| {
+            VectLiteError::InvalidFormat(format!("failed to persist ANN index: {err}"))
+        })
     }
 }
 
@@ -1514,9 +1520,7 @@ impl Database {
                 .filter_map(|key| self.records.get(key))
                 .filter(|record| {
                     !record.is_expired_at(now)
-                        && filter
-                            .map(|f| f.matches(&record.metadata))
-                            .unwrap_or(true)
+                        && filter.map(|f| f.matches(&record.metadata)).unwrap_or(true)
                 })
                 .count()
         } else {
@@ -1563,9 +1567,7 @@ impl Database {
                 .filter_map(|key| self.records.get(*key))
                 .filter(|record| {
                     !record.is_expired_at(now)
-                        && filter
-                            .map(|f| f.matches(&record.metadata))
-                            .unwrap_or(true)
+                        && filter.map(|f| f.matches(&record.metadata)).unwrap_or(true)
                 })
                 .skip(offset)
                 .take(if limit == 0 { usize::MAX } else { limit })
@@ -1659,9 +1661,7 @@ impl Database {
 
         let next_cursor = if results.len() > limit {
             results.pop(); // remove the extra
-            results
-                .last()
-                .map(|r| format!("{}\0{}", r.namespace, r.id))
+            results.last().map(|r| format!("{}\0{}", r.namespace, r.id))
         } else {
             None
         };
@@ -1710,11 +1710,7 @@ impl Database {
     ///
     /// Returns `true` if the record exists and was updated, `false` if the
     /// record was not found (no error is raised).
-    pub fn update_metadata(
-        &mut self,
-        id: impl Into<String>,
-        metadata: Metadata,
-    ) -> Result<bool> {
+    pub fn update_metadata(&mut self, id: impl Into<String>, metadata: Metadata) -> Result<bool> {
         self.update_metadata_in_namespace(DEFAULT_NAMESPACE, id, metadata)
     }
 
@@ -1841,7 +1837,11 @@ impl Database {
             PayloadIndexType::Numeric => {
                 let mut num = NumericIndex::default();
                 for (key, record) in &self.records {
-                    if let Some(val) = record.metadata.get(&field).and_then(MetadataValue::as_number) {
+                    if let Some(val) = record
+                        .metadata
+                        .get(&field)
+                        .and_then(MetadataValue::as_number)
+                    {
                         num.insert(val, key.clone());
                     }
                 }
@@ -2326,14 +2326,13 @@ impl Database {
         let dense_start = Instant::now();
         // Use quantized index for candidate selection if available (2-stage pipeline).
         // The quantized index operates on the default vector only and globally (not per-namespace).
-        let quantized_candidates =
-            if !matryoshka_truncated
-                && (vector_name.is_none() || vector_name == Some(DEFAULT_VECTOR_NAME))
-            {
-                dense_query.and_then(|query| self.quantized_candidate_keys(query, fetch_k))
-            } else {
-                None
-            };
+        let quantized_candidates = if !matryoshka_truncated
+            && (vector_name.is_none() || vector_name == Some(DEFAULT_VECTOR_NAME))
+        {
+            dense_query.and_then(|query| self.quantized_candidate_keys(query, fetch_k))
+        } else {
+            None
+        };
         let ann_candidates = if quantized_candidates.is_some() {
             // Skip HNSW if quantized index provided candidates
             None
@@ -2363,13 +2362,18 @@ impl Database {
         };
 
         // Use payload indexes to narrow candidates when doing a full scan.
-        let payload_candidates = options.filter.as_ref().and_then(|f| {
-            self.payload_index_candidates(f, namespace)
-        });
+        let payload_candidates = options
+            .filter
+            .as_ref()
+            .and_then(|f| self.payload_index_candidates(f, namespace));
         let candidate_keys = match (candidate_keys, payload_candidates) {
             (Some(ck), Some(pc)) => {
                 // Intersect ANN/sparse candidates with payload index candidates.
-                Some(ck.into_iter().filter(|k| pc.contains(k)).collect::<Vec<_>>())
+                Some(
+                    ck.into_iter()
+                        .filter(|k| pc.contains(k))
+                        .collect::<Vec<_>>(),
+                )
             }
             (None, Some(pc)) => {
                 // No ANN candidates but payload index narrowed the set.
@@ -2403,8 +2407,14 @@ impl Database {
 
         if effective_dense_candidates.is_some() && results.len() < fetch_k {
             stats.exact_fallback = true;
-            results =
-                self.collect_results(dense_query, sparse_query, &options, namespace, None, effective_dimension);
+            results = self.collect_results(
+                dense_query,
+                sparse_query,
+                &options,
+                namespace,
+                None,
+                effective_dimension,
+            );
             stats.considered_count = results.len();
         }
 
@@ -2657,7 +2667,11 @@ impl Database {
         multi_vectors: MultiVectors,
     ) -> Result<()> {
         self.upsert_multi_vectors_in_namespace(
-            DEFAULT_NAMESPACE, id, vector, metadata, multi_vectors,
+            DEFAULT_NAMESPACE,
+            id,
+            vector,
+            metadata,
+            multi_vectors,
         )
     }
 
@@ -2716,10 +2730,8 @@ impl Database {
 
         // Try quantized multi-vector search first for candidate selection
         let query_refs: Vec<&[f32]> = query_tokens.iter().map(Vec::as_slice).collect();
-        let candidate_keys: Option<Vec<RecordKey>> = self
-            .multi_vector_quantized
-            .get(space)
-            .and_then(|index| {
+        let candidate_keys: Option<Vec<RecordKey>> =
+            self.multi_vector_quantized.get(space).and_then(|index| {
                 let keys = self.multi_vector_quantized_keys.get(space)?;
                 let candidate_indices = index.search(&query_refs, top_k);
                 Some(
@@ -2740,9 +2752,7 @@ impl Database {
         let mut scored: Vec<(f32, &Record)> = record_iter
             .filter(|record| {
                 !record.is_expired_at(now)
-                    && namespace
-                        .map(|ns| record.namespace == ns)
-                        .unwrap_or(true)
+                    && namespace.map(|ns| record.namespace == ns).unwrap_or(true)
                     && record.multi_vectors.contains_key(space)
                     && options
                         .filter
@@ -2840,14 +2850,9 @@ impl Database {
             return;
         }
 
-        let index = MultiVectorQuantizedIndex::build(
-            &doc_token_vectors,
-            token_dimension,
-            &config,
-        );
+        let index = MultiVectorQuantizedIndex::build(&doc_token_vectors, token_dimension, &config);
 
-        self.multi_vector_quantized
-            .insert(space.to_owned(), index);
+        self.multi_vector_quantized.insert(space.to_owned(), index);
         self.multi_vector_quantized_keys
             .insert(space.to_owned(), keys);
     }
@@ -2928,15 +2933,15 @@ impl Database {
 
             if !doc_token_vectors.is_empty() {
                 index.rebuild(&doc_token_vectors);
-                let MultiVectorQuantizationConfig::TwoBit(ref cfg) = {
-                    MultiVectorQuantizationConfig::TwoBit(index.quantizer.config.clone())
-                };
-                self.multi_vector_quantization_config
-                    .insert(space.to_owned(), MultiVectorQuantizationConfig::TwoBit(cfg.clone()));
+                let MultiVectorQuantizationConfig::TwoBit(ref cfg) =
+                    { MultiVectorQuantizationConfig::TwoBit(index.quantizer.config.clone()) };
+                self.multi_vector_quantization_config.insert(
+                    space.to_owned(),
+                    MultiVectorQuantizationConfig::TwoBit(cfg.clone()),
+                );
                 self.multi_vector_quantized_keys
                     .insert(space.to_owned(), keys);
-                self.multi_vector_quantized
-                    .insert(space.to_owned(), index);
+                self.multi_vector_quantized.insert(space.to_owned(), index);
             }
         }
     }
@@ -3020,7 +3025,11 @@ impl Database {
                 PayloadIndexType::Numeric => {
                     let mut num = NumericIndex::default();
                     for (key, record) in &self.records {
-                        if let Some(val) = record.metadata.get(field).and_then(MetadataValue::as_number) {
+                        if let Some(val) = record
+                            .metadata
+                            .get(field)
+                            .and_then(MetadataValue::as_number)
+                        {
                             num.insert(val, key.clone());
                         }
                     }
@@ -3071,14 +3080,22 @@ impl Database {
     /// Use payload indexes to narrow down candidate keys for a filter.
     /// Returns `None` if no indexes can help with this filter (fallback to scan).
     /// Returns `Some(set)` with the set of record keys that *may* match the filter.
-    fn payload_index_candidates(&self, filter: &MetadataFilter, namespace: Option<&str>) -> Option<HashSet<RecordKey>> {
+    fn payload_index_candidates(
+        &self,
+        filter: &MetadataFilter,
+        namespace: Option<&str>,
+    ) -> Option<HashSet<RecordKey>> {
         if self.payload_indexes.is_empty() {
             return None;
         }
         self.payload_index_candidates_inner(filter, namespace)
     }
 
-    fn payload_index_candidates_inner(&self, filter: &MetadataFilter, namespace: Option<&str>) -> Option<HashSet<RecordKey>> {
+    fn payload_index_candidates_inner(
+        &self,
+        filter: &MetadataFilter,
+        namespace: Option<&str>,
+    ) -> Option<HashSet<RecordKey>> {
         match filter {
             MetadataFilter::Eq { key, value } => {
                 // Try keyword index for string equality
@@ -3172,7 +3189,11 @@ impl Database {
         }
     }
 
-    fn filter_by_namespace(&self, keys: HashSet<RecordKey>, namespace: Option<&str>) -> HashSet<RecordKey> {
+    fn filter_by_namespace(
+        &self,
+        keys: HashSet<RecordKey>,
+        namespace: Option<&str>,
+    ) -> HashSet<RecordKey> {
         match namespace {
             Some(ns) => keys.into_iter().filter(|(n, _)| n == ns).collect(),
             None => keys,
@@ -3357,7 +3378,9 @@ impl Database {
             WalOp::UpdateMetadata { .. } | WalOp::SetTtl { .. } => false,
         });
 
-        let metadata_only = ops.iter().all(|op| matches!(op, WalOp::UpdateMetadata { .. } | WalOp::SetTtl { .. }));
+        let metadata_only = ops
+            .iter()
+            .all(|op| matches!(op, WalOp::UpdateMetadata { .. } | WalOp::SetTtl { .. }));
 
         self.append_wal_batch(&ops)?;
         self.apply_ops_in_memory(ops);
@@ -3721,19 +3744,19 @@ impl Database {
             Some(0) => {
                 return Err(VectLiteError::InvalidFormat(
                     "truncate_dim must be greater than zero".to_owned(),
-                ))
+                ));
             }
             Some(dim) if dim > self.dimension => {
                 return Err(VectLiteError::DimensionMismatch {
                     expected: self.dimension,
                     found: dim,
-                })
+                });
             }
             Some(dim) if dim > query.len() => {
                 return Err(VectLiteError::InvalidFormat(format!(
                     "truncate_dim ({dim}) cannot exceed query vector length ({})",
                     query.len()
-                )))
+                )));
             }
             Some(dim) => dim,
             None => query.len(),
@@ -4058,8 +4081,13 @@ impl Database {
                         let mut weighted_sum = 0.0_f32;
                         for (name, (query, weight)) in &options.multi_vector_queries {
                             if let Some(vector) = record.vector_for(Some(name.as_str())) {
-                                weighted_sum +=
-                                    weight * score_dense_prefix(self.metric, query, vector, effective_dimension);
+                                weighted_sum += weight
+                                    * score_dense_prefix(
+                                        self.metric,
+                                        query,
+                                        vector,
+                                        effective_dimension,
+                                    );
                             }
                         }
                         (weighted_sum, None)
@@ -4375,11 +4403,7 @@ fn ensure_dimension(dimension: usize) -> Result<()> {
 /// MaxSim scoring (ColBERT-style late interaction).
 /// For each query token, find the maximum similarity against any document
 /// token using the given metric, then sum those maxima across all query tokens.
-fn maxsim_score(
-    query_tokens: &[&[f32]],
-    doc_tokens: &[Vec<f32>],
-    metric: DistanceMetric,
-) -> f32 {
+fn maxsim_score(query_tokens: &[&[f32]], doc_tokens: &[Vec<f32>], metric: DistanceMetric) -> f32 {
     if query_tokens.is_empty() || doc_tokens.is_empty() {
         return 0.0;
     }
@@ -4428,8 +4452,13 @@ fn build_ann_index(records: Vec<(RecordKey, &Vec<f32>)>, metric: DistanceMetric)
 
     macro_rules! build_hnsw {
         ($dist_type:ty, $dist_val:expr, $variant:ident) => {{
-            let mut hnsw =
-                Hnsw::<f32, $dist_type>::new(ANN_M, count, max_layer, ANN_EF_CONSTRUCTION, $dist_val);
+            let mut hnsw = Hnsw::<f32, $dist_type>::new(
+                ANN_M,
+                count,
+                max_layer,
+                ANN_EF_CONSTRUCTION,
+                $dist_val,
+            );
             let mut keys = Vec::with_capacity(count);
             for (origin_id, (key, vector)) in records.into_iter().enumerate() {
                 hnsw.insert((vector.as_slice(), origin_id));
@@ -5350,9 +5379,9 @@ fn usize_from_u64(value: u64) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Database, HybridSearchOptions, Metadata, MetadataFilter, MetadataValue, MultiVectors,
-        MultiVectorSearchOptions, NamedVectors, PayloadIndexType, Record, SearchOptions,
-        SparseVector, VectLiteError,
+        Database, HybridSearchOptions, Metadata, MetadataFilter, MetadataValue,
+        MultiVectorSearchOptions, MultiVectors, NamedVectors, PayloadIndexType, Record,
+        SearchOptions, SparseVector, VectLiteError,
     };
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -6200,10 +6229,7 @@ mod tests {
         let mut mv1 = MultiVectors::new();
         mv1.insert(
             "colbert".to_owned(),
-            vec![
-                vec![1.0, 0.0, 0.0],
-                vec![0.0, 1.0, 0.0],
-            ],
+            vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]],
         );
         db.upsert_multi_vectors("doc1", vec![1.0, 0.0, 0.0], Metadata::new(), mv1)
             .expect("upsert doc1");
@@ -6211,10 +6237,7 @@ mod tests {
         let mut mv2 = MultiVectors::new();
         mv2.insert(
             "colbert".to_owned(),
-            vec![
-                vec![0.0, 0.0, 1.0],
-                vec![0.0, 1.0, 0.0],
-            ],
+            vec![vec![0.0, 0.0, 1.0], vec![0.0, 1.0, 0.0]],
         );
         db.upsert_multi_vectors("doc2", vec![0.0, 0.0, 1.0], Metadata::new(), mv2)
             .expect("upsert doc2");
@@ -6222,13 +6245,14 @@ mod tests {
         assert_eq!(db.len(), 2);
 
         // Search with query tokens that strongly match doc1
-        let query_tokens = vec![
-            vec![1.0, 0.0, 0.0],
-            vec![0.0, 1.0, 0.0],
-        ];
+        let query_tokens = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]];
 
         let results = db
-            .search_multi_vector("colbert", &query_tokens, MultiVectorSearchOptions::default())
+            .search_multi_vector(
+                "colbert",
+                &query_tokens,
+                MultiVectorSearchOptions::default(),
+            )
             .expect("search");
 
         assert_eq!(results.len(), 2);
@@ -6255,7 +6279,11 @@ mod tests {
         let db = Database::create(&path, 3).expect("create");
 
         let query_tokens: Vec<Vec<f32>> = vec![];
-        let result = db.search_multi_vector("colbert", &query_tokens, MultiVectorSearchOptions::default());
+        let result = db.search_multi_vector(
+            "colbert",
+            &query_tokens,
+            MultiVectorSearchOptions::default(),
+        );
         assert!(result.is_err());
 
         cleanup(&path);
@@ -6268,10 +6296,22 @@ mod tests {
 
         let mut mv = MultiVectors::new();
         mv.insert("colbert".to_owned(), vec![vec![1.0, 0.0, 0.0]]);
-        db.upsert_multi_vectors_in_namespace("ns1", "doc1", vec![1.0, 0.0, 0.0], Metadata::new(), mv.clone())
-            .expect("upsert ns1");
-        db.upsert_multi_vectors_in_namespace("ns2", "doc2", vec![0.0, 1.0, 0.0], Metadata::new(), mv.clone())
-            .expect("upsert ns2");
+        db.upsert_multi_vectors_in_namespace(
+            "ns1",
+            "doc1",
+            vec![1.0, 0.0, 0.0],
+            Metadata::new(),
+            mv.clone(),
+        )
+        .expect("upsert ns1");
+        db.upsert_multi_vectors_in_namespace(
+            "ns2",
+            "doc2",
+            vec![0.0, 1.0, 0.0],
+            Metadata::new(),
+            mv.clone(),
+        )
+        .expect("upsert ns2");
 
         let query_tokens = vec![vec![1.0, 0.0, 0.0]];
         let options = MultiVectorSearchOptions {
@@ -6279,7 +6319,9 @@ mod tests {
             filter: None,
             namespace: Some("ns1".to_owned()),
         };
-        let results = db.search_multi_vector("colbert", &query_tokens, options).expect("search");
+        let results = db
+            .search_multi_vector("colbert", &query_tokens, options)
+            .expect("search");
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "doc1");
@@ -6331,13 +6373,18 @@ mod tests {
         // Search should still work
         let query_tokens = vec![vec![9.0, 0.0, 0.0], vec![0.0, 9.0, 0.0]];
         let results = db
-            .search_multi_vector("colbert", &query_tokens, MultiVectorSearchOptions::default())
+            .search_multi_vector(
+                "colbert",
+                &query_tokens,
+                MultiVectorSearchOptions::default(),
+            )
             .expect("search");
 
         assert!(!results.is_empty());
 
         // Disable quantization
-        db.disable_multi_vector_quantization("colbert").expect("disable");
+        db.disable_multi_vector_quantization("colbert")
+            .expect("disable");
         assert!(!db.is_multi_vector_quantized("colbert"));
 
         cleanup(&path);
@@ -6387,7 +6434,11 @@ mod tests {
         // Search should work on reopened database
         let query_tokens = vec![vec![0.9, 0.5, 0.5]];
         let results = db
-            .search_multi_vector("colbert", &query_tokens, MultiVectorSearchOptions::default())
+            .search_multi_vector(
+                "colbert",
+                &query_tokens,
+                MultiVectorSearchOptions::default(),
+            )
             .expect("search");
         assert!(!results.is_empty());
 
@@ -6421,7 +6472,7 @@ mod tests {
 
     #[test]
     fn multi_vector_maxsim_scoring_correctness() {
-        use super::{maxsim_score, DistanceMetric};
+        use super::{DistanceMetric, maxsim_score};
 
         // Two identical sets: MaxSim should be sum of 1.0 per query token
         let query = [&[1.0_f32, 0.0, 0.0][..], &[0.0, 1.0, 0.0]];
@@ -6479,17 +6530,44 @@ mod tests {
     fn distance_metric_name_aliases() {
         use super::DistanceMetric;
         // Euclidean aliases
-        assert_eq!(DistanceMetric::from_name("l2").unwrap(), DistanceMetric::Euclidean);
-        assert_eq!(DistanceMetric::from_name("L2").unwrap(), DistanceMetric::Euclidean);
-        assert_eq!(DistanceMetric::from_name("EUCLIDEAN").unwrap(), DistanceMetric::Euclidean);
+        assert_eq!(
+            DistanceMetric::from_name("l2").unwrap(),
+            DistanceMetric::Euclidean
+        );
+        assert_eq!(
+            DistanceMetric::from_name("L2").unwrap(),
+            DistanceMetric::Euclidean
+        );
+        assert_eq!(
+            DistanceMetric::from_name("EUCLIDEAN").unwrap(),
+            DistanceMetric::Euclidean
+        );
         // DotProduct aliases
-        assert_eq!(DistanceMetric::from_name("dot").unwrap(), DistanceMetric::DotProduct);
-        assert_eq!(DistanceMetric::from_name("dot_product").unwrap(), DistanceMetric::DotProduct);
-        assert_eq!(DistanceMetric::from_name("ip").unwrap(), DistanceMetric::DotProduct);
-        assert_eq!(DistanceMetric::from_name("inner_product").unwrap(), DistanceMetric::DotProduct);
+        assert_eq!(
+            DistanceMetric::from_name("dot").unwrap(),
+            DistanceMetric::DotProduct
+        );
+        assert_eq!(
+            DistanceMetric::from_name("dot_product").unwrap(),
+            DistanceMetric::DotProduct
+        );
+        assert_eq!(
+            DistanceMetric::from_name("ip").unwrap(),
+            DistanceMetric::DotProduct
+        );
+        assert_eq!(
+            DistanceMetric::from_name("inner_product").unwrap(),
+            DistanceMetric::DotProduct
+        );
         // Manhattan aliases
-        assert_eq!(DistanceMetric::from_name("l1").unwrap(), DistanceMetric::Manhattan);
-        assert_eq!(DistanceMetric::from_name("L1").unwrap(), DistanceMetric::Manhattan);
+        assert_eq!(
+            DistanceMetric::from_name("l1").unwrap(),
+            DistanceMetric::Manhattan
+        );
+        assert_eq!(
+            DistanceMetric::from_name("L1").unwrap(),
+            DistanceMetric::Manhattan
+        );
         // Invalid
         assert!(DistanceMetric::from_name("hamming").is_err());
     }
@@ -6634,8 +6712,8 @@ mod tests {
     fn search_with_euclidean_metric() {
         use super::DistanceMetric;
         let path = temp_file("metric-search-euclidean");
-        let mut db = Database::create_with_metric(&path, 3, DistanceMetric::Euclidean)
-            .expect("create");
+        let mut db =
+            Database::create_with_metric(&path, 3, DistanceMetric::Euclidean).expect("create");
 
         // Insert vectors at known distances from query [0, 0, 0]
         db.insert("close", vec![1.0, 0.0, 0.0], Metadata::new())
@@ -6671,8 +6749,8 @@ mod tests {
     fn search_with_dotproduct_metric() {
         use super::DistanceMetric;
         let path = temp_file("metric-search-dot");
-        let mut db = Database::create_with_metric(&path, 3, DistanceMetric::DotProduct)
-            .expect("create");
+        let mut db =
+            Database::create_with_metric(&path, 3, DistanceMetric::DotProduct).expect("create");
 
         // Vectors with different dot products with query [1, 0, 0]
         db.insert("high", vec![10.0, 0.0, 0.0], Metadata::new())
@@ -6707,8 +6785,8 @@ mod tests {
     fn search_with_manhattan_metric() {
         use super::DistanceMetric;
         let path = temp_file("metric-search-manhattan");
-        let mut db = Database::create_with_metric(&path, 3, DistanceMetric::Manhattan)
-            .expect("create");
+        let mut db =
+            Database::create_with_metric(&path, 3, DistanceMetric::Manhattan).expect("create");
 
         // Vectors at known Manhattan distances from query [0, 0, 0]
         db.insert("close", vec![1.0, 0.0, 0.0], Metadata::new())
@@ -6801,8 +6879,8 @@ mod tests {
     fn search_with_cosine_metric_explicit() {
         use super::DistanceMetric;
         let path = temp_file("metric-search-cosine-explicit");
-        let mut db = Database::create_with_metric(&path, 3, DistanceMetric::Cosine)
-            .expect("create");
+        let mut db =
+            Database::create_with_metric(&path, 3, DistanceMetric::Cosine).expect("create");
 
         db.insert("aligned", vec![2.0, 0.0, 0.0], Metadata::new())
             .expect("insert aligned"); // cosine = 1.0
@@ -6836,8 +6914,8 @@ mod tests {
         use super::DistanceMetric;
         let path = temp_file("metric-upsert-cycle");
         {
-            let mut db = Database::create_with_metric(&path, 3, DistanceMetric::Manhattan)
-                .expect("create");
+            let mut db =
+                Database::create_with_metric(&path, 3, DistanceMetric::Manhattan).expect("create");
             db.upsert("a", vec![1.0, 0.0, 0.0], Metadata::new())
                 .expect("upsert a");
             db.upsert("b", vec![0.0, 5.0, 0.0], Metadata::new())
@@ -6916,7 +6994,8 @@ mod tests {
         let mut meta = Metadata::new();
         meta.insert("source".into(), "blog".into());
         meta.insert("version".into(), MetadataValue::Integer(1));
-        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta).expect("upsert");
+        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta)
+            .expect("upsert");
 
         // Patch: update version, add new key
         let mut patch = Metadata::new();
@@ -6966,7 +7045,8 @@ mod tests {
 
         let mut meta = Metadata::new();
         meta.insert("source".into(), "blog".into());
-        db.upsert("doc1", vec![1.0, 2.0, 3.0], meta).expect("upsert");
+        db.upsert("doc1", vec![1.0, 2.0, 3.0], meta)
+            .expect("upsert");
 
         let mut patch = Metadata::new();
         patch.insert("source".into(), "updated".into());
@@ -6986,7 +7066,8 @@ mod tests {
             let mut db = Database::create(&path, 3).expect("create");
             let mut meta = Metadata::new();
             meta.insert("source".into(), "blog".into());
-            db.upsert("doc1", vec![1.0, 0.0, 0.0], meta).expect("upsert");
+            db.upsert("doc1", vec![1.0, 0.0, 0.0], meta)
+                .expect("upsert");
 
             let mut patch = Metadata::new();
             patch.insert("source".into(), "updated".into());
@@ -7052,7 +7133,8 @@ mod tests {
 
         let mut meta = Metadata::new();
         meta.insert("status".into(), "draft".into());
-        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta).expect("upsert");
+        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta)
+            .expect("upsert");
 
         // Before patch: filter matches
         let count = db.count_filtered(None, Some(&MetadataFilter::eq("status", "draft")));
@@ -7320,7 +7402,8 @@ mod tests {
 
             let mut meta = Metadata::new();
             meta.insert("source".into(), "blog".into());
-            db.upsert("doc1", vec![1.0, 0.0, 0.0], meta).expect("upsert");
+            db.upsert("doc1", vec![1.0, 0.0, 0.0], meta)
+                .expect("upsert");
 
             let mut meta2 = Metadata::new();
             meta2.insert("source".into(), "docs".into());
@@ -7356,7 +7439,8 @@ mod tests {
         // Now upsert records — they should be indexed incrementally
         let mut meta = Metadata::new();
         meta.insert("source".into(), "blog".into());
-        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta).expect("upsert");
+        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta)
+            .expect("upsert");
 
         let count = db.count_filtered(None, Some(&MetadataFilter::eq("source", "blog")));
         assert_eq!(count, 1);
@@ -7381,7 +7465,8 @@ mod tests {
 
         let mut meta = Metadata::new();
         meta.insert("source".into(), "blog".into());
-        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta).expect("upsert");
+        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta)
+            .expect("upsert");
 
         let mut meta2 = Metadata::new();
         meta2.insert("source".into(), "blog".into());
@@ -7454,7 +7539,8 @@ mod tests {
 
         let mut meta = Metadata::new();
         meta.insert("status".into(), "draft".into());
-        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta).expect("upsert");
+        db.upsert("doc1", vec![1.0, 0.0, 0.0], meta)
+            .expect("upsert");
 
         db.create_index("status", PayloadIndexType::Keyword)
             .expect("create");
@@ -7490,7 +7576,10 @@ mod tests {
         // Insert records with source and priority
         for i in 0..30 {
             let mut meta = Metadata::new();
-            meta.insert("source".into(), if i % 2 == 0 { "blog" } else { "docs" }.into());
+            meta.insert(
+                "source".into(),
+                if i % 2 == 0 { "blog" } else { "docs" }.into(),
+            );
             meta.insert("priority".into(), MetadataValue::Float((i % 3) as f64));
             db.upsert(format!("doc{}", i), vec![1.0, 0.0, 0.0], meta)
                 .expect("upsert");
@@ -7659,7 +7748,10 @@ mod tests {
 
         for i in 0..20 {
             let mut meta = Metadata::new();
-            meta.insert("type".into(), if i % 2 == 0 { "even" } else { "odd" }.into());
+            meta.insert(
+                "type".into(),
+                if i % 2 == 0 { "even" } else { "odd" }.into(),
+            );
             db.upsert(format!("doc{}", i), vec![1.0, 0.0, 0.0], meta)
                 .expect("upsert");
         }
@@ -7929,7 +8021,10 @@ mod tests {
         assert!(db.get_in_namespace("ns1", "doc1").is_none());
 
         // Wrong namespace returns false
-        assert!(!db.set_ttl_in_namespace("ns2", "doc1", 60.0).expect("set wrong ns"));
+        assert!(
+            !db.set_ttl_in_namespace("ns2", "doc1", 60.0)
+                .expect("set wrong ns")
+        );
 
         cleanup(&path);
     }
@@ -7943,12 +8038,8 @@ mod tests {
         let path = temp_file("cursor-basic");
         let mut db = Database::create(&path, 3).expect("create");
         for i in 0..5 {
-            db.upsert(
-                &format!("doc{i}"),
-                vec![1.0, 0.0, 0.0],
-                Metadata::new(),
-            )
-            .expect("upsert");
+            db.upsert(&format!("doc{i}"), vec![1.0, 0.0, 0.0], Metadata::new())
+                .expect("upsert");
         }
 
         // First page of 2
@@ -7983,12 +8074,22 @@ mod tests {
         let path = temp_file("cursor-ns");
         let mut db = Database::create(&path, 3).expect("create");
         for i in 0..3 {
-            db.upsert_in_namespace("ns1", &format!("doc{i}"), vec![1.0, 0.0, 0.0], Metadata::new())
-                .expect("upsert");
+            db.upsert_in_namespace(
+                "ns1",
+                &format!("doc{i}"),
+                vec![1.0, 0.0, 0.0],
+                Metadata::new(),
+            )
+            .expect("upsert");
         }
         for i in 0..2 {
-            db.upsert_in_namespace("ns2", &format!("doc{i}"), vec![0.0, 1.0, 0.0], Metadata::new())
-                .expect("upsert");
+            db.upsert_in_namespace(
+                "ns2",
+                &format!("doc{i}"),
+                vec![0.0, 1.0, 0.0],
+                Metadata::new(),
+            )
+            .expect("upsert");
         }
 
         let (page1, cursor1) = db.list_cursor(Some("ns1"), None, 2, None);
@@ -8007,12 +8108,8 @@ mod tests {
         let path = temp_file("cursor-ttl");
         let mut db = Database::create(&path, 3).expect("create");
         for i in 0..5 {
-            db.upsert(
-                &format!("doc{i}"),
-                vec![1.0, 0.0, 0.0],
-                Metadata::new(),
-            )
-            .expect("upsert");
+            db.upsert(&format!("doc{i}"), vec![1.0, 0.0, 0.0], Metadata::new())
+                .expect("upsert");
         }
 
         // Expire doc1
