@@ -6,6 +6,13 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-05-13
+
+### Fixed
+
+- UniFFI (Swift/Kotlin) scalar and product quantization `rescore_multiplier` defaults now match the core Rust defaults (10x) instead of being hard-coded to 4x. This fixes the recall regression where Swift scalar quantization scored ~0.66 vs Python's ~0.855. Binary quantization was already correct at 10x.
+- UniFFI `enableQuantization()` now accepts `"int8"` as an alias for `"scalar"`, matching Python and Node behaviour.
+
 ## [0.9.2] - 2026-05-12
 
 ### Fixed

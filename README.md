@@ -392,7 +392,7 @@ print(db.quantization_method)  # "scalar", "binary", or "product"
 db.disable_quantization()
 ```
 
-`rescore_multiplier` controls the number of quantized candidates rescored with exact float32 scoring: `k * rescore_multiplier`, capped at the collection size. Increase it to trade latency for recall.
+`rescore_multiplier` (default **10**) controls the number of quantized candidates rescored with exact float32 scoring: `k * rescore_multiplier`, capped at the collection size. Increase it to trade latency for recall.
 
 For PQ, `num_sub_vectors` must divide the database dimension. If omitted, Vectlite chooses a compatible default; use `db.valid_num_sub_vectors()` to inspect all valid values.
 
@@ -711,7 +711,7 @@ console.log(db.quantizationMethod)  // "scalar", "binary", or "product"
 db.disableQuantization()
 ```
 
-`rescoreMultiplier` controls the exact-rescore candidate budget (`k * rescoreMultiplier`, capped at collection size). Quantization keeps the original float32 vectors in the `.vdb` file and adds a `.vdb.quant` sidecar, so it is not a disk compression mode.
+`rescoreMultiplier` (default **10**) controls the exact-rescore candidate budget (`k * rescoreMultiplier`, capped at collection size). Quantization keeps the original float32 vectors in the `.vdb` file and adds a `.vdb.quant` sidecar, so it is not a disk compression mode.
 
 For PQ, `numSubVectors` must divide the database dimension. If omitted, Vectlite chooses a compatible default; use `db.validNumSubVectors()` to inspect all valid values.
 
@@ -805,6 +805,129 @@ vectlite.configureOpenTelemetry({ tracerName: 'my-app' })
 // Disable
 vectlite.configureOpenTelemetry(false)
 ```
+
+## Swift API (Experimental)
+
+The Swift binding wraps the UniFFI layer. All JSON parameters accept Swift string literals.
+
+### Quantization (Swift)
+
+```swift
+// Scalar quantization (int8) -- default rescore_multiplier: 10
+try db.enableQuantization(method: "scalar", optionsJson: nil)
+
+// Binary quantization with custom rescore multiplier
+try db.enableQuantization(method: "binary", optionsJson: #"{"rescoreMultiplier":20}"#)
+
+// Product quantization
+try db.enableQuantization(method: "pq", optionsJson: #"{"numSubVectors":16}"#)
+
+// Check status
+print(db.isQuantized())          // true
+print(db.quantizationMethod())   // Optional("scalar")
+
+// Disable
+try db.disableQuantization()
+```
+
+### Transactions (Swift)
+
+```swift
+let ops = """
+[
+  {"op":"upsert","id":"doc1","vector":[1,0],"metadata":{"source":"a"}},
+  {"op":"delete","id":"old_doc"}
+]
+"""
+try db.transactionExecute(operationsJson: ops)
+```
+
+### Available Methods (Swift)
+
+| Method | Description |
+|---|---|
+| `Database.openOrCreate(path:dimension:metric:)` | Open or create a database |
+| `Database.openExisting(path:lockTimeout:)` | Open an existing database |
+| `Database.openReadOnly(path:lockTimeout:)` | Open in read-only mode |
+| `db.upsert(id:vector:metadataJson:namespace:ttl:)` | Insert or update a record |
+| `db.insert(id:vector:metadataJson:namespace:ttl:)` | Insert (throws on duplicate) |
+| `db.get(id:namespace:)` | Get a record by id |
+| `db.search(query:k:filterJson:namespace:...)` | Vector search |
+| `db.searchWithStats(query:k:filterJson:namespace:...)` | Search with stats JSON |
+| `db.delete(id:namespace:)` | Delete a record |
+| `db.deleteMany(ids:namespace:)` | Delete multiple records |
+| `db.deleteByFilter(filterJson:namespace:)` | Delete by filter |
+| `db.count(namespace:filterJson:)` | Count records |
+| `db.list(namespace:filterJson:limit:offset:)` | List records |
+| `db.enableQuantization(method:optionsJson:)` | Enable quantization |
+| `db.disableQuantization()` | Disable quantization |
+| `db.isQuantized()` | Check quantization status |
+| `db.quantizationMethod()` | Active method name |
+| `db.bulkIngest(recordsJson:batchSize:)` | Bulk import |
+| `db.transactionExecute(operationsJson:)` | Atomic transaction |
+| `db.compact()` / `db.flush()` | Persist WAL to snapshot |
+| `db.snapshot(dest:)` / `db.backup(dest:)` | Backup |
+| `db.close()` | Release resources |
+
+## Kotlin API (Experimental)
+
+The Kotlin binding wraps the same UniFFI layer. JSON parameters are plain strings.
+
+### Quantization (Kotlin)
+
+```kotlin
+// Scalar quantization (int8) -- default rescoreMultiplier: 10
+db.enableQuantization("scalar", null)
+
+// Binary quantization with custom rescore multiplier
+db.enableQuantization("binary", """{"rescoreMultiplier":20}""")
+
+// Product quantization
+db.enableQuantization("pq", """{"numSubVectors":16}""")
+
+// Check status
+println(db.isQuantized())          // true
+println(db.quantizationMethod())   // "scalar"
+
+// Disable
+db.disableQuantization()
+```
+
+### Transactions (Kotlin)
+
+```kotlin
+db.transactionExecute("""[
+  {"op":"upsert","id":"doc1","vector":[1,0],"metadata":{"source":"a"}},
+  {"op":"delete","id":"old_doc"}
+]""")
+```
+
+### Available Methods (Kotlin)
+
+| Method | Description |
+|---|---|
+| `Database.openOrCreate(path, dimension, metric)` | Open or create a database |
+| `Database.openExisting(path, lockTimeout?)` | Open an existing database |
+| `Database.openReadOnly(path, lockTimeout?)` | Open in read-only mode |
+| `db.upsert(id, vector, metadataJson, namespace?, ttl?)` | Insert or update a record |
+| `db.insert(id, vector, metadataJson, namespace?, ttl?)` | Insert (throws on duplicate) |
+| `db.get(id, namespace?)` | Get a record by id |
+| `db.search(query, k, filterJson?, namespace?, ...)` | Vector search |
+| `db.searchWithStats(query, k, filterJson?, namespace?, ...)` | Search with stats JSON |
+| `db.delete(id, namespace?)` | Delete a record |
+| `db.deleteMany(ids, namespace?)` | Delete multiple records |
+| `db.deleteByFilter(filterJson, namespace?)` | Delete by filter |
+| `db.count(namespace?, filterJson?)` | Count records |
+| `db.list(namespace?, filterJson?, limit, offset)` | List records |
+| `db.enableQuantization(method, optionsJson?)` | Enable quantization |
+| `db.disableQuantization()` | Disable quantization |
+| `db.isQuantized()` | Check quantization status |
+| `db.quantizationMethod()` | Active method name |
+| `db.bulkIngest(recordsJson, batchSize)` | Bulk import |
+| `db.transactionExecute(operationsJson)` | Atomic transaction |
+| `db.compact()` / `db.flush()` | Persist WAL to snapshot |
+| `db.snapshot(dest)` / `db.backup(dest)` | Backup |
+| `db.close()` | Release resources |
 
 ## Rust API
 

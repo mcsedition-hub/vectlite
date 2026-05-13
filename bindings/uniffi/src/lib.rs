@@ -1013,42 +1013,45 @@ fn parse_quantization_config(
         Some(j) => serde_json::from_str(j).map_err(|e| json_err(e.to_string()))?,
         None => Value::Object(Map::new()),
     };
+    let scalar_default = ScalarQuantizationConfig::default();
+    let binary_default = BinaryQuantizationConfig::default();
+    let product_default = ProductQuantizationConfig::default();
     match method {
-        "scalar" => Ok(QuantizationConfig::Scalar(ScalarQuantizationConfig {
+        "scalar" | "int8" => Ok(QuantizationConfig::Scalar(ScalarQuantizationConfig {
             rescore_multiplier: opts
                 .get("rescoreMultiplier")
                 .or_else(|| opts.get("rescore_multiplier"))
                 .and_then(Value::as_u64)
-                .unwrap_or(4) as usize,
+                .unwrap_or(scalar_default.rescore_multiplier as u64) as usize,
         })),
         "binary" => Ok(QuantizationConfig::Binary(BinaryQuantizationConfig {
             rescore_multiplier: opts
                 .get("rescoreMultiplier")
                 .or_else(|| opts.get("rescore_multiplier"))
                 .and_then(Value::as_u64)
-                .unwrap_or(10) as usize,
+                .unwrap_or(binary_default.rescore_multiplier as u64) as usize,
         })),
         "product" | "pq" => Ok(QuantizationConfig::Product(ProductQuantizationConfig {
             num_sub_vectors: opts
                 .get("numSubVectors")
                 .or_else(|| opts.get("num_sub_vectors"))
                 .and_then(Value::as_u64)
-                .unwrap_or(8) as usize,
+                .unwrap_or(product_default.num_sub_vectors as u64) as usize,
             num_centroids: opts
                 .get("numCentroids")
                 .or_else(|| opts.get("num_centroids"))
                 .and_then(Value::as_u64)
-                .unwrap_or(256) as usize,
+                .unwrap_or(product_default.num_centroids as u64) as usize,
             training_iterations: opts
                 .get("trainingIterations")
                 .or_else(|| opts.get("training_iterations"))
                 .and_then(Value::as_u64)
-                .unwrap_or(20) as usize,
+                .unwrap_or(product_default.training_iterations as u64) as usize,
             rescore_multiplier: opts
                 .get("rescoreMultiplier")
                 .or_else(|| opts.get("rescore_multiplier"))
                 .and_then(Value::as_u64)
-                .unwrap_or(4) as usize,
+                .unwrap_or(product_default.rescore_multiplier as u64) as usize,
         })),
         other => Err(json_err(format!(
             "unknown quantization method: {other}; valid: scalar, binary, product (alias: pq)"

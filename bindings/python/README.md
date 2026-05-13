@@ -291,7 +291,7 @@ print(db.quantization_method)  # "scalar", "binary", or "product"
 db.disable_quantization()
 ```
 
-`rescore_multiplier` controls the number of quantized candidates rescored with exact float32 scoring: `k * rescore_multiplier`, capped at the collection size. Increase it to trade latency for recall.
+`rescore_multiplier` (default **10**) controls the number of quantized candidates rescored with exact float32 scoring: `k * rescore_multiplier`, capped at the collection size. Increase it to trade latency for recall.
 
 For PQ, `num_sub_vectors` must divide the database dimension. If omitted, Vectlite chooses a compatible default; use `db.valid_num_sub_vectors()` to inspect all valid values.
 

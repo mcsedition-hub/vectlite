@@ -260,7 +260,7 @@ console.log(db.quantizationMethod)  // "scalar", "binary", or "product"
 db.disableQuantization()
 ```
 
-`rescoreMultiplier` controls the number of quantized candidates rescored with exact float32 scoring: `k * rescoreMultiplier`, capped at the collection size. Increase it to trade latency for recall.
+`rescoreMultiplier` (default **10**) controls the number of quantized candidates rescored with exact float32 scoring: `k * rescoreMultiplier`, capped at the collection size. Increase it to trade latency for recall.
 
 For PQ, `numSubVectors` must divide the database dimension. If omitted, Vectlite chooses a compatible default; use `db.validNumSubVectors()` to inspect all valid values.
 

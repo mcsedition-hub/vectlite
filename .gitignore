@@ -18,4 +18,5 @@ bindings/node/prebuilds/
 bindings/swift/.build/
 bindings/swift/.build-staging/
 bindings/kotlin/.gradle/
+bindings/kotlin/.kotlin/
 bindings/kotlin/build/
