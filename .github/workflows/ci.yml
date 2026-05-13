@@ -62,7 +62,11 @@ jobs:
 
       - name: Ensure Cargo is on PATH
         if: runner.os == 'macOS'
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile default --no-self-update
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          cargo --version
 
       - uses: Swatinem/rust-cache@v2
 
