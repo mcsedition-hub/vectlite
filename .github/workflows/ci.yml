@@ -60,6 +60,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Ensure Cargo is on PATH
+        if: runner.os == 'macOS'
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Install test dependencies
