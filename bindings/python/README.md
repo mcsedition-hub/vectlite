@@ -64,7 +64,7 @@ with vectlite.open("knowledge.vdb", dimension=384) as db:
 ### Data Management
 
 - **Physical collections** -- `vectlite.open_store()` manages a directory of independent databases
-- **Bulk ingestion** -- `bulk_ingest()` with deferred index rebuilds for fast imports
+- **Bulk ingestion** -- `bulk_ingest()` with Rayon-parallel HNSW build, coalesced WAL fsync, and tunable `m` / `ef_construction` / `ef_search`
 - **Listing & filtered counts** -- `list()` and `count(namespace=..., filter=...)` without a vector query
 - **Delete by filter** -- remove matching records across a namespace slice in one call
 - **Partial metadata updates** -- `update_metadata()` merges a patch without re-writing the vector or rebuilding indexes
@@ -163,6 +163,38 @@ The `records` parameter is a `list[dict]` where each dict has keys:
 - `namespace` (str, optional) -- namespace override per record
 
 `upsert_many()` and `insert_many()` also accept the same `list[dict]` format and rebuild indexes once, but don't batch WAL writes internally.
+
+#### Tuning the HNSW index
+
+`bulk_ingest()` accepts optional HNSW parameters that control the recall/latency
+trade-off and trigger Rayon-backed parallel graph construction once the dataset
+crosses `parallel_insert_threshold` (default `256`):
+
+```python
+# Higher recall, slightly slower build/search
+db.bulk_ingest(
+    records,
+    batch_size=5000,
+    m=32,                  # max bidirectional links per node (default 16)
+    ef_construction=400,   # build-time search width (default 200)
+    ef_search=200,         # query-time search width (default: auto)
+)
+
+# Faster build/search, lower recall
+db.bulk_ingest(records, m=8, ef_construction=100, ef_search=40)
+```
+
+The same parameters can be changed at any time without re-ingesting:
+
+```python
+db.set_index_config(m=32, ef_construction=400)  # rebuilds the ANN graph
+db.set_ef_search(200)                           # query-time only, no rebuild
+print(db.index_config())
+# {'m': 32, 'ef_construction': 400, 'ef_search': 200, 'parallel_insert_threshold': 256}
+```
+
+Use higher `m` / `ef_construction` / `ef_search` to push Recall@10 toward `1.0`;
+use lower values when latency or memory matter more than recall.
 
 ### Collections
 
@@ -582,7 +614,10 @@ The Python API exposes passive database metadata as properties (`db.path`,
 | `db.insert(id, vector, metadata, sparse=..., vectors=...)` | Insert a record (raises on duplicate id) |
 | `db.upsert_many(records, namespace=None)` | Upsert a batch of records (single index rebuild) |
 | `db.insert_many(records, namespace=None)` | Insert a batch (raises on duplicate ids) |
-| `db.bulk_ingest(records, namespace=None, batch_size=10000)` | Fastest bulk import with batched WAL writes |
+| `db.bulk_ingest(records, namespace=None, batch_size=10000, m=None, ef_construction=None, ef_search=None, parallel_insert_threshold=None)` | Fastest bulk import with coalesced WAL fsync and Rayon-parallel HNSW build |
+| `db.set_index_config(m=None, ef_construction=None, ef_search=None, parallel_insert_threshold=None)` | Update HNSW parameters; rebuilds the ANN graph if `m`/`ef_construction` changed |
+| `db.set_ef_search(ef_search)` | Adjust query-time HNSW search width without rebuilding |
+| `db.index_config()` | Return the current HNSW configuration dict |
 | `db.delete(id, namespace=None)` | Delete a single record |
 | `db.delete_many(ids, namespace=None)` | Delete multiple records by id |
 | `db.delete_by_filter(filter, namespace=None)` | Delete all matching records in one filtered pass |

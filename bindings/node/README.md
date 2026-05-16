@@ -68,7 +68,7 @@ db.close()
 ### Data Management
 
 - **Physical collections** -- `vectlite.openStore()` manages a directory of independent databases
-- **Bulk ingestion** -- `bulkIngest()` with deferred index rebuilds for fast imports
+- **Bulk ingestion** -- `bulkIngest()` with Rayon-parallel HNSW build, coalesced WAL fsync, and tunable `m` / `efConstruction` / `efSearch`
 - **Listing & filtered counts** -- `list()` and `count({ namespace, filter })` without a vector query
 - **Delete by filter** -- `deleteByFilter()` for bulk deletion by metadata filter
 - **Partial metadata updates** -- `updateMetadata()` merges a patch without re-writing the vector or rebuilding indexes
@@ -345,6 +345,37 @@ await db.compactAsync()
 const count = await db.bulkIngestAsync(records, { batchSize: 5000 })
 ```
 
+### Tuning the HNSW index
+
+`bulkIngest()` and `bulkIngestAsync()` accept optional HNSW parameters that
+control the recall/latency trade-off and trigger Rayon-backed parallel graph
+construction once the dataset crosses `parallelInsertThreshold` (default 256):
+
+```js
+// Higher recall, slightly slower build/search
+db.bulkIngest(records, {
+  batchSize: 5000,
+  m: 32,              // max bidirectional links per node (default 16)
+  efConstruction: 400, // build-time search width (default 200)
+  efSearch: 200,       // query-time search width (default: auto)
+})
+
+// Faster build/search, lower recall
+db.bulkIngest(records, { m: 8, efConstruction: 100, efSearch: 40 })
+```
+
+The same parameters can be changed at any time without re-ingesting:
+
+```js
+db.setIndexConfig({ m: 32, efConstruction: 400 }) // rebuilds the ANN graph
+db.setEfSearch(200)                               // query-time only, no rebuild
+console.log(db.indexConfig())
+// { m: 32, ef_construction: 400, ef_search: 200, parallel_insert_threshold: 256 }
+```
+
+Use higher `m` / `efConstruction` / `efSearch` to push Recall@10 toward `1.0`;
+use lower values when latency or memory matter more than recall.
+
 ### OpenTelemetry Integration
 
 vectlite ships with optional OpenTelemetry tracing. When enabled, every search
@@ -398,7 +429,10 @@ before re-throwing.
 | `db.insert(id, vector, metadata, options)` | Insert a record (throws on duplicate id) |
 | `db.upsertMany(records, { namespace })` | Upsert a batch of records |
 | `db.insertMany(records, { namespace })` | Insert a batch |
-| `db.bulkIngest(records, { namespace, batchSize })` | Fastest bulk import with batched WAL writes |
+| `db.bulkIngest(records, { namespace, batchSize, m, efConstruction, efSearch, parallelInsertThreshold })` | Fastest bulk import with coalesced WAL fsync and Rayon-parallel HNSW build |
+| `db.setIndexConfig({ m, efConstruction, efSearch, parallelInsertThreshold })` | Update HNSW parameters; rebuilds the ANN graph if `m`/`efConstruction` changed |
+| `db.setEfSearch(efSearch)` | Adjust query-time HNSW search width without rebuilding |
+| `db.indexConfig()` | Return the current HNSW configuration |
 | `db.delete(id, { namespace })` | Delete a single record |
 | `db.deleteMany(ids, { namespace })` | Delete multiple records by id |
 | `db.deleteByFilter(filter, { namespace })` | Delete all records matching a filter |
@@ -462,7 +496,7 @@ before re-throwing.
 | `db.searchWithStatsAsync(query, options)` | Non-blocking search with stats (returns Promise) |
 | `db.flushAsync()` | Non-blocking flush/compact (returns Promise) |
 | `db.compactAsync()` | Non-blocking compact (returns Promise) |
-| `db.bulkIngestAsync(records, options)` | Non-blocking bulk import (returns Promise) |
+| `db.bulkIngestAsync(records, options)` | Non-blocking bulk import (returns Promise); accepts the same HNSW tuning options as `bulkIngest` |
 
 ## Filter Operators
 

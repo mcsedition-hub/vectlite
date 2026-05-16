@@ -42,6 +42,19 @@ dictionary SearchStatsResult {
     string stats_json;
 };
 
+/// HNSW index configuration. Use null to keep the current value
+/// (when passed to `set_index_config` / `bulk_ingest_tuned`).
+dictionary IndexConfigResult {
+    /// Max bidirectional links per node (default 16).
+    u32 m;
+    /// Build-time search width (default 200).
+    u32 ef_construction;
+    /// Query-time search width; null = auto.
+    u32? ef_search;
+    /// Minimum dataset size to engage Rayon-parallel HNSW insertion (default 256).
+    u32 parallel_insert_threshold;
+};
+
 /// An embedded vector database.
 interface Database {
     // -- Constructors --
@@ -148,6 +161,37 @@ interface Database {
     // -- Bulk --
     [Throws=VectLiteError]
     u32 bulk_ingest(string records_json, u32 batch_size);
+
+    /// Same as `bulk_ingest` but accepts HNSW tuning. Any null field falls
+    /// back to the current per-session config.
+    [Throws=VectLiteError]
+    u32 bulk_ingest_tuned(
+        string records_json,
+        u32 batch_size,
+        u32? m,
+        u32? ef_construction,
+        u32? ef_search,
+        u32? parallel_insert_threshold
+    );
+
+    // -- HNSW tuning --
+    /// Get the current HNSW configuration.
+    IndexConfigResult index_config();
+
+    /// Adjust query-time `ef_search` only. Null reverts to auto-derived.
+    /// Cheap (no rebuild).
+    [Throws=VectLiteError]
+    void set_ef_search(u32? ef_search);
+
+    /// Update any subset of HNSW parameters. Changing `m` or
+    /// `ef_construction` triggers a full ANN rebuild; other changes are free.
+    [Throws=VectLiteError]
+    void set_index_config(
+        u32? m,
+        u32? ef_construction,
+        u32? ef_search,
+        u32? parallel_insert_threshold
+    );
 
     // -- Maintenance --
     [Throws=VectLiteError]

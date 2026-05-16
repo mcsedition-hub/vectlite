@@ -286,6 +286,11 @@ void uniffi_vectlite_uniffi_fn_method_database_backup(void*_Nonnull ptr, RustBuf
 uint32_t uniffi_vectlite_uniffi_fn_method_database_bulk_ingest(void*_Nonnull ptr, RustBuffer records_json, uint32_t batch_size, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_BULK_INGEST_TUNED
+#define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_BULK_INGEST_TUNED
+uint32_t uniffi_vectlite_uniffi_fn_method_database_bulk_ingest_tuned(void*_Nonnull ptr, RustBuffer records_json, uint32_t batch_size, RustBuffer m, RustBuffer ef_construction, RustBuffer ef_search, RustBuffer parallel_insert_threshold, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_CLEAR_TTL
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_CLEAR_TTL
 int8_t uniffi_vectlite_uniffi_fn_method_database_clear_ttl(void*_Nonnull ptr, RustBuffer id, RustBuffer namespace, RustCallStatus *_Nonnull out_status
@@ -356,6 +361,11 @@ void uniffi_vectlite_uniffi_fn_method_database_flush(void*_Nonnull ptr, RustCall
 RustBuffer uniffi_vectlite_uniffi_fn_method_database_get(void*_Nonnull ptr, RustBuffer id, RustBuffer namespace, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_INDEX_CONFIG
+#define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_INDEX_CONFIG
+RustBuffer uniffi_vectlite_uniffi_fn_method_database_index_config(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_INSERT
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_INSERT
 void uniffi_vectlite_uniffi_fn_method_database_insert(void*_Nonnull ptr, RustBuffer id, RustBuffer vector, RustBuffer metadata_json, RustBuffer namespace, RustBuffer ttl, RustCallStatus *_Nonnull out_status
@@ -419,6 +429,16 @@ RustBuffer uniffi_vectlite_uniffi_fn_method_database_search(void*_Nonnull ptr, R
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_SEARCH_WITH_STATS
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_SEARCH_WITH_STATS
 RustBuffer uniffi_vectlite_uniffi_fn_method_database_search_with_stats(void*_Nonnull ptr, RustBuffer query, uint32_t k, RustBuffer filter_json, RustBuffer namespace, RustBuffer sparse_json, RustBuffer fusion, RustBuffer dense_weight, RustBuffer sparse_weight, RustBuffer mmr_lambda, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_SET_EF_SEARCH
+#define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_SET_EF_SEARCH
+void uniffi_vectlite_uniffi_fn_method_database_set_ef_search(void*_Nonnull ptr, RustBuffer ef_search, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_SET_INDEX_CONFIG
+#define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_SET_INDEX_CONFIG
+void uniffi_vectlite_uniffi_fn_method_database_set_index_config(void*_Nonnull ptr, RustBuffer m, RustBuffer ef_construction, RustBuffer ef_search, RustBuffer parallel_insert_threshold, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_FN_METHOD_DATABASE_SET_TTL
@@ -784,283 +804,307 @@ void ffi_vectlite_uniffi_rust_future_complete_void(uint64_t handle, RustCallStat
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_FUNC_RESTORE
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_FUNC_RESTORE
 uint16_t uniffi_vectlite_uniffi_checksum_func_restore(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_FUNC_SPARSE_TERMS
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_FUNC_SPARSE_TERMS
 uint16_t uniffi_vectlite_uniffi_checksum_func_sparse_terms(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_BACKUP
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_BACKUP
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_backup(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_BULK_INGEST
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_BULK_INGEST
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_bulk_ingest(void
-    
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_BULK_INGEST_TUNED
+#define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_BULK_INGEST_TUNED
+uint16_t uniffi_vectlite_uniffi_checksum_method_database_bulk_ingest_tuned(void
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_CLEAR_TTL
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_CLEAR_TTL
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_clear_ttl(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_CLOSE
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_CLOSE
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_close(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_COMPACT
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_COMPACT
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_compact(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_COUNT
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_COUNT
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_count(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_CREATE_INDEX
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_CREATE_INDEX
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_create_index(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_DELETE
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_DELETE
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_delete(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_DELETE_BY_FILTER
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_DELETE_BY_FILTER
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_delete_by_filter(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_DELETE_MANY
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_DELETE_MANY
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_delete_many(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_DIMENSION
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_DIMENSION
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_dimension(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_DISABLE_QUANTIZATION
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_DISABLE_QUANTIZATION
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_disable_quantization(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_DROP_INDEX
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_DROP_INDEX
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_drop_index(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_ENABLE_QUANTIZATION
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_ENABLE_QUANTIZATION
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_enable_quantization(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_FLUSH
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_FLUSH
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_flush(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_GET
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_GET
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_get(void
-    
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_INDEX_CONFIG
+#define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_INDEX_CONFIG
+uint16_t uniffi_vectlite_uniffi_checksum_method_database_index_config(void
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_INSERT
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_INSERT
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_insert(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_IS_CLOSED
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_IS_CLOSED
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_is_closed(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_IS_QUANTIZED
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_IS_QUANTIZED
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_is_quantized(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_IS_READ_ONLY
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_IS_READ_ONLY
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_is_read_only(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_LIST
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_LIST
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_list(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_LIST_CURSOR
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_LIST_CURSOR
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_list_cursor(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_LIST_INDEXES_JSON
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_LIST_INDEXES_JSON
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_list_indexes_json(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_METRIC
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_METRIC
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_metric(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_NAMESPACES
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_NAMESPACES
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_namespaces(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_PATH
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_PATH
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_path(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_QUANTIZATION_METHOD
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_QUANTIZATION_METHOD
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_quantization_method(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_SEARCH
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_SEARCH
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_search(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_SEARCH_WITH_STATS
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_SEARCH_WITH_STATS
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_search_with_stats(void
-    
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_SET_EF_SEARCH
+#define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_SET_EF_SEARCH
+uint16_t uniffi_vectlite_uniffi_checksum_method_database_set_ef_search(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_SET_INDEX_CONFIG
+#define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_SET_INDEX_CONFIG
+uint16_t uniffi_vectlite_uniffi_checksum_method_database_set_index_config(void
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_SET_TTL
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_SET_TTL
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_set_ttl(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_SNAPSHOT
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_SNAPSHOT
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_snapshot(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_TRANSACTION_EXECUTE
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_TRANSACTION_EXECUTE
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_transaction_execute(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_UPDATE_METADATA
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_UPDATE_METADATA
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_update_metadata(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_UPSERT
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_DATABASE_UPSERT
 uint16_t uniffi_vectlite_uniffi_checksum_method_database_upsert(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_STORE_COLLECTIONS
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_STORE_COLLECTIONS
 uint16_t uniffi_vectlite_uniffi_checksum_method_store_collections(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_STORE_CREATE_COLLECTION
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_STORE_CREATE_COLLECTION
 uint16_t uniffi_vectlite_uniffi_checksum_method_store_create_collection(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_STORE_DROP_COLLECTION
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_STORE_DROP_COLLECTION
 uint16_t uniffi_vectlite_uniffi_checksum_method_store_drop_collection(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_STORE_OPEN_COLLECTION
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_STORE_OPEN_COLLECTION
 uint16_t uniffi_vectlite_uniffi_checksum_method_store_open_collection(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_STORE_OPEN_OR_CREATE_COLLECTION
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_STORE_OPEN_OR_CREATE_COLLECTION
 uint16_t uniffi_vectlite_uniffi_checksum_method_store_open_or_create_collection(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_STORE_ROOT
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_METHOD_STORE_ROOT
 uint16_t uniffi_vectlite_uniffi_checksum_method_store_root(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_CONSTRUCTOR_DATABASE_OPEN_EXISTING
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_CONSTRUCTOR_DATABASE_OPEN_EXISTING
 uint16_t uniffi_vectlite_uniffi_checksum_constructor_database_open_existing(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_CONSTRUCTOR_DATABASE_OPEN_OR_CREATE
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_CONSTRUCTOR_DATABASE_OPEN_OR_CREATE
 uint16_t uniffi_vectlite_uniffi_checksum_constructor_database_open_or_create(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_CONSTRUCTOR_DATABASE_OPEN_READ_ONLY
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_CONSTRUCTOR_DATABASE_OPEN_READ_ONLY
 uint16_t uniffi_vectlite_uniffi_checksum_constructor_database_open_read_only(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_CONSTRUCTOR_STORE_NEW
 #define UNIFFI_FFIDEF_UNIFFI_VECTLITE_UNIFFI_CHECKSUM_CONSTRUCTOR_STORE_NEW
 uint16_t uniffi_vectlite_uniffi_checksum_constructor_store_new(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_VECTLITE_UNIFFI_UNIFFI_CONTRACT_VERSION
 #define UNIFFI_FFIDEF_FFI_VECTLITE_UNIFFI_UNIFFI_CONTRACT_VERSION
 uint32_t ffi_vectlite_uniffi_uniffi_contract_version(void
-    
+
 );
 #endif
 

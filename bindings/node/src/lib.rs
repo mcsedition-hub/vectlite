@@ -12,8 +12,8 @@ use vectlite::quantization::{
     default_product_num_sub_vectors,
 };
 use vectlite::{
-    Database as CoreDatabase, DistanceMetric, FusionStrategy, HybridSearchOptions, Metadata,
-    MetadataFilter, MetadataValue, MultiVectorSearchOptions, MultiVectors, NamedVectors,
+    Database as CoreDatabase, DistanceMetric, FusionStrategy, HybridSearchOptions, IndexConfig,
+    Metadata, MetadataFilter, MetadataValue, MultiVectorSearchOptions, MultiVectors, NamedVectors,
     PayloadIndexType, Record, SearchOutcome, SearchResult, SparseVector, Store as CoreStore,
     WriteOperation,
 };
@@ -417,13 +417,55 @@ impl NativeDatabase {
         records_json: String,
         namespace: Option<String>,
         batch_size: u32,
+        m: Option<u32>,
+        ef_construction: Option<u32>,
+        ef_search: Option<u32>,
+        parallel_insert_threshold: Option<u32>,
     ) -> Result<u32> {
         let records = parse_record_batch_json(&records_json, namespace.as_deref())?;
         let mut database = self.write_open()?;
-        database
-            .bulk_ingest(records, batch_size as usize)
-            .map(|count| count as u32)
-            .map_err(to_napi_error)
+        let tuning = merge_index_config(m, ef_construction, ef_search, parallel_insert_threshold);
+        let count = if let Some(cfg) = tuning {
+            let merged = apply_index_overrides(database.index_config(), cfg);
+            database.bulk_ingest_with_config(records, batch_size as usize, Some(merged))
+        } else {
+            database.bulk_ingest(records, batch_size as usize)
+        };
+        count.map(|n| n as u32).map_err(to_napi_error)
+    }
+
+    #[napi(js_name = "indexConfig")]
+    pub fn index_config(&self) -> Result<String> {
+        let cfg = self.read()?.index_config();
+        let value = json!({
+            "m": cfg.m as u32,
+            "ef_construction": cfg.ef_construction as u32,
+            "ef_search": cfg.ef_search.map(|v| v as u32),
+            "parallel_insert_threshold": cfg.parallel_insert_threshold as u32,
+        });
+        stringify_value(value)
+    }
+
+    #[napi(js_name = "setEfSearch")]
+    pub fn set_ef_search(&self, ef_search: Option<u32>) -> Result<()> {
+        let ef = ef_search.map(|v| v as usize);
+        self.write_open()?.set_ef_search(ef).map_err(to_napi_error)
+    }
+
+    #[napi(js_name = "setIndexConfig")]
+    pub fn set_index_config(
+        &self,
+        m: Option<u32>,
+        ef_construction: Option<u32>,
+        ef_search: Option<u32>,
+        parallel_insert_threshold: Option<u32>,
+    ) -> Result<()> {
+        let mut database = self.write_open()?;
+        let overrides =
+            merge_index_config(m, ef_construction, ef_search, parallel_insert_threshold)
+                .ok_or_else(|| err("setIndexConfig requires at least one field"))?;
+        let merged = apply_index_overrides(database.index_config(), overrides);
+        database.set_index_config(merged).map_err(to_napi_error)
     }
 
     #[napi]
@@ -878,6 +920,7 @@ pub struct BulkIngestTask {
     db: Arc<RwLock<CoreDatabase>>,
     records: Vec<Record>,
     batch_size: usize,
+    tuning: Option<IndexConfigPatch>,
 }
 
 impl napi::Task for BulkIngestTask {
@@ -890,10 +933,13 @@ impl napi::Task for BulkIngestTask {
             .db
             .write()
             .map_err(|e| err(format!("lock poisoned: {e}")))?;
-        database
-            .bulk_ingest(records, self.batch_size)
-            .map(|count| count as u32)
-            .map_err(to_napi_error)
+        let res = if let Some(cfg) = self.tuning.clone() {
+            let merged = apply_index_overrides(database.index_config(), cfg);
+            database.bulk_ingest_with_config(records, self.batch_size, Some(merged))
+        } else {
+            database.bulk_ingest(records, self.batch_size)
+        };
+        res.map(|count| count as u32).map_err(to_napi_error)
     }
 
     fn resolve(&mut self, _env: napi::Env, output: Self::Output) -> Result<Self::JsValue> {
@@ -959,12 +1005,18 @@ impl NativeDatabase {
         records_json: String,
         namespace: Option<String>,
         batch_size: u32,
+        m: Option<u32>,
+        ef_construction: Option<u32>,
+        ef_search: Option<u32>,
+        parallel_insert_threshold: Option<u32>,
     ) -> Result<AsyncTask<BulkIngestTask>> {
         let records = parse_record_batch_json(&records_json, namespace.as_deref())?;
+        let tuning = merge_index_config(m, ef_construction, ef_search, parallel_insert_threshold);
         Ok(AsyncTask::new(BulkIngestTask {
             db: self.inner.clone(),
             records,
             batch_size: batch_size as usize,
+            tuning,
         }))
     }
 }
@@ -1960,6 +2012,53 @@ fn value_to_usize(value: &Value, label: &str) -> Result<usize> {
         .as_u64()
         .map(|value| value as usize)
         .ok_or_else(|| err(format!("{label} must be an unsigned integer")))
+}
+
+#[derive(Clone, Copy)]
+struct IndexConfigPatch {
+    m: Option<usize>,
+    ef_construction: Option<usize>,
+    ef_search: Option<usize>,
+    parallel_insert_threshold: Option<usize>,
+}
+
+/// Pack the four optional HNSW tuning fields into a patch. Returns `None`
+/// when every field is `None`; explicit zeroes are preserved so core
+/// validation can reject invalid build/search widths instead of treating
+/// them as "not provided".
+fn merge_index_config(
+    m: Option<u32>,
+    ef_construction: Option<u32>,
+    ef_search: Option<u32>,
+    parallel_insert_threshold: Option<u32>,
+) -> Option<IndexConfigPatch> {
+    if m.is_none()
+        && ef_construction.is_none()
+        && ef_search.is_none()
+        && parallel_insert_threshold.is_none()
+    {
+        return None;
+    }
+    Some(IndexConfigPatch {
+        m: m.map(|v| v as usize),
+        ef_construction: ef_construction.map(|v| v as usize),
+        ef_search: ef_search.map(|v| v as usize),
+        parallel_insert_threshold: parallel_insert_threshold.map(|v| v as usize),
+    })
+}
+
+/// Merge a tuning patch into the current `IndexConfig`. Omitted fields inherit
+/// from `current`; `ef_search = None` in the patch means "no change" because
+/// callers use `setEfSearch(null)` to reset query-time tuning to auto.
+fn apply_index_overrides(current: IndexConfig, patch: IndexConfigPatch) -> IndexConfig {
+    IndexConfig {
+        m: patch.m.unwrap_or(current.m),
+        ef_construction: patch.ef_construction.unwrap_or(current.ef_construction),
+        ef_search: patch.ef_search.or(current.ef_search),
+        parallel_insert_threshold: patch
+            .parallel_insert_threshold
+            .unwrap_or(current.parallel_insert_threshold),
+    }
 }
 
 fn err(message: impl Into<String>) -> NapiError {

@@ -503,6 +503,56 @@ def test_bulk_ingest(tmp_path: Path) -> None:
     assert db.get("doc49") is not None
 
 
+def test_index_config_tuning(tmp_path: Path) -> None:
+    """HNSW tuning options are exposed and validated."""
+    path = tmp_path / "index_config.vdb"
+    db = vectlite.open(str(path), dimension=2)
+
+    assert db.index_config() == {
+        "m": 16,
+        "ef_construction": 200,
+        "ef_search": None,
+        "parallel_insert_threshold": 256,
+    }
+
+    db.set_ef_search(40)
+    assert db.index_config()["ef_search"] == 40
+
+    db.set_index_config(m=8, ef_construction=100, parallel_insert_threshold=9999)
+    assert db.index_config() == {
+        "m": 8,
+        "ef_construction": 100,
+        "ef_search": 40,
+        "parallel_insert_threshold": 9999,
+    }
+
+    db.set_ef_search(None)
+    assert db.index_config()["ef_search"] is None
+
+    records = [
+        {"id": f"doc{i}", "vector": [1.0, 0.0], "metadata": {"idx": i}}
+        for i in range(8)
+    ]
+    count = db.bulk_ingest(
+        records,
+        batch_size=3,
+        m=12,
+        ef_construction=150,
+        ef_search=80,
+        parallel_insert_threshold=1,
+    )
+    assert count == 8
+    assert db.index_config() == {
+        "m": 12,
+        "ef_construction": 150,
+        "ef_search": 80,
+        "parallel_insert_threshold": 1,
+    }
+
+    with pytest.raises(vectlite.VectLiteError, match="IndexConfig.m"):
+        db.set_index_config(m=0)
+
+
 def test_nested_metadata_filters(tmp_path: Path) -> None:
     """Dot-path, $elemMatch, and $size filters work on nested metadata."""
     path = tmp_path / "nested.vdb"

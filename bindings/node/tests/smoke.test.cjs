@@ -108,6 +108,55 @@ test('product quantization default is dimension-compatible and invalid config is
   assert.equal(db.quantizationMethod, 'product')
 })
 
+test('index tuning is exposed on public wrapper', () => {
+  const dbPath = tempPath('index-config.vdb')
+  const db = vectlite.open(dbPath, { dimension: 2 })
+
+  assert.deepEqual(db.indexConfig(), {
+    m: 16,
+    ef_construction: 200,
+    ef_search: null,
+    parallel_insert_threshold: 256,
+  })
+
+  db.setEfSearch(40)
+  assert.equal(db.indexConfig().ef_search, 40)
+
+  db.setIndexConfig({ m: 8, efConstruction: 100, parallelInsertThreshold: 9999 })
+  assert.deepEqual(db.indexConfig(), {
+    m: 8,
+    ef_construction: 100,
+    ef_search: 40,
+    parallel_insert_threshold: 9999,
+  })
+
+  db.setEfSearch(null)
+  assert.equal(db.indexConfig().ef_search, null)
+
+  const records = Array.from({ length: 8 }, (_, i) => ({
+    id: `doc${i}`,
+    vector: [1, 0],
+    metadata: { idx: i },
+  }))
+  const count = db.bulkIngest(records, {
+    batchSize: 3,
+    m: 12,
+    efConstruction: 150,
+    efSearch: 80,
+    parallelInsertThreshold: 1,
+  })
+  assert.equal(count, 8)
+  assert.deepEqual(db.indexConfig(), {
+    m: 12,
+    ef_construction: 150,
+    ef_search: 80,
+    parallel_insert_threshold: 1,
+  })
+
+  assert.throws(() => db.setIndexConfig({ m: 0 }), /IndexConfig\.m/)
+  assert.throws(() => db.setIndexConfig(), /requires at least one field/)
+})
+
 test('store and text helpers', () => {
   const root = tempPath('store-root')
   fs.mkdirSync(root, { recursive: true })

@@ -110,6 +110,28 @@ export interface ListCursorResult {
 export interface BulkIngestOptions {
   namespace?: string | null
   batchSize?: number
+  /** Max bidirectional links per HNSW node (default 16). */
+  m?: number | null
+  /** Build-time search width (default 200). Higher = better recall, slower build. */
+  efConstruction?: number | null
+  /** Query-time search width. `null` = auto (derived from k). */
+  efSearch?: number | null
+  /** Minimum dataset size to engage Rayon-parallel HNSW insertion (default 256). */
+  parallelInsertThreshold?: number | null
+}
+
+export interface IndexConfig {
+  m: number
+  ef_construction: number
+  ef_search: number | null
+  parallel_insert_threshold: number
+}
+
+export interface SetIndexConfigOptions {
+  m?: number | null
+  efConstruction?: number | null
+  efSearch?: number | null
+  parallelInsertThreshold?: number | null
 }
 
 export interface SearchOptions {
@@ -212,6 +234,12 @@ export class Database {
   insertMany(records: Record[], options?: { namespace?: string | null }): number
   upsertMany(records: Record[], options?: { namespace?: string | null }): number
   bulkIngest(records: Record[], options?: BulkIngestOptions): number
+  /** Get the current HNSW configuration. */
+  indexConfig(): IndexConfig
+  /** Adjust query-time `ef_search` only (no rebuild). `null` reverts to auto. */
+  setEfSearch(efSearch: number | null): void
+  /** Update HNSW parameters; rebuilds the ANN graph if `m`/`efConstruction` changed. */
+  setIndexConfig(config: SetIndexConfigOptions): void
   get(id: string, options?: { namespace?: string | null }): Record | null
   delete(id: string, options?: { namespace?: string | null }): boolean
   deleteMany(ids: string[], options?: { namespace?: string | null }): number

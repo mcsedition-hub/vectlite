@@ -170,7 +170,59 @@ class Database:
         records: list[Record],
         namespace: str | None = None,
         batch_size: int = 10000,
-    ) -> int: ...
+        m: int | None = None,
+        ef_construction: int | None = None,
+        ef_search: int | None = None,
+        parallel_insert_threshold: int | None = None,
+    ) -> int:
+        """Bulk-ingest many records efficiently.
+
+        Optimised path: WAL writes are coalesced into a single fsync at the
+        end, and the HNSW graph is built with Rayon-backed parallel insert
+        once at the end (instead of one insert per record).
+
+        HNSW tuning (all optional, defaults preserve existing behaviour):
+
+        :param m: max bidirectional links per node. Higher = better recall,
+            more memory, slower build. Typical range 8..64. Default 16.
+        :param ef_construction: search width during graph construction.
+            Higher = better recall, slower build. Typical range 64..800.
+            Default 200.
+        :param ef_search: search width at query time. Higher = better recall,
+            slower search. ``None`` = auto-derived from ``top_k``.
+        :param parallel_insert_threshold: minimum dataset size to engage
+            Rayon-backed parallel HNSW insertion. Default 256.
+        """
+        ...
+    def set_ef_search(self, ef_search: int | None) -> None:
+        """Update the query-time ``ef_search`` without rebuilding the index.
+
+        ``None`` reverts to the default heuristic (``max(candidate_count,
+        ef_construction)``). Higher values trade latency for recall.
+        """
+        ...
+    def set_index_config(
+        self,
+        m: int | None = None,
+        ef_construction: int | None = None,
+        ef_search: int | None = None,
+        parallel_insert_threshold: int | None = None,
+    ) -> None:
+        """Replace the HNSW index configuration.
+
+        Changing ``m`` or ``ef_construction`` triggers a full ANN index
+        rebuild. Changing only ``ef_search`` is free (query-time only).
+        Pass only the fields you want to change; omitted fields keep their
+        current value.
+        """
+        ...
+    def index_config(self) -> dict[str, int | None]:
+        """Return the current HNSW index configuration.
+
+        Keys: ``m``, ``ef_construction``, ``ef_search``,
+        ``parallel_insert_threshold``.
+        """
+        ...
     def get(self, id: str, namespace: str | None = None) -> Record | None: ...
     def delete(self, id: str, namespace: str | None = None) -> bool: ...
     def delete_many(self, ids: list[str], namespace: str | None = None) -> int: ...

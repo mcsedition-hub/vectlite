@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "org.mcsedition"
-version = "0.9.3"
+version = "0.10.0"
 
 val workspaceDir = layout.projectDirectory.dir("../..").asFile
 val nativeProfile = providers.gradleProperty("nativeProfile").orElse("debug").get()

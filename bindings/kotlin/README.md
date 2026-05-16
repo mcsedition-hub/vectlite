@@ -54,3 +54,31 @@ val results = db.search(
 
 db.close()
 ```
+
+### Tuning the HNSW index
+
+```kotlin
+import uniffi.vectlite.Database
+
+val db = Database.openOrCreate("knowledge.vdb", 384u, "cosine")
+
+// Higher recall, slightly slower build/search
+db.bulkIngestTuned(
+    recordsJson,
+    batchSize = 5000u,
+    m = 32u,
+    efConstruction = 400u,
+    efSearch = 200u,
+    parallelInsertThreshold = null,
+)
+
+// Adjust tuning at any time without re-ingesting:
+db.setIndexConfig(m = 32u, efConstruction = 400u, efSearch = null, parallelInsertThreshold = null)
+db.setEfSearch(efSearch = 200u)            // query-time only, no rebuild
+val cfg = db.indexConfig()                  // IndexConfigResult
+println("m=${cfg.m} efC=${cfg.efConstruction} efS=${cfg.efSearch}")
+```
+
+Use higher `m` / `efConstruction` / `efSearch` to push Recall@10 toward `1.0`;
+use lower values when latency or memory matter more than recall. Pass `0u` for
+`efSearch` to revert to the auto-derived default.

@@ -12,8 +12,8 @@ use vectlite::quantization::{
     default_product_num_sub_vectors,
 };
 use vectlite::{
-    Database as CoreDatabase, DistanceMetric, FusionStrategy, HybridSearchOptions, Metadata,
-    MetadataFilter, MetadataValue, MultiVectorSearchOptions, MultiVectors, NamedVectors,
+    Database as CoreDatabase, DistanceMetric, FusionStrategy, HybridSearchOptions, IndexConfig,
+    Metadata, MetadataFilter, MetadataValue, MultiVectorSearchOptions, MultiVectors, NamedVectors,
     PayloadIndexType, Record, SearchOutcome, SearchResult, SparseVector, Store as CoreStore,
     WriteOperation,
 };
@@ -246,19 +246,104 @@ impl PyDatabase {
         database.upsert_many(records).map_err(to_py_error)
     }
 
-    #[pyo3(signature = (records, namespace=None, batch_size=10000))]
+    #[pyo3(signature = (
+        records,
+        namespace=None,
+        batch_size=10000,
+        m=None,
+        ef_construction=None,
+        ef_search=None,
+        parallel_insert_threshold=None,
+    ))]
     fn bulk_ingest(
         &self,
         py: Python<'_>,
         records: Vec<Py<PyDict>>,
         namespace: Option<String>,
         batch_size: usize,
+        m: Option<usize>,
+        ef_construction: Option<usize>,
+        ef_search: Option<usize>,
+        parallel_insert_threshold: Option<usize>,
     ) -> PyResult<usize> {
         let records = parse_record_batch(py, records, namespace.as_deref())?;
         let mut database = self.write_open()?;
+        let config_override = if m.is_some()
+            || ef_construction.is_some()
+            || ef_search.is_some()
+            || parallel_insert_threshold.is_some()
+        {
+            let mut cfg = database.index_config();
+            if let Some(v) = m {
+                cfg.m = v;
+            }
+            if let Some(v) = ef_construction {
+                cfg.ef_construction = v;
+            }
+            if let Some(v) = ef_search {
+                cfg.ef_search = Some(v);
+            }
+            if let Some(v) = parallel_insert_threshold {
+                cfg.parallel_insert_threshold = v;
+            }
+            Some(cfg)
+        } else {
+            None
+        };
         database
-            .bulk_ingest(records, batch_size)
+            .bulk_ingest_with_config(records, batch_size, config_override)
             .map_err(to_py_error)
+    }
+
+    /// Update the query-time ef_search parameter. Higher = better recall,
+    /// slower search. Pass None to revert to the default heuristic.
+    #[pyo3(signature = (ef_search))]
+    fn set_ef_search(&self, ef_search: Option<usize>) -> PyResult<()> {
+        let mut database = self.write_open()?;
+        database.set_ef_search(ef_search).map_err(to_py_error)
+    }
+
+    /// Replace the HNSW index configuration. Changing m or ef_construction
+    /// triggers a full ANN index rebuild.
+    #[pyo3(signature = (m=None, ef_construction=None, ef_search=None, parallel_insert_threshold=None))]
+    fn set_index_config(
+        &self,
+        m: Option<usize>,
+        ef_construction: Option<usize>,
+        ef_search: Option<usize>,
+        parallel_insert_threshold: Option<usize>,
+    ) -> PyResult<()> {
+        let mut database = self.write_open()?;
+        let mut cfg = database.index_config();
+        if let Some(v) = m {
+            cfg.m = v;
+        }
+        if let Some(v) = ef_construction {
+            cfg.ef_construction = v;
+        }
+        // ef_search semantics: explicit None on the call site means "no
+        // change". We never reach this branch if `ef_search` was omitted;
+        // pyo3 maps omitted keyword to None. To allow "reset to auto" callers
+        // can use `set_ef_search(None)`.
+        if let Some(v) = ef_search {
+            cfg.ef_search = Some(v);
+        }
+        if let Some(v) = parallel_insert_threshold {
+            cfg.parallel_insert_threshold = v;
+        }
+        database.set_index_config(cfg).map_err(to_py_error)
+    }
+
+    /// Return the current HNSW index configuration as a dict.
+    fn index_config(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let database = self.read()?;
+        let cfg: IndexConfig = database.index_config();
+        let dict = PyDict::new(py);
+        dict.set_item("m", cfg.m)?;
+        dict.set_item("ef_construction", cfg.ef_construction)?;
+        dict.set_item("ef_search", cfg.ef_search)?;
+        dict.set_item("parallel_insert_threshold", cfg.parallel_insert_threshold)?;
+        Ok(dict.into())
     }
 
     #[pyo3(signature = (id, namespace=None))]

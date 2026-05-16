@@ -516,78 +516,101 @@ fileprivate struct FfiConverterString: FfiConverter {
  * An embedded vector database.
  */
 public protocol DatabaseProtocol : AnyObject {
-    
-    func backup(dest: String) throws 
-    
+
+    func backup(dest: String) throws
+
     func bulkIngest(recordsJson: String, batchSize: UInt32) throws  -> UInt32
-    
+
+    /**
+     * Same as `bulk_ingest` but accepts HNSW tuning. Any null field falls
+     * back to the current per-session config.
+     */
+    func bulkIngestTuned(recordsJson: String, batchSize: UInt32, m: UInt32?, efConstruction: UInt32?, efSearch: UInt32?, parallelInsertThreshold: UInt32?) throws  -> UInt32
+
     func clearTtl(id: String, namespace: String?) throws  -> Bool
-    
-    func close() throws 
-    
-    func compact() throws 
-    
+
+    func close() throws
+
+    func compact() throws
+
     func count(namespace: String?, filterJson: String?)  -> UInt32
-    
-    func createIndex(field: String, indexType: String) throws 
-    
+
+    func createIndex(field: String, indexType: String) throws
+
     func delete(id: String, namespace: String?) throws  -> Bool
-    
+
     func deleteByFilter(filterJson: String, namespace: String?) throws  -> UInt32
-    
+
     func deleteMany(ids: [String], namespace: String?) throws  -> UInt32
-    
+
     func dimension()  -> UInt32
-    
-    func disableQuantization() throws 
-    
+
+    func disableQuantization() throws
+
     func dropIndex(field: String) throws  -> Bool
-    
-    func enableQuantization(method: String, optionsJson: String?) throws 
-    
-    func flush() throws 
-    
+
+    func enableQuantization(method: String, optionsJson: String?) throws
+
+    func flush() throws
+
     func get(id: String, namespace: String?)  -> RecordResult?
-    
-    func insert(id: String, vector: [Float], metadataJson: String?, namespace: String?, ttl: Double?) throws 
-    
+
+    /**
+     * Get the current HNSW configuration.
+     */
+    func indexConfig()  -> IndexConfigResult
+
+    func insert(id: String, vector: [Float], metadataJson: String?, namespace: String?, ttl: Double?) throws
+
     func isClosed()  -> Bool
-    
+
     func isQuantized()  -> Bool
-    
+
     func isReadOnly()  -> Bool
-    
+
     func list(namespace: String?, filterJson: String?, limit: UInt32, offset: UInt32)  -> [RecordResult]
-    
+
     func listCursor(namespace: String?, filterJson: String?, limit: UInt32, cursor: String?) throws  -> CursorPage
-    
+
     /**
      * Returns JSON array of {field, type} objects.
      */
     func listIndexesJson()  -> String
-    
+
     func metric()  -> String
-    
+
     func namespaces()  -> [String]
-    
+
     func path()  -> String
-    
+
     func quantizationMethod()  -> String?
-    
+
     func search(query: [Float], k: UInt32, filterJson: String?, namespace: String?, sparseJson: String?, fusion: String?, denseWeight: Float?, sparseWeight: Float?, mmrLambda: Float?) throws  -> [SearchResult]
-    
+
     func searchWithStats(query: [Float], k: UInt32, filterJson: String?, namespace: String?, sparseJson: String?, fusion: String?, denseWeight: Float?, sparseWeight: Float?, mmrLambda: Float?) throws  -> SearchStatsResult
-    
+
+    /**
+     * Adjust query-time `ef_search` only. Null reverts to auto-derived.
+     * Cheap (no rebuild).
+     */
+    func setEfSearch(efSearch: UInt32?) throws
+
+    /**
+     * Update any subset of HNSW parameters. Changing `m` or
+     * `ef_construction` triggers a full ANN rebuild; other changes are free.
+     */
+    func setIndexConfig(m: UInt32?, efConstruction: UInt32?, efSearch: UInt32?, parallelInsertThreshold: UInt32?) throws
+
     func setTtl(id: String, ttlSecs: Double, namespace: String?) throws  -> Bool
-    
-    func snapshot(dest: String) throws 
-    
-    func transactionExecute(operationsJson: String) throws 
-    
+
+    func snapshot(dest: String) throws
+
+    func transactionExecute(operationsJson: String) throws
+
     func updateMetadata(id: String, metadataJson: String, namespace: String?) throws  -> Bool
-    
-    func upsert(id: String, vector: [Float], metadataJson: String?, namespace: String?, ttl: Double?) throws 
-    
+
+    func upsert(id: String, vector: [Float], metadataJson: String?, namespace: String?, ttl: Double?) throws
+
 }
 
 /**
@@ -640,7 +663,7 @@ open class Database:
         try! rustCall { uniffi_vectlite_uniffi_fn_free_database(pointer, $0) }
     }
 
-    
+
 public static func openExisting(path: String, lockTimeout: Double?)throws  -> Database {
     return try  FfiConverterTypeDatabase.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_constructor_database_open_existing(
@@ -649,7 +672,7 @@ public static func openExisting(path: String, lockTimeout: Double?)throws  -> Da
     )
 })
 }
-    
+
 public static func openOrCreate(path: String, dimension: UInt32, metric: String?)throws  -> Database {
     return try  FfiConverterTypeDatabase.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_constructor_database_open_or_create(
@@ -659,7 +682,7 @@ public static func openOrCreate(path: String, dimension: UInt32, metric: String?
     )
 })
 }
-    
+
 public static func openReadOnly(path: String, lockTimeout: Double?)throws  -> Database {
     return try  FfiConverterTypeDatabase.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_constructor_database_open_read_only(
@@ -668,16 +691,16 @@ public static func openReadOnly(path: String, lockTimeout: Double?)throws  -> Da
     )
 })
 }
-    
 
-    
+
+
 open func backup(dest: String)throws  {try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_backup(self.uniffiClonePointer(),
         FfiConverterString.lower(dest),$0
     )
 }
 }
-    
+
 open func bulkIngest(recordsJson: String, batchSize: UInt32)throws  -> UInt32 {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_bulk_ingest(self.uniffiClonePointer(),
@@ -686,7 +709,24 @@ open func bulkIngest(recordsJson: String, batchSize: UInt32)throws  -> UInt32 {
     )
 })
 }
-    
+
+    /**
+     * Same as `bulk_ingest` but accepts HNSW tuning. Any null field falls
+     * back to the current per-session config.
+     */
+open func bulkIngestTuned(recordsJson: String, batchSize: UInt32, m: UInt32?, efConstruction: UInt32?, efSearch: UInt32?, parallelInsertThreshold: UInt32?)throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
+    uniffi_vectlite_uniffi_fn_method_database_bulk_ingest_tuned(self.uniffiClonePointer(),
+        FfiConverterString.lower(recordsJson),
+        FfiConverterUInt32.lower(batchSize),
+        FfiConverterOptionUInt32.lower(m),
+        FfiConverterOptionUInt32.lower(efConstruction),
+        FfiConverterOptionUInt32.lower(efSearch),
+        FfiConverterOptionUInt32.lower(parallelInsertThreshold),$0
+    )
+})
+}
+
 open func clearTtl(id: String, namespace: String?)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_clear_ttl(self.uniffiClonePointer(),
@@ -695,19 +735,19 @@ open func clearTtl(id: String, namespace: String?)throws  -> Bool {
     )
 })
 }
-    
+
 open func close()throws  {try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_close(self.uniffiClonePointer(),$0
     )
 }
 }
-    
+
 open func compact()throws  {try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_compact(self.uniffiClonePointer(),$0
     )
 }
 }
-    
+
 open func count(namespace: String?, filterJson: String?) -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_vectlite_uniffi_fn_method_database_count(self.uniffiClonePointer(),
@@ -716,7 +756,7 @@ open func count(namespace: String?, filterJson: String?) -> UInt32 {
     )
 })
 }
-    
+
 open func createIndex(field: String, indexType: String)throws  {try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_create_index(self.uniffiClonePointer(),
         FfiConverterString.lower(field),
@@ -724,7 +764,7 @@ open func createIndex(field: String, indexType: String)throws  {try rustCallWith
     )
 }
 }
-    
+
 open func delete(id: String, namespace: String?)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_delete(self.uniffiClonePointer(),
@@ -733,7 +773,7 @@ open func delete(id: String, namespace: String?)throws  -> Bool {
     )
 })
 }
-    
+
 open func deleteByFilter(filterJson: String, namespace: String?)throws  -> UInt32 {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_delete_by_filter(self.uniffiClonePointer(),
@@ -742,7 +782,7 @@ open func deleteByFilter(filterJson: String, namespace: String?)throws  -> UInt3
     )
 })
 }
-    
+
 open func deleteMany(ids: [String], namespace: String?)throws  -> UInt32 {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_delete_many(self.uniffiClonePointer(),
@@ -751,20 +791,20 @@ open func deleteMany(ids: [String], namespace: String?)throws  -> UInt32 {
     )
 })
 }
-    
+
 open func dimension() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_vectlite_uniffi_fn_method_database_dimension(self.uniffiClonePointer(),$0
     )
 })
 }
-    
+
 open func disableQuantization()throws  {try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_disable_quantization(self.uniffiClonePointer(),$0
     )
 }
 }
-    
+
 open func dropIndex(field: String)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_drop_index(self.uniffiClonePointer(),
@@ -772,7 +812,7 @@ open func dropIndex(field: String)throws  -> Bool {
     )
 })
 }
-    
+
 open func enableQuantization(method: String, optionsJson: String?)throws  {try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_enable_quantization(self.uniffiClonePointer(),
         FfiConverterString.lower(method),
@@ -780,13 +820,13 @@ open func enableQuantization(method: String, optionsJson: String?)throws  {try r
     )
 }
 }
-    
+
 open func flush()throws  {try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_flush(self.uniffiClonePointer(),$0
     )
 }
 }
-    
+
 open func get(id: String, namespace: String?) -> RecordResult? {
     return try!  FfiConverterOptionTypeRecordResult.lift(try! rustCall() {
     uniffi_vectlite_uniffi_fn_method_database_get(self.uniffiClonePointer(),
@@ -795,7 +835,17 @@ open func get(id: String, namespace: String?) -> RecordResult? {
     )
 })
 }
-    
+
+    /**
+     * Get the current HNSW configuration.
+     */
+open func indexConfig() -> IndexConfigResult {
+    return try!  FfiConverterTypeIndexConfigResult.lift(try! rustCall() {
+    uniffi_vectlite_uniffi_fn_method_database_index_config(self.uniffiClonePointer(),$0
+    )
+})
+}
+
 open func insert(id: String, vector: [Float], metadataJson: String?, namespace: String?, ttl: Double?)throws  {try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_insert(self.uniffiClonePointer(),
         FfiConverterString.lower(id),
@@ -806,28 +856,28 @@ open func insert(id: String, vector: [Float], metadataJson: String?, namespace: 
     )
 }
 }
-    
+
 open func isClosed() -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_vectlite_uniffi_fn_method_database_is_closed(self.uniffiClonePointer(),$0
     )
 })
 }
-    
+
 open func isQuantized() -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_vectlite_uniffi_fn_method_database_is_quantized(self.uniffiClonePointer(),$0
     )
 })
 }
-    
+
 open func isReadOnly() -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_vectlite_uniffi_fn_method_database_is_read_only(self.uniffiClonePointer(),$0
     )
 })
 }
-    
+
 open func list(namespace: String?, filterJson: String?, limit: UInt32, offset: UInt32) -> [RecordResult] {
     return try!  FfiConverterSequenceTypeRecordResult.lift(try! rustCall() {
     uniffi_vectlite_uniffi_fn_method_database_list(self.uniffiClonePointer(),
@@ -838,7 +888,7 @@ open func list(namespace: String?, filterJson: String?, limit: UInt32, offset: U
     )
 })
 }
-    
+
 open func listCursor(namespace: String?, filterJson: String?, limit: UInt32, cursor: String?)throws  -> CursorPage {
     return try  FfiConverterTypeCursorPage.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_list_cursor(self.uniffiClonePointer(),
@@ -849,7 +899,7 @@ open func listCursor(namespace: String?, filterJson: String?, limit: UInt32, cur
     )
 })
 }
-    
+
     /**
      * Returns JSON array of {field, type} objects.
      */
@@ -859,35 +909,35 @@ open func listIndexesJson() -> String {
     )
 })
 }
-    
+
 open func metric() -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_vectlite_uniffi_fn_method_database_metric(self.uniffiClonePointer(),$0
     )
 })
 }
-    
+
 open func namespaces() -> [String] {
     return try!  FfiConverterSequenceString.lift(try! rustCall() {
     uniffi_vectlite_uniffi_fn_method_database_namespaces(self.uniffiClonePointer(),$0
     )
 })
 }
-    
+
 open func path() -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_vectlite_uniffi_fn_method_database_path(self.uniffiClonePointer(),$0
     )
 })
 }
-    
+
 open func quantizationMethod() -> String? {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
     uniffi_vectlite_uniffi_fn_method_database_quantization_method(self.uniffiClonePointer(),$0
     )
 })
 }
-    
+
 open func search(query: [Float], k: UInt32, filterJson: String?, namespace: String?, sparseJson: String?, fusion: String?, denseWeight: Float?, sparseWeight: Float?, mmrLambda: Float?)throws  -> [SearchResult] {
     return try  FfiConverterSequenceTypeSearchResult.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_search(self.uniffiClonePointer(),
@@ -903,7 +953,7 @@ open func search(query: [Float], k: UInt32, filterJson: String?, namespace: Stri
     )
 })
 }
-    
+
 open func searchWithStats(query: [Float], k: UInt32, filterJson: String?, namespace: String?, sparseJson: String?, fusion: String?, denseWeight: Float?, sparseWeight: Float?, mmrLambda: Float?)throws  -> SearchStatsResult {
     return try  FfiConverterTypeSearchStatsResult.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_search_with_stats(self.uniffiClonePointer(),
@@ -919,7 +969,32 @@ open func searchWithStats(query: [Float], k: UInt32, filterJson: String?, namesp
     )
 })
 }
-    
+
+    /**
+     * Adjust query-time `ef_search` only. Null reverts to auto-derived.
+     * Cheap (no rebuild).
+     */
+open func setEfSearch(efSearch: UInt32?)throws  {try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
+    uniffi_vectlite_uniffi_fn_method_database_set_ef_search(self.uniffiClonePointer(),
+        FfiConverterOptionUInt32.lower(efSearch),$0
+    )
+}
+}
+
+    /**
+     * Update any subset of HNSW parameters. Changing `m` or
+     * `ef_construction` triggers a full ANN rebuild; other changes are free.
+     */
+open func setIndexConfig(m: UInt32?, efConstruction: UInt32?, efSearch: UInt32?, parallelInsertThreshold: UInt32?)throws  {try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
+    uniffi_vectlite_uniffi_fn_method_database_set_index_config(self.uniffiClonePointer(),
+        FfiConverterOptionUInt32.lower(m),
+        FfiConverterOptionUInt32.lower(efConstruction),
+        FfiConverterOptionUInt32.lower(efSearch),
+        FfiConverterOptionUInt32.lower(parallelInsertThreshold),$0
+    )
+}
+}
+
 open func setTtl(id: String, ttlSecs: Double, namespace: String?)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_set_ttl(self.uniffiClonePointer(),
@@ -929,21 +1004,21 @@ open func setTtl(id: String, ttlSecs: Double, namespace: String?)throws  -> Bool
     )
 })
 }
-    
+
 open func snapshot(dest: String)throws  {try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_snapshot(self.uniffiClonePointer(),
         FfiConverterString.lower(dest),$0
     )
 }
 }
-    
+
 open func transactionExecute(operationsJson: String)throws  {try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_transaction_execute(self.uniffiClonePointer(),
         FfiConverterString.lower(operationsJson),$0
     )
 }
 }
-    
+
 open func updateMetadata(id: String, metadataJson: String, namespace: String?)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_update_metadata(self.uniffiClonePointer(),
@@ -953,7 +1028,7 @@ open func updateMetadata(id: String, metadataJson: String, namespace: String?)th
     )
 })
 }
-    
+
 open func upsert(id: String, vector: [Float], metadataJson: String?, namespace: String?, ttl: Double?)throws  {try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_database_upsert(self.uniffiClonePointer(),
         FfiConverterString.lower(id),
@@ -964,7 +1039,7 @@ open func upsert(id: String, vector: [Float], metadataJson: String?, namespace: 
     )
 }
 }
-    
+
 
 }
 
@@ -1026,19 +1101,19 @@ public func FfiConverterTypeDatabase_lower(_ value: Database) -> UnsafeMutableRa
  * A physical collection store (directory of databases).
  */
 public protocol StoreProtocol : AnyObject {
-    
+
     func collections() throws  -> [String]
-    
+
     func createCollection(name: String, dimension: UInt32) throws  -> Database
-    
+
     func dropCollection(name: String) throws  -> Bool
-    
+
     func openCollection(name: String) throws  -> Database
-    
+
     func openOrCreateCollection(name: String, dimension: UInt32) throws  -> Database
-    
+
     func root()  -> String
-    
+
 }
 
 /**
@@ -1099,16 +1174,16 @@ public convenience init(root: String)throws  {
         try! rustCall { uniffi_vectlite_uniffi_fn_free_store(pointer, $0) }
     }
 
-    
 
-    
+
+
 open func collections()throws  -> [String] {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_store_collections(self.uniffiClonePointer(),$0
     )
 })
 }
-    
+
 open func createCollection(name: String, dimension: UInt32)throws  -> Database {
     return try  FfiConverterTypeDatabase.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_store_create_collection(self.uniffiClonePointer(),
@@ -1117,7 +1192,7 @@ open func createCollection(name: String, dimension: UInt32)throws  -> Database {
     )
 })
 }
-    
+
 open func dropCollection(name: String)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_store_drop_collection(self.uniffiClonePointer(),
@@ -1125,7 +1200,7 @@ open func dropCollection(name: String)throws  -> Bool {
     )
 })
 }
-    
+
 open func openCollection(name: String)throws  -> Database {
     return try  FfiConverterTypeDatabase.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_store_open_collection(self.uniffiClonePointer(),
@@ -1133,7 +1208,7 @@ open func openCollection(name: String)throws  -> Database {
     )
 })
 }
-    
+
 open func openOrCreateCollection(name: String, dimension: UInt32)throws  -> Database {
     return try  FfiConverterTypeDatabase.lift(try rustCallWithError(FfiConverterTypeVectLiteError.lift) {
     uniffi_vectlite_uniffi_fn_method_store_open_or_create_collection(self.uniffiClonePointer(),
@@ -1142,14 +1217,14 @@ open func openOrCreateCollection(name: String, dimension: UInt32)throws  -> Data
     )
 })
 }
-    
+
 open func root() -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_vectlite_uniffi_fn_method_store_root(self.uniffiClonePointer(),$0
     )
 })
 }
-    
+
 
 }
 
@@ -1247,7 +1322,7 @@ public struct FfiConverterTypeCursorPage: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CursorPage {
         return
             try CursorPage(
-                records: FfiConverterSequenceTypeRecordResult.read(from: &buf), 
+                records: FfiConverterSequenceTypeRecordResult.read(from: &buf),
                 cursor: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -1275,6 +1350,116 @@ public func FfiConverterTypeCursorPage_lower(_ value: CursorPage) -> RustBuffer 
 
 
 /**
+ * HNSW index configuration. Use null to keep the current value
+ * (when passed to `set_index_config` / `bulk_ingest_tuned`).
+ */
+public struct IndexConfigResult {
+    /**
+     * Max bidirectional links per node (default 16).
+     */
+    public var m: UInt32
+    /**
+     * Build-time search width (default 200).
+     */
+    public var efConstruction: UInt32
+    /**
+     * Query-time search width; null = auto.
+     */
+    public var efSearch: UInt32?
+    /**
+     * Minimum dataset size to engage Rayon-parallel HNSW insertion (default 256).
+     */
+    public var parallelInsertThreshold: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Max bidirectional links per node (default 16).
+         */m: UInt32,
+        /**
+         * Build-time search width (default 200).
+         */efConstruction: UInt32,
+        /**
+         * Query-time search width; null = auto.
+         */efSearch: UInt32?,
+        /**
+         * Minimum dataset size to engage Rayon-parallel HNSW insertion (default 256).
+         */parallelInsertThreshold: UInt32) {
+        self.m = m
+        self.efConstruction = efConstruction
+        self.efSearch = efSearch
+        self.parallelInsertThreshold = parallelInsertThreshold
+    }
+}
+
+
+
+extension IndexConfigResult: Equatable, Hashable {
+    public static func ==(lhs: IndexConfigResult, rhs: IndexConfigResult) -> Bool {
+        if lhs.m != rhs.m {
+            return false
+        }
+        if lhs.efConstruction != rhs.efConstruction {
+            return false
+        }
+        if lhs.efSearch != rhs.efSearch {
+            return false
+        }
+        if lhs.parallelInsertThreshold != rhs.parallelInsertThreshold {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(m)
+        hasher.combine(efConstruction)
+        hasher.combine(efSearch)
+        hasher.combine(parallelInsertThreshold)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIndexConfigResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IndexConfigResult {
+        return
+            try IndexConfigResult(
+                m: FfiConverterUInt32.read(from: &buf),
+                efConstruction: FfiConverterUInt32.read(from: &buf),
+                efSearch: FfiConverterOptionUInt32.read(from: &buf),
+                parallelInsertThreshold: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IndexConfigResult, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.m, into: &buf)
+        FfiConverterUInt32.write(value.efConstruction, into: &buf)
+        FfiConverterOptionUInt32.write(value.efSearch, into: &buf)
+        FfiConverterUInt32.write(value.parallelInsertThreshold, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIndexConfigResult_lift(_ buf: RustBuffer) throws -> IndexConfigResult {
+    return try FfiConverterTypeIndexConfigResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIndexConfigResult_lower(_ value: IndexConfigResult) -> RustBuffer {
+    return FfiConverterTypeIndexConfigResult.lower(value)
+}
+
+
+/**
  * A record returned from get/list operations.
  */
 public struct RecordResult {
@@ -1292,10 +1477,10 @@ public struct RecordResult {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(namespace: String, id: String, vector: [Float], 
+    public init(namespace: String, id: String, vector: [Float],
         /**
          * Metadata as a JSON string.
-         */metadataJson: String, 
+         */metadataJson: String,
         /**
          * Expiry timestamp (epoch seconds) or null.
          */expiresAt: Double?) {
@@ -1346,10 +1531,10 @@ public struct FfiConverterTypeRecordResult: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RecordResult {
         return
             try RecordResult(
-                namespace: FfiConverterString.read(from: &buf), 
-                id: FfiConverterString.read(from: &buf), 
-                vector: FfiConverterSequenceFloat.read(from: &buf), 
-                metadataJson: FfiConverterString.read(from: &buf), 
+                namespace: FfiConverterString.read(from: &buf),
+                id: FfiConverterString.read(from: &buf),
+                vector: FfiConverterSequenceFloat.read(from: &buf),
+                metadataJson: FfiConverterString.read(from: &buf),
                 expiresAt: FfiConverterOptionDouble.read(from: &buf)
         )
     }
@@ -1393,7 +1578,7 @@ public struct SearchResult {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(namespace: String, id: String, score: Float, 
+    public init(namespace: String, id: String, score: Float,
         /**
          * Metadata as a JSON string.
          */metadataJson: String) {
@@ -1439,9 +1624,9 @@ public struct FfiConverterTypeSearchResult: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SearchResult {
         return
             try SearchResult(
-                namespace: FfiConverterString.read(from: &buf), 
-                id: FfiConverterString.read(from: &buf), 
-                score: FfiConverterFloat.read(from: &buf), 
+                namespace: FfiConverterString.read(from: &buf),
+                id: FfiConverterString.read(from: &buf),
+                score: FfiConverterFloat.read(from: &buf),
                 metadataJson: FfiConverterString.read(from: &buf)
         )
     }
@@ -1482,7 +1667,7 @@ public struct SearchStatsResult {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(results: [SearchResult], 
+    public init(results: [SearchResult],
         /**
          * Stats as a JSON string.
          */statsJson: String) {
@@ -1518,7 +1703,7 @@ public struct FfiConverterTypeSearchStatsResult: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SearchStatsResult {
         return
             try SearchStatsResult(
-                results: FfiConverterSequenceTypeSearchResult.read(from: &buf), 
+                results: FfiConverterSequenceTypeSearchResult.read(from: &buf),
                 statsJson: FfiConverterString.read(from: &buf)
         )
     }
@@ -1547,22 +1732,22 @@ public func FfiConverterTypeSearchStatsResult_lower(_ value: SearchStatsResult) 
 
 public enum VectLiteError {
 
-    
-    
+
+
     case Io(message: String)
-    
+
     case InvalidFormat(message: String)
-    
+
     case DimensionMismatch(message: String)
-    
+
     case DuplicateId(message: String)
-    
+
     case ReadOnly(message: String)
-    
+
     case LockContention(message: String)
-    
+
     case JsonError(message: String)
-    
+
 }
 
 
@@ -1576,37 +1761,37 @@ public struct FfiConverterTypeVectLiteError: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
-        
 
-        
+
+
         case 1: return .Io(
             message: try FfiConverterString.read(from: &buf)
         )
-        
+
         case 2: return .InvalidFormat(
             message: try FfiConverterString.read(from: &buf)
         )
-        
+
         case 3: return .DimensionMismatch(
             message: try FfiConverterString.read(from: &buf)
         )
-        
+
         case 4: return .DuplicateId(
             message: try FfiConverterString.read(from: &buf)
         )
-        
+
         case 5: return .ReadOnly(
             message: try FfiConverterString.read(from: &buf)
         )
-        
+
         case 6: return .LockContention(
             message: try FfiConverterString.read(from: &buf)
         )
-        
+
         case 7: return .JsonError(
             message: try FfiConverterString.read(from: &buf)
         )
-        
+
 
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1615,9 +1800,9 @@ public struct FfiConverterTypeVectLiteError: FfiConverterRustBuffer {
     public static func write(_ value: VectLiteError, into buf: inout [UInt8]) {
         switch value {
 
-        
 
-        
+
+
         case .Io(_ /* message is ignored*/):
             writeInt(&buf, Int32(1))
         case .InvalidFormat(_ /* message is ignored*/):
@@ -1633,7 +1818,7 @@ public struct FfiConverterTypeVectLiteError: FfiConverterRustBuffer {
         case .JsonError(_ /* message is ignored*/):
             writeInt(&buf, Int32(7))
 
-        
+
         }
     }
 }
@@ -1644,6 +1829,30 @@ extension VectLiteError: Equatable, Hashable {}
 extension VectLiteError: Foundation.LocalizedError {
     public var errorDescription: String? {
         String(reflecting: self)
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = UInt32?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt32.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt32.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
     }
 }
 
@@ -1891,6 +2100,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_vectlite_uniffi_checksum_method_database_bulk_ingest() != 5888) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_vectlite_uniffi_checksum_method_database_bulk_ingest_tuned() != 32838) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_vectlite_uniffi_checksum_method_database_clear_ttl() != 13772) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1933,6 +2145,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_vectlite_uniffi_checksum_method_database_get() != 17933) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_vectlite_uniffi_checksum_method_database_index_config() != 10874) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_vectlite_uniffi_checksum_method_database_insert() != 55000) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1970,6 +2185,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vectlite_uniffi_checksum_method_database_search_with_stats() != 7087) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vectlite_uniffi_checksum_method_database_set_ef_search() != 11331) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vectlite_uniffi_checksum_method_database_set_index_config() != 29951) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_vectlite_uniffi_checksum_method_database_set_ttl() != 60343) {

@@ -375,7 +375,7 @@ private fun findLibraryName(componentName: String): String {
     if (libOverride != null) {
         return libOverride
     }
-    return "vectlite_uniffi"
+    return "uniffi_vectlite"
 }
 
 private inline fun <reified Lib : Library> loadIndirect(
@@ -808,6 +808,14 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -820,120 +828,128 @@ internal interface UniffiLib : Library {
                 uniffiCheckApiChecksums(lib)
                 }
         }
-        
+
         // The Cleaner for the whole library
         internal val CLEANER: UniffiCleaner by lazy {
             UniffiCleaner.create()
         }
     }
 
-    fun uniffi_vectlite_uniffi_fn_clone_database(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_clone_database(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): Pointer
-    fun uniffi_vectlite_uniffi_fn_free_database(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_free_database(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_vectlite_uniffi_fn_constructor_database_open_existing(`path`: RustBuffer.ByValue,`lockTimeout`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_constructor_database_open_existing(`path`: RustBuffer.ByValue,`lockTimeout`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Pointer
-    fun uniffi_vectlite_uniffi_fn_constructor_database_open_or_create(`path`: RustBuffer.ByValue,`dimension`: Int,`metric`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_constructor_database_open_or_create(`path`: RustBuffer.ByValue,`dimension`: Int,`metric`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Pointer
-    fun uniffi_vectlite_uniffi_fn_constructor_database_open_read_only(`path`: RustBuffer.ByValue,`lockTimeout`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_constructor_database_open_read_only(`path`: RustBuffer.ByValue,`lockTimeout`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Pointer
-    fun uniffi_vectlite_uniffi_fn_method_database_backup(`ptr`: Pointer,`dest`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_backup(`ptr`: Pointer,`dest`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_vectlite_uniffi_fn_method_database_bulk_ingest(`ptr`: Pointer,`recordsJson`: RustBuffer.ByValue,`batchSize`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_bulk_ingest(`ptr`: Pointer,`recordsJson`: RustBuffer.ByValue,`batchSize`: Int,uniffi_out_err: UniffiRustCallStatus,
     ): Int
-    fun uniffi_vectlite_uniffi_fn_method_database_clear_ttl(`ptr`: Pointer,`id`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Byte
-    fun uniffi_vectlite_uniffi_fn_method_database_close(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    fun uniffi_vectlite_uniffi_fn_method_database_compact(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    fun uniffi_vectlite_uniffi_fn_method_database_count(`ptr`: Pointer,`namespace`: RustBuffer.ByValue,`filterJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_bulk_ingest_tuned(`ptr`: Pointer,`recordsJson`: RustBuffer.ByValue,`batchSize`: Int,`m`: RustBuffer.ByValue,`efConstruction`: RustBuffer.ByValue,`efSearch`: RustBuffer.ByValue,`parallelInsertThreshold`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Int
-    fun uniffi_vectlite_uniffi_fn_method_database_create_index(`ptr`: Pointer,`field`: RustBuffer.ByValue,`indexType`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Unit
-    fun uniffi_vectlite_uniffi_fn_method_database_delete(`ptr`: Pointer,`id`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_clear_ttl(`ptr`: Pointer,`id`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Byte
-    fun uniffi_vectlite_uniffi_fn_method_database_delete_by_filter(`ptr`: Pointer,`filterJson`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_close(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    fun uniffi_vectlite_uniffi_fn_method_database_compact(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    fun uniffi_vectlite_uniffi_fn_method_database_count(`ptr`: Pointer,`namespace`: RustBuffer.ByValue,`filterJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Int
-    fun uniffi_vectlite_uniffi_fn_method_database_delete_many(`ptr`: Pointer,`ids`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_create_index(`ptr`: Pointer,`field`: RustBuffer.ByValue,`indexType`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    fun uniffi_vectlite_uniffi_fn_method_database_delete(`ptr`: Pointer,`id`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+    fun uniffi_vectlite_uniffi_fn_method_database_delete_by_filter(`ptr`: Pointer,`filterJson`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Int
-    fun uniffi_vectlite_uniffi_fn_method_database_dimension(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_delete_many(`ptr`: Pointer,`ids`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Int
-    fun uniffi_vectlite_uniffi_fn_method_database_disable_quantization(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_dimension(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+    ): Int
+    fun uniffi_vectlite_uniffi_fn_method_database_disable_quantization(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_vectlite_uniffi_fn_method_database_drop_index(`ptr`: Pointer,`field`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_drop_index(`ptr`: Pointer,`field`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Byte
-    fun uniffi_vectlite_uniffi_fn_method_database_enable_quantization(`ptr`: Pointer,`method`: RustBuffer.ByValue,`optionsJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_enable_quantization(`ptr`: Pointer,`method`: RustBuffer.ByValue,`optionsJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_vectlite_uniffi_fn_method_database_flush(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_flush(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_vectlite_uniffi_fn_method_database_get(`ptr`: Pointer,`id`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_get(`ptr`: Pointer,`id`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun uniffi_vectlite_uniffi_fn_method_database_insert(`ptr`: Pointer,`id`: RustBuffer.ByValue,`vector`: RustBuffer.ByValue,`metadataJson`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,`ttl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_index_config(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    fun uniffi_vectlite_uniffi_fn_method_database_insert(`ptr`: Pointer,`id`: RustBuffer.ByValue,`vector`: RustBuffer.ByValue,`metadataJson`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,`ttl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_vectlite_uniffi_fn_method_database_is_closed(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_is_closed(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): Byte
-    fun uniffi_vectlite_uniffi_fn_method_database_is_quantized(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_is_quantized(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): Byte
-    fun uniffi_vectlite_uniffi_fn_method_database_is_read_only(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_is_read_only(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): Byte
-    fun uniffi_vectlite_uniffi_fn_method_database_list(`ptr`: Pointer,`namespace`: RustBuffer.ByValue,`filterJson`: RustBuffer.ByValue,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_list(`ptr`: Pointer,`namespace`: RustBuffer.ByValue,`filterJson`: RustBuffer.ByValue,`limit`: Int,`offset`: Int,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun uniffi_vectlite_uniffi_fn_method_database_list_cursor(`ptr`: Pointer,`namespace`: RustBuffer.ByValue,`filterJson`: RustBuffer.ByValue,`limit`: Int,`cursor`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_list_cursor(`ptr`: Pointer,`namespace`: RustBuffer.ByValue,`filterJson`: RustBuffer.ByValue,`limit`: Int,`cursor`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun uniffi_vectlite_uniffi_fn_method_database_list_indexes_json(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_list_indexes_json(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun uniffi_vectlite_uniffi_fn_method_database_metric(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_metric(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun uniffi_vectlite_uniffi_fn_method_database_namespaces(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_namespaces(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun uniffi_vectlite_uniffi_fn_method_database_path(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_path(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun uniffi_vectlite_uniffi_fn_method_database_quantization_method(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_quantization_method(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun uniffi_vectlite_uniffi_fn_method_database_search(`ptr`: Pointer,`query`: RustBuffer.ByValue,`k`: Int,`filterJson`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,`sparseJson`: RustBuffer.ByValue,`fusion`: RustBuffer.ByValue,`denseWeight`: RustBuffer.ByValue,`sparseWeight`: RustBuffer.ByValue,`mmrLambda`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_search(`ptr`: Pointer,`query`: RustBuffer.ByValue,`k`: Int,`filterJson`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,`sparseJson`: RustBuffer.ByValue,`fusion`: RustBuffer.ByValue,`denseWeight`: RustBuffer.ByValue,`sparseWeight`: RustBuffer.ByValue,`mmrLambda`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun uniffi_vectlite_uniffi_fn_method_database_search_with_stats(`ptr`: Pointer,`query`: RustBuffer.ByValue,`k`: Int,`filterJson`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,`sparseJson`: RustBuffer.ByValue,`fusion`: RustBuffer.ByValue,`denseWeight`: RustBuffer.ByValue,`sparseWeight`: RustBuffer.ByValue,`mmrLambda`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_search_with_stats(`ptr`: Pointer,`query`: RustBuffer.ByValue,`k`: Int,`filterJson`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,`sparseJson`: RustBuffer.ByValue,`fusion`: RustBuffer.ByValue,`denseWeight`: RustBuffer.ByValue,`sparseWeight`: RustBuffer.ByValue,`mmrLambda`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun uniffi_vectlite_uniffi_fn_method_database_set_ttl(`ptr`: Pointer,`id`: RustBuffer.ByValue,`ttlSecs`: Double,`namespace`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-    ): Byte
-    fun uniffi_vectlite_uniffi_fn_method_database_snapshot(`ptr`: Pointer,`dest`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_set_ef_search(`ptr`: Pointer,`efSearch`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_vectlite_uniffi_fn_method_database_transaction_execute(`ptr`: Pointer,`operationsJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_set_index_config(`ptr`: Pointer,`m`: RustBuffer.ByValue,`efConstruction`: RustBuffer.ByValue,`efSearch`: RustBuffer.ByValue,`parallelInsertThreshold`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_vectlite_uniffi_fn_method_database_update_metadata(`ptr`: Pointer,`id`: RustBuffer.ByValue,`metadataJson`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_set_ttl(`ptr`: Pointer,`id`: RustBuffer.ByValue,`ttlSecs`: Double,`namespace`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Byte
-    fun uniffi_vectlite_uniffi_fn_method_database_upsert(`ptr`: Pointer,`id`: RustBuffer.ByValue,`vector`: RustBuffer.ByValue,`metadataJson`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,`ttl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_snapshot(`ptr`: Pointer,`dest`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_vectlite_uniffi_fn_clone_store(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_database_transaction_execute(`ptr`: Pointer,`operationsJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    fun uniffi_vectlite_uniffi_fn_method_database_update_metadata(`ptr`: Pointer,`id`: RustBuffer.ByValue,`metadataJson`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+    fun uniffi_vectlite_uniffi_fn_method_database_upsert(`ptr`: Pointer,`id`: RustBuffer.ByValue,`vector`: RustBuffer.ByValue,`metadataJson`: RustBuffer.ByValue,`namespace`: RustBuffer.ByValue,`ttl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    fun uniffi_vectlite_uniffi_fn_clone_store(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): Pointer
-    fun uniffi_vectlite_uniffi_fn_free_store(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_free_store(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun uniffi_vectlite_uniffi_fn_constructor_store_new(`root`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_constructor_store_new(`root`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Pointer
-    fun uniffi_vectlite_uniffi_fn_method_store_collections(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_store_collections(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun uniffi_vectlite_uniffi_fn_method_store_create_collection(`ptr`: Pointer,`name`: RustBuffer.ByValue,`dimension`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_store_create_collection(`ptr`: Pointer,`name`: RustBuffer.ByValue,`dimension`: Int,uniffi_out_err: UniffiRustCallStatus,
     ): Pointer
-    fun uniffi_vectlite_uniffi_fn_method_store_drop_collection(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_store_drop_collection(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Byte
-    fun uniffi_vectlite_uniffi_fn_method_store_open_collection(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_store_open_collection(`ptr`: Pointer,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Pointer
-    fun uniffi_vectlite_uniffi_fn_method_store_open_or_create_collection(`ptr`: Pointer,`name`: RustBuffer.ByValue,`dimension`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_store_open_or_create_collection(`ptr`: Pointer,`name`: RustBuffer.ByValue,`dimension`: Int,uniffi_out_err: UniffiRustCallStatus,
     ): Pointer
-    fun uniffi_vectlite_uniffi_fn_method_store_root(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_method_store_root(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun uniffi_vectlite_uniffi_fn_func_restore(`source`: RustBuffer.ByValue,`dest`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_func_restore(`source`: RustBuffer.ByValue,`dest`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Pointer
-    fun uniffi_vectlite_uniffi_fn_func_sparse_terms(`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun uniffi_vectlite_uniffi_fn_func_sparse_terms(`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun ffi_vectlite_uniffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun ffi_vectlite_uniffi_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
-    fun ffi_vectlite_uniffi_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
-    fun ffi_vectlite_uniffi_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     fun ffi_vectlite_uniffi_rust_future_poll_u8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -941,7 +957,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_vectlite_uniffi_rust_future_free_u8(`handle`: Long,
     ): Unit
-    fun ffi_vectlite_uniffi_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Byte
     fun ffi_vectlite_uniffi_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -949,7 +965,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_vectlite_uniffi_rust_future_free_i8(`handle`: Long,
     ): Unit
-    fun ffi_vectlite_uniffi_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Byte
     fun ffi_vectlite_uniffi_rust_future_poll_u16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -957,7 +973,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_vectlite_uniffi_rust_future_free_u16(`handle`: Long,
     ): Unit
-    fun ffi_vectlite_uniffi_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Short
     fun ffi_vectlite_uniffi_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -965,7 +981,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_vectlite_uniffi_rust_future_free_i16(`handle`: Long,
     ): Unit
-    fun ffi_vectlite_uniffi_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Short
     fun ffi_vectlite_uniffi_rust_future_poll_u32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -973,7 +989,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_vectlite_uniffi_rust_future_free_u32(`handle`: Long,
     ): Unit
-    fun ffi_vectlite_uniffi_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Int
     fun ffi_vectlite_uniffi_rust_future_poll_i32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -981,7 +997,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_vectlite_uniffi_rust_future_free_i32(`handle`: Long,
     ): Unit
-    fun ffi_vectlite_uniffi_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Int
     fun ffi_vectlite_uniffi_rust_future_poll_u64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -989,7 +1005,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_vectlite_uniffi_rust_future_free_u64(`handle`: Long,
     ): Unit
-    fun ffi_vectlite_uniffi_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Long
     fun ffi_vectlite_uniffi_rust_future_poll_i64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -997,7 +1013,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_vectlite_uniffi_rust_future_free_i64(`handle`: Long,
     ): Unit
-    fun ffi_vectlite_uniffi_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Long
     fun ffi_vectlite_uniffi_rust_future_poll_f32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -1005,7 +1021,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_vectlite_uniffi_rust_future_free_f32(`handle`: Long,
     ): Unit
-    fun ffi_vectlite_uniffi_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Float
     fun ffi_vectlite_uniffi_rust_future_poll_f64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -1013,7 +1029,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_vectlite_uniffi_rust_future_free_f64(`handle`: Long,
     ): Unit
-    fun ffi_vectlite_uniffi_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Double
     fun ffi_vectlite_uniffi_rust_future_poll_pointer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -1021,7 +1037,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_vectlite_uniffi_rust_future_free_pointer(`handle`: Long,
     ): Unit
-    fun ffi_vectlite_uniffi_rust_future_complete_pointer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rust_future_complete_pointer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Pointer
     fun ffi_vectlite_uniffi_rust_future_poll_rust_buffer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -1029,7 +1045,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_vectlite_uniffi_rust_future_free_rust_buffer(`handle`: Long,
     ): Unit
-    fun ffi_vectlite_uniffi_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     fun ffi_vectlite_uniffi_rust_future_poll_void(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
     ): Unit
@@ -1037,7 +1053,7 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_vectlite_uniffi_rust_future_free_void(`handle`: Long,
     ): Unit
-    fun ffi_vectlite_uniffi_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    fun ffi_vectlite_uniffi_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
     fun uniffi_vectlite_uniffi_checksum_func_restore(
     ): Short
@@ -1046,6 +1062,8 @@ internal interface UniffiLib : Library {
     fun uniffi_vectlite_uniffi_checksum_method_database_backup(
     ): Short
     fun uniffi_vectlite_uniffi_checksum_method_database_bulk_ingest(
+    ): Short
+    fun uniffi_vectlite_uniffi_checksum_method_database_bulk_ingest_tuned(
     ): Short
     fun uniffi_vectlite_uniffi_checksum_method_database_clear_ttl(
     ): Short
@@ -1075,6 +1093,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_vectlite_uniffi_checksum_method_database_get(
     ): Short
+    fun uniffi_vectlite_uniffi_checksum_method_database_index_config(
+    ): Short
     fun uniffi_vectlite_uniffi_checksum_method_database_insert(
     ): Short
     fun uniffi_vectlite_uniffi_checksum_method_database_is_closed(
@@ -1100,6 +1120,10 @@ internal interface UniffiLib : Library {
     fun uniffi_vectlite_uniffi_checksum_method_database_search(
     ): Short
     fun uniffi_vectlite_uniffi_checksum_method_database_search_with_stats(
+    ): Short
+    fun uniffi_vectlite_uniffi_checksum_method_database_set_ef_search(
+    ): Short
+    fun uniffi_vectlite_uniffi_checksum_method_database_set_index_config(
     ): Short
     fun uniffi_vectlite_uniffi_checksum_method_database_set_ttl(
     ): Short
@@ -1133,7 +1157,7 @@ internal interface UniffiLib : Library {
     ): Short
     fun ffi_vectlite_uniffi_uniffi_contract_version(
     ): Int
-    
+
 }
 
 private fun uniffiCheckContractApiVersion(lib: UniffiLib) {
@@ -1158,6 +1182,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_vectlite_uniffi_checksum_method_database_bulk_ingest() != 5888.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_vectlite_uniffi_checksum_method_database_bulk_ingest_tuned() != 32838.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_vectlite_uniffi_checksum_method_database_clear_ttl() != 13772.toShort()) {
@@ -1202,6 +1229,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_vectlite_uniffi_checksum_method_database_get() != 17933.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_vectlite_uniffi_checksum_method_database_index_config() != 10874.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_vectlite_uniffi_checksum_method_database_insert() != 55000.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1239,6 +1269,12 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_vectlite_uniffi_checksum_method_database_search_with_stats() != 7087.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_vectlite_uniffi_checksum_method_database_set_ef_search() != 11331.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_vectlite_uniffi_checksum_method_database_set_index_config() != 29951.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_vectlite_uniffi_checksum_method_database_set_ttl() != 60343.toShort()) {
@@ -1326,7 +1362,7 @@ inline fun <T : Disposable?, R> T.use(block: (T) -> R) =
         }
     }
 
-/** 
+/**
  * Used to instantiate an interface without an actual pointer, for fakes in tests, mostly.
  *
  * @suppress
@@ -1648,78 +1684,101 @@ private class JavaLangRefCleanable(
  * An embedded vector database.
  */
 public interface DatabaseInterface {
-    
+
     fun `backup`(`dest`: kotlin.String)
-    
+
     fun `bulkIngest`(`recordsJson`: kotlin.String, `batchSize`: kotlin.UInt): kotlin.UInt
-    
+
+    /**
+     * Same as `bulk_ingest` but accepts HNSW tuning. Any null field falls
+     * back to the current per-session config.
+     */
+    fun `bulkIngestTuned`(`recordsJson`: kotlin.String, `batchSize`: kotlin.UInt, `m`: kotlin.UInt?, `efConstruction`: kotlin.UInt?, `efSearch`: kotlin.UInt?, `parallelInsertThreshold`: kotlin.UInt?): kotlin.UInt
+
     fun `clearTtl`(`id`: kotlin.String, `namespace`: kotlin.String?): kotlin.Boolean
-    
+
     fun `close`()
-    
+
     fun `compact`()
-    
+
     fun `count`(`namespace`: kotlin.String?, `filterJson`: kotlin.String?): kotlin.UInt
-    
+
     fun `createIndex`(`field`: kotlin.String, `indexType`: kotlin.String)
-    
+
     fun `delete`(`id`: kotlin.String, `namespace`: kotlin.String?): kotlin.Boolean
-    
+
     fun `deleteByFilter`(`filterJson`: kotlin.String, `namespace`: kotlin.String?): kotlin.UInt
-    
+
     fun `deleteMany`(`ids`: List<kotlin.String>, `namespace`: kotlin.String?): kotlin.UInt
-    
+
     fun `dimension`(): kotlin.UInt
-    
+
     fun `disableQuantization`()
-    
+
     fun `dropIndex`(`field`: kotlin.String): kotlin.Boolean
-    
+
     fun `enableQuantization`(`method`: kotlin.String, `optionsJson`: kotlin.String?)
-    
+
     fun `flush`()
-    
+
     fun `get`(`id`: kotlin.String, `namespace`: kotlin.String?): RecordResult?
-    
+
+    /**
+     * Get the current HNSW configuration.
+     */
+    fun `indexConfig`(): IndexConfigResult
+
     fun `insert`(`id`: kotlin.String, `vector`: List<kotlin.Float>, `metadataJson`: kotlin.String?, `namespace`: kotlin.String?, `ttl`: kotlin.Double?)
-    
+
     fun `isClosed`(): kotlin.Boolean
-    
+
     fun `isQuantized`(): kotlin.Boolean
-    
+
     fun `isReadOnly`(): kotlin.Boolean
-    
+
     fun `list`(`namespace`: kotlin.String?, `filterJson`: kotlin.String?, `limit`: kotlin.UInt, `offset`: kotlin.UInt): List<RecordResult>
-    
+
     fun `listCursor`(`namespace`: kotlin.String?, `filterJson`: kotlin.String?, `limit`: kotlin.UInt, `cursor`: kotlin.String?): CursorPage
-    
+
     /**
      * Returns JSON array of {field, type} objects.
      */
     fun `listIndexesJson`(): kotlin.String
-    
+
     fun `metric`(): kotlin.String
-    
+
     fun `namespaces`(): List<kotlin.String>
-    
+
     fun `path`(): kotlin.String
-    
+
     fun `quantizationMethod`(): kotlin.String?
-    
+
     fun `search`(`query`: List<kotlin.Float>, `k`: kotlin.UInt, `filterJson`: kotlin.String?, `namespace`: kotlin.String?, `sparseJson`: kotlin.String?, `fusion`: kotlin.String?, `denseWeight`: kotlin.Float?, `sparseWeight`: kotlin.Float?, `mmrLambda`: kotlin.Float?): List<SearchResult>
-    
+
     fun `searchWithStats`(`query`: List<kotlin.Float>, `k`: kotlin.UInt, `filterJson`: kotlin.String?, `namespace`: kotlin.String?, `sparseJson`: kotlin.String?, `fusion`: kotlin.String?, `denseWeight`: kotlin.Float?, `sparseWeight`: kotlin.Float?, `mmrLambda`: kotlin.Float?): SearchStatsResult
-    
+
+    /**
+     * Adjust query-time `ef_search` only. Null reverts to auto-derived.
+     * Cheap (no rebuild).
+     */
+    fun `setEfSearch`(`efSearch`: kotlin.UInt?)
+
+    /**
+     * Update any subset of HNSW parameters. Changing `m` or
+     * `ef_construction` triggers a full ANN rebuild; other changes are free.
+     */
+    fun `setIndexConfig`(`m`: kotlin.UInt?, `efConstruction`: kotlin.UInt?, `efSearch`: kotlin.UInt?, `parallelInsertThreshold`: kotlin.UInt?)
+
     fun `setTtl`(`id`: kotlin.String, `ttlSecs`: kotlin.Double, `namespace`: kotlin.String?): kotlin.Boolean
-    
+
     fun `snapshot`(`dest`: kotlin.String)
-    
+
     fun `transactionExecute`(`operationsJson`: kotlin.String)
-    
+
     fun `updateMetadata`(`id`: kotlin.String, `metadataJson`: kotlin.String, `namespace`: kotlin.String?): kotlin.Boolean
-    
+
     fun `upsert`(`id`: kotlin.String, `vector`: List<kotlin.Float>, `metadataJson`: kotlin.String?, `namespace`: kotlin.String?, `ttl`: kotlin.Double?)
-    
+
     companion object
 }
 
@@ -1807,19 +1866,19 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
         }
     }
 
-    
+
     @Throws(VectLiteException::class)override fun `backup`(`dest`: kotlin.String)
-        = 
+        =
     callWithPointer {
     uniffiRustCallWithError(VectLiteException) { _status ->
     UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_backup(
         it, FfiConverterString.lower(`dest`),_status)
 }
     }
-    
-    
 
-    
+
+
+
     @Throws(VectLiteException::class)override fun `bulkIngest`(`recordsJson`: kotlin.String, `batchSize`: kotlin.UInt): kotlin.UInt {
             return FfiConverterUInt.lift(
     callWithPointer {
@@ -1830,9 +1889,26 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
+    /**
+     * Same as `bulk_ingest` but accepts HNSW tuning. Any null field falls
+     * back to the current per-session config.
+     */
+    @Throws(VectLiteException::class)override fun `bulkIngestTuned`(`recordsJson`: kotlin.String, `batchSize`: kotlin.UInt, `m`: kotlin.UInt?, `efConstruction`: kotlin.UInt?, `efSearch`: kotlin.UInt?, `parallelInsertThreshold`: kotlin.UInt?): kotlin.UInt {
+            return FfiConverterUInt.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VectLiteException) { _status ->
+    UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_bulk_ingest_tuned(
+        it, FfiConverterString.lower(`recordsJson`),FfiConverterUInt.lower(`batchSize`),FfiConverterOptionalUInt.lower(`m`),FfiConverterOptionalUInt.lower(`efConstruction`),FfiConverterOptionalUInt.lower(`efSearch`),FfiConverterOptionalUInt.lower(`parallelInsertThreshold`),_status)
+}
+    }
+    )
+    }
+
+
+
     @Throws(VectLiteException::class)override fun `clearTtl`(`id`: kotlin.String, `namespace`: kotlin.String?): kotlin.Boolean {
             return FfiConverterBoolean.lift(
     callWithPointer {
@@ -1843,31 +1919,31 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `close`()
-        = 
+        =
     callWithPointer {
     uniffiRustCallWithError(VectLiteException) { _status ->
     UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_close(
         it, _status)
 }
     }
-    
-    
 
-    
+
+
+
     @Throws(VectLiteException::class)override fun `compact`()
-        = 
+        =
     callWithPointer {
     uniffiRustCallWithError(VectLiteException) { _status ->
     UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_compact(
         it, _status)
 }
     }
-    
-    
+
+
 
     override fun `count`(`namespace`: kotlin.String?, `filterJson`: kotlin.String?): kotlin.UInt {
             return FfiConverterUInt.lift(
@@ -1879,21 +1955,21 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `createIndex`(`field`: kotlin.String, `indexType`: kotlin.String)
-        = 
+        =
     callWithPointer {
     uniffiRustCallWithError(VectLiteException) { _status ->
     UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_create_index(
         it, FfiConverterString.lower(`field`),FfiConverterString.lower(`indexType`),_status)
 }
     }
-    
-    
 
-    
+
+
+
     @Throws(VectLiteException::class)override fun `delete`(`id`: kotlin.String, `namespace`: kotlin.String?): kotlin.Boolean {
             return FfiConverterBoolean.lift(
     callWithPointer {
@@ -1904,9 +1980,9 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `deleteByFilter`(`filterJson`: kotlin.String, `namespace`: kotlin.String?): kotlin.UInt {
             return FfiConverterUInt.lift(
     callWithPointer {
@@ -1917,9 +1993,9 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `deleteMany`(`ids`: List<kotlin.String>, `namespace`: kotlin.String?): kotlin.UInt {
             return FfiConverterUInt.lift(
     callWithPointer {
@@ -1930,7 +2006,7 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
+
 
     override fun `dimension`(): kotlin.UInt {
             return FfiConverterUInt.lift(
@@ -1942,21 +2018,21 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `disableQuantization`()
-        = 
+        =
     callWithPointer {
     uniffiRustCallWithError(VectLiteException) { _status ->
     UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_disable_quantization(
         it, _status)
 }
     }
-    
-    
 
-    
+
+
+
     @Throws(VectLiteException::class)override fun `dropIndex`(`field`: kotlin.String): kotlin.Boolean {
             return FfiConverterBoolean.lift(
     callWithPointer {
@@ -1967,31 +2043,31 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `enableQuantization`(`method`: kotlin.String, `optionsJson`: kotlin.String?)
-        = 
+        =
     callWithPointer {
     uniffiRustCallWithError(VectLiteException) { _status ->
     UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_enable_quantization(
         it, FfiConverterString.lower(`method`),FfiConverterOptionalString.lower(`optionsJson`),_status)
 }
     }
-    
-    
 
-    
+
+
+
     @Throws(VectLiteException::class)override fun `flush`()
-        = 
+        =
     callWithPointer {
     uniffiRustCallWithError(VectLiteException) { _status ->
     UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_flush(
         it, _status)
 }
     }
-    
-    
+
+
 
     override fun `get`(`id`: kotlin.String, `namespace`: kotlin.String?): RecordResult? {
             return FfiConverterOptionalTypeRecordResult.lift(
@@ -2003,19 +2079,34 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
+    /**
+     * Get the current HNSW configuration.
+     */override fun `indexConfig`(): IndexConfigResult {
+            return FfiConverterTypeIndexConfigResult.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_index_config(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+
     @Throws(VectLiteException::class)override fun `insert`(`id`: kotlin.String, `vector`: List<kotlin.Float>, `metadataJson`: kotlin.String?, `namespace`: kotlin.String?, `ttl`: kotlin.Double?)
-        = 
+        =
     callWithPointer {
     uniffiRustCallWithError(VectLiteException) { _status ->
     UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_insert(
         it, FfiConverterString.lower(`id`),FfiConverterSequenceFloat.lower(`vector`),FfiConverterOptionalString.lower(`metadataJson`),FfiConverterOptionalString.lower(`namespace`),FfiConverterOptionalDouble.lower(`ttl`),_status)
 }
     }
-    
-    
+
+
 
     override fun `isClosed`(): kotlin.Boolean {
             return FfiConverterBoolean.lift(
@@ -2027,7 +2118,7 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
+
 
     override fun `isQuantized`(): kotlin.Boolean {
             return FfiConverterBoolean.lift(
@@ -2039,7 +2130,7 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
+
 
     override fun `isReadOnly`(): kotlin.Boolean {
             return FfiConverterBoolean.lift(
@@ -2051,7 +2142,7 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
+
 
     override fun `list`(`namespace`: kotlin.String?, `filterJson`: kotlin.String?, `limit`: kotlin.UInt, `offset`: kotlin.UInt): List<RecordResult> {
             return FfiConverterSequenceTypeRecordResult.lift(
@@ -2063,9 +2154,9 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `listCursor`(`namespace`: kotlin.String?, `filterJson`: kotlin.String?, `limit`: kotlin.UInt, `cursor`: kotlin.String?): CursorPage {
             return FfiConverterTypeCursorPage.lift(
     callWithPointer {
@@ -2076,9 +2167,9 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
     /**
      * Returns JSON array of {field, type} objects.
      */override fun `listIndexesJson`(): kotlin.String {
@@ -2091,7 +2182,7 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
+
 
     override fun `metric`(): kotlin.String {
             return FfiConverterString.lift(
@@ -2103,7 +2194,7 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
+
 
     override fun `namespaces`(): List<kotlin.String> {
             return FfiConverterSequenceString.lift(
@@ -2115,7 +2206,7 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
+
 
     override fun `path`(): kotlin.String {
             return FfiConverterString.lift(
@@ -2127,7 +2218,7 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
+
 
     override fun `quantizationMethod`(): kotlin.String? {
             return FfiConverterOptionalString.lift(
@@ -2139,9 +2230,9 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `search`(`query`: List<kotlin.Float>, `k`: kotlin.UInt, `filterJson`: kotlin.String?, `namespace`: kotlin.String?, `sparseJson`: kotlin.String?, `fusion`: kotlin.String?, `denseWeight`: kotlin.Float?, `sparseWeight`: kotlin.Float?, `mmrLambda`: kotlin.Float?): List<SearchResult> {
             return FfiConverterSequenceTypeSearchResult.lift(
     callWithPointer {
@@ -2152,9 +2243,9 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `searchWithStats`(`query`: List<kotlin.Float>, `k`: kotlin.UInt, `filterJson`: kotlin.String?, `namespace`: kotlin.String?, `sparseJson`: kotlin.String?, `fusion`: kotlin.String?, `denseWeight`: kotlin.Float?, `sparseWeight`: kotlin.Float?, `mmrLambda`: kotlin.Float?): SearchStatsResult {
             return FfiConverterTypeSearchStatsResult.lift(
     callWithPointer {
@@ -2165,9 +2256,41 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
+    /**
+     * Adjust query-time `ef_search` only. Null reverts to auto-derived.
+     * Cheap (no rebuild).
+     */
+    @Throws(VectLiteException::class)override fun `setEfSearch`(`efSearch`: kotlin.UInt?)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(VectLiteException) { _status ->
+    UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_set_ef_search(
+        it, FfiConverterOptionalUInt.lower(`efSearch`),_status)
+}
+    }
+
+
+
+
+    /**
+     * Update any subset of HNSW parameters. Changing `m` or
+     * `ef_construction` triggers a full ANN rebuild; other changes are free.
+     */
+    @Throws(VectLiteException::class)override fun `setIndexConfig`(`m`: kotlin.UInt?, `efConstruction`: kotlin.UInt?, `efSearch`: kotlin.UInt?, `parallelInsertThreshold`: kotlin.UInt?)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(VectLiteException) { _status ->
+    UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_set_index_config(
+        it, FfiConverterOptionalUInt.lower(`m`),FfiConverterOptionalUInt.lower(`efConstruction`),FfiConverterOptionalUInt.lower(`efSearch`),FfiConverterOptionalUInt.lower(`parallelInsertThreshold`),_status)
+}
+    }
+
+
+
+
     @Throws(VectLiteException::class)override fun `setTtl`(`id`: kotlin.String, `ttlSecs`: kotlin.Double, `namespace`: kotlin.String?): kotlin.Boolean {
             return FfiConverterBoolean.lift(
     callWithPointer {
@@ -2178,33 +2301,33 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `snapshot`(`dest`: kotlin.String)
-        = 
+        =
     callWithPointer {
     uniffiRustCallWithError(VectLiteException) { _status ->
     UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_snapshot(
         it, FfiConverterString.lower(`dest`),_status)
 }
     }
-    
-    
 
-    
+
+
+
     @Throws(VectLiteException::class)override fun `transactionExecute`(`operationsJson`: kotlin.String)
-        = 
+        =
     callWithPointer {
     uniffiRustCallWithError(VectLiteException) { _status ->
     UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_transaction_execute(
         it, FfiConverterString.lower(`operationsJson`),_status)
 }
     }
-    
-    
 
-    
+
+
+
     @Throws(VectLiteException::class)override fun `updateMetadata`(`id`: kotlin.String, `metadataJson`: kotlin.String, `namespace`: kotlin.String?): kotlin.Boolean {
             return FfiConverterBoolean.lift(
     callWithPointer {
@@ -2215,25 +2338,25 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `upsert`(`id`: kotlin.String, `vector`: List<kotlin.Float>, `metadataJson`: kotlin.String?, `namespace`: kotlin.String?, `ttl`: kotlin.Double?)
-        = 
+        =
     callWithPointer {
     uniffiRustCallWithError(VectLiteException) { _status ->
     UniffiLib.INSTANCE.uniffi_vectlite_uniffi_fn_method_database_upsert(
         it, FfiConverterString.lower(`id`),FfiConverterSequenceFloat.lower(`vector`),FfiConverterOptionalString.lower(`metadataJson`),FfiConverterOptionalString.lower(`namespace`),FfiConverterOptionalDouble.lower(`ttl`),_status)
 }
     }
-    
-    
 
-    
 
-    
+
+
+
+
     companion object {
-        
+
     @Throws(VectLiteException::class) fun `openExisting`(`path`: kotlin.String, `lockTimeout`: kotlin.Double?): Database {
             return FfiConverterTypeDatabase.lift(
     uniffiRustCallWithError(VectLiteException) { _status ->
@@ -2242,9 +2365,9 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
 }
     )
     }
-    
 
-        
+
+
     @Throws(VectLiteException::class) fun `openOrCreate`(`path`: kotlin.String, `dimension`: kotlin.UInt, `metric`: kotlin.String?): Database {
             return FfiConverterTypeDatabase.lift(
     uniffiRustCallWithError(VectLiteException) { _status ->
@@ -2253,9 +2376,9 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
 }
     )
     }
-    
 
-        
+
+
     @Throws(VectLiteException::class) fun `openReadOnly`(`path`: kotlin.String, `lockTimeout`: kotlin.Double?): Database {
             return FfiConverterTypeDatabase.lift(
     uniffiRustCallWithError(VectLiteException) { _status ->
@@ -2264,11 +2387,11 @@ open class Database: Disposable, AutoCloseable, DatabaseInterface {
 }
     )
     }
-    
 
-        
+
+
     }
-    
+
 }
 
 /**
@@ -2402,19 +2525,19 @@ public object FfiConverterTypeDatabase: FfiConverter<Database, Pointer> {
  * A physical collection store (directory of databases).
  */
 public interface StoreInterface {
-    
+
     fun `collections`(): List<kotlin.String>
-    
+
     fun `createCollection`(`name`: kotlin.String, `dimension`: kotlin.UInt): Database
-    
+
     fun `dropCollection`(`name`: kotlin.String): kotlin.Boolean
-    
+
     fun `openCollection`(`name`: kotlin.String): Database
-    
+
     fun `openOrCreateCollection`(`name`: kotlin.String, `dimension`: kotlin.UInt): Database
-    
+
     fun `root`(): kotlin.String
-    
+
     companion object
 }
 
@@ -2509,7 +2632,7 @@ open class Store: Disposable, AutoCloseable, StoreInterface {
         }
     }
 
-    
+
     @Throws(VectLiteException::class)override fun `collections`(): List<kotlin.String> {
             return FfiConverterSequenceString.lift(
     callWithPointer {
@@ -2520,9 +2643,9 @@ open class Store: Disposable, AutoCloseable, StoreInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `createCollection`(`name`: kotlin.String, `dimension`: kotlin.UInt): Database {
             return FfiConverterTypeDatabase.lift(
     callWithPointer {
@@ -2533,9 +2656,9 @@ open class Store: Disposable, AutoCloseable, StoreInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `dropCollection`(`name`: kotlin.String): kotlin.Boolean {
             return FfiConverterBoolean.lift(
     callWithPointer {
@@ -2546,9 +2669,9 @@ open class Store: Disposable, AutoCloseable, StoreInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `openCollection`(`name`: kotlin.String): Database {
             return FfiConverterTypeDatabase.lift(
     callWithPointer {
@@ -2559,9 +2682,9 @@ open class Store: Disposable, AutoCloseable, StoreInterface {
     }
     )
     }
-    
 
-    
+
+
     @Throws(VectLiteException::class)override fun `openOrCreateCollection`(`name`: kotlin.String, `dimension`: kotlin.UInt): Database {
             return FfiConverterTypeDatabase.lift(
     callWithPointer {
@@ -2572,7 +2695,7 @@ open class Store: Disposable, AutoCloseable, StoreInterface {
     }
     )
     }
-    
+
 
     override fun `root`(): kotlin.String {
             return FfiConverterString.lift(
@@ -2584,14 +2707,14 @@ open class Store: Disposable, AutoCloseable, StoreInterface {
     }
     )
     }
-    
 
-    
 
-    
-    
+
+
+
+
     companion object
-    
+
 }
 
 /**
@@ -2628,10 +2751,10 @@ public object FfiConverterTypeStore: FfiConverter<Store, Pointer> {
  * A page of cursor-based results.
  */
 data class CursorPage (
-    var `records`: List<RecordResult>, 
+    var `records`: List<RecordResult>,
     var `cursor`: kotlin.String?
 ) {
-    
+
     companion object
 }
 
@@ -2660,22 +2783,78 @@ public object FfiConverterTypeCursorPage: FfiConverterRustBuffer<CursorPage> {
 
 
 /**
+ * HNSW index configuration. Use null to keep the current value
+ * (when passed to `set_index_config` / `bulk_ingest_tuned`).
+ */
+data class IndexConfigResult (
+    /**
+     * Max bidirectional links per node (default 16).
+     */
+    var `m`: kotlin.UInt,
+    /**
+     * Build-time search width (default 200).
+     */
+    var `efConstruction`: kotlin.UInt,
+    /**
+     * Query-time search width; null = auto.
+     */
+    var `efSearch`: kotlin.UInt?,
+    /**
+     * Minimum dataset size to engage Rayon-parallel HNSW insertion (default 256).
+     */
+    var `parallelInsertThreshold`: kotlin.UInt
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeIndexConfigResult: FfiConverterRustBuffer<IndexConfigResult> {
+    override fun read(buf: ByteBuffer): IndexConfigResult {
+        return IndexConfigResult(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterOptionalUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: IndexConfigResult) = (
+            FfiConverterUInt.allocationSize(value.`m`) +
+            FfiConverterUInt.allocationSize(value.`efConstruction`) +
+            FfiConverterOptionalUInt.allocationSize(value.`efSearch`) +
+            FfiConverterUInt.allocationSize(value.`parallelInsertThreshold`)
+    )
+
+    override fun write(value: IndexConfigResult, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`m`, buf)
+            FfiConverterUInt.write(value.`efConstruction`, buf)
+            FfiConverterOptionalUInt.write(value.`efSearch`, buf)
+            FfiConverterUInt.write(value.`parallelInsertThreshold`, buf)
+    }
+}
+
+
+
+/**
  * A record returned from get/list operations.
  */
 data class RecordResult (
-    var `namespace`: kotlin.String, 
-    var `id`: kotlin.String, 
-    var `vector`: List<kotlin.Float>, 
+    var `namespace`: kotlin.String,
+    var `id`: kotlin.String,
+    var `vector`: List<kotlin.Float>,
     /**
      * Metadata as a JSON string.
      */
-    var `metadataJson`: kotlin.String, 
+    var `metadataJson`: kotlin.String,
     /**
      * Expiry timestamp (epoch seconds) or null.
      */
     var `expiresAt`: kotlin.Double?
 ) {
-    
+
     companion object
 }
 
@@ -2716,15 +2895,15 @@ public object FfiConverterTypeRecordResult: FfiConverterRustBuffer<RecordResult>
  * A search result returned from search operations.
  */
 data class SearchResult (
-    var `namespace`: kotlin.String, 
-    var `id`: kotlin.String, 
-    var `score`: kotlin.Float, 
+    var `namespace`: kotlin.String,
+    var `id`: kotlin.String,
+    var `score`: kotlin.Float,
     /**
      * Metadata as a JSON string.
      */
     var `metadataJson`: kotlin.String
 ) {
-    
+
     companion object
 }
 
@@ -2762,13 +2941,13 @@ public object FfiConverterTypeSearchResult: FfiConverterRustBuffer<SearchResult>
  * Statistics from a search-with-stats call.
  */
 data class SearchStatsResult (
-    var `results`: List<SearchResult>, 
+    var `results`: List<SearchResult>,
     /**
      * Stats as a JSON string.
      */
     var `statsJson`: kotlin.String
 ) {
-    
+
     companion object
 }
 
@@ -2799,21 +2978,21 @@ public object FfiConverterTypeSearchStatsResult: FfiConverterRustBuffer<SearchSt
 
 
 sealed class VectLiteException(message: String): kotlin.Exception(message) {
-        
+
         class Io(message: String) : VectLiteException(message)
-        
+
         class InvalidFormat(message: String) : VectLiteException(message)
-        
+
         class DimensionMismatch(message: String) : VectLiteException(message)
-        
+
         class DuplicateId(message: String) : VectLiteException(message)
-        
+
         class ReadOnly(message: String) : VectLiteException(message)
-        
+
         class LockContention(message: String) : VectLiteException(message)
-        
+
         class JsonException(message: String) : VectLiteException(message)
-        
+
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<VectLiteException> {
         override fun lift(error_buf: RustBuffer.ByValue): VectLiteException = FfiConverterTypeVectLiteError.lift(error_buf)
@@ -2825,7 +3004,7 @@ sealed class VectLiteException(message: String): kotlin.Exception(message) {
  */
 public object FfiConverterTypeVectLiteError : FfiConverterRustBuffer<VectLiteException> {
     override fun read(buf: ByteBuffer): VectLiteException {
-        
+
             return when(buf.getInt()) {
             1 -> VectLiteException.Io(FfiConverterString.read(buf))
             2 -> VectLiteException.InvalidFormat(FfiConverterString.read(buf))
@@ -2836,7 +3015,7 @@ public object FfiConverterTypeVectLiteError : FfiConverterRustBuffer<VectLiteExc
             7 -> VectLiteException.JsonException(FfiConverterString.read(buf))
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
-        
+
     }
 
     override fun allocationSize(value: VectLiteException): ULong {
@@ -2876,6 +3055,38 @@ public object FfiConverterTypeVectLiteError : FfiConverterRustBuffer<VectLiteExc
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalUInt: FfiConverterRustBuffer<kotlin.UInt?> {
+    override fun read(buf: ByteBuffer): kotlin.UInt? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterUInt.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.UInt?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterUInt.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.UInt?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterUInt.write(value, buf)
+        }
+    }
 }
 
 
@@ -3128,7 +3339,7 @@ public object FfiConverterSequenceTypeSearchResult: FfiConverterRustBuffer<List<
 }
     )
     }
-    
+
 
         /**
          * Generate BM25 sparse terms from text. Returns JSON: {"term": weight, ...}
@@ -3140,6 +3351,6 @@ public object FfiConverterSequenceTypeSearchResult: FfiConverterRustBuffer<List<
 }
     )
     }
-    
+
 
 

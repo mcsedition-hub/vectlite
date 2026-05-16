@@ -4,7 +4,41 @@ All notable changes to `vectlite` will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows Semantic Versioning while the public API stabilizes.
 
-## [Unreleased]
+## [0.10.0] - 2026-05-16
+
+### Performance
+
+- `bulk_ingest` is now ~10–20× faster on default settings. Two optimisations:
+  - HNSW graph construction now uses `parallel_insert` (Rayon-backed) when
+    the dataset is large enough (>= `parallel_insert_threshold`, default 256
+    vectors). The dominant cost — distance calculations during graph
+    neighbour selection — is now multi-threaded.
+  - WAL writes during `bulk_ingest` are coalesced into a single `fsync` at
+    the very end instead of `fsync`-per-batch. This removes the
+    fsync-per-batch tax that dominates ingestion latency on macOS and
+    modern SSDs.
+- Synthetic 5k × 384 cosine benchmark on M-class macOS: ingest throughput
+  improved from ~47 vec/s (article-run baseline) to ~917 vec/s out of the
+  box, and up to ~1782 vec/s with the `fast` preset (lower recall).
+
+### Added
+
+- New `IndexConfig` struct (core Rust) exposing the HNSW tuning knobs
+  `m`, `ef_construction`, `ef_search`, and `parallel_insert_threshold`.
+  Includes `IndexConfig::high_recall()` and `IndexConfig::fast()` presets.
+- `Database::bulk_ingest_with_config(records, batch_size, Option<IndexConfig>)`
+  for one-shot tuned ingestion.
+- `Database::set_index_config(IndexConfig)` and `Database::set_ef_search(Option<usize>)`
+  to retune an existing database. Changing `m` / `ef_construction` triggers a
+  full ANN rebuild; changing only `ef_search` is free (query-time only).
+- Python: `db.bulk_ingest(records, batch_size=..., m=..., ef_construction=..., ef_search=..., parallel_insert_threshold=...)`.
+- Python: `db.set_index_config(...)`, `db.set_ef_search(...)`, `db.index_config()`.
+- Node: `db.bulkIngest(records, { m, efConstruction, efSearch, parallelInsertThreshold })`
+  and matching `bulkIngestAsync` options.
+- Node: `db.indexConfig()`, `db.setEfSearch(...)`, `db.setIndexConfig({ ... })`.
+- UniFFI (Swift / Kotlin): new `IndexConfigResult` dictionary plus
+  `bulkIngestTuned`, `indexConfig`, `setEfSearch`, `setIndexConfig` on the
+  `Database` interface.
 
 ## [0.9.3] - 2026-05-13
 

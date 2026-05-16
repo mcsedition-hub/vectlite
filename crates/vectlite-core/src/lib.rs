@@ -35,6 +35,10 @@ const ANN_OVERSAMPLE: usize = 8;
 const ANN_MIN_CANDIDATES: usize = 64;
 const ANN_M: usize = 16;
 const ANN_EF_CONSTRUCTION: usize = 200;
+/// Threshold above which HNSW construction uses parallel batch insert
+/// (Rayon-based). Below this, sequential insert is cheaper because of
+/// thread setup overhead.
+const ANN_PARALLEL_INSERT_THRESHOLD: usize = 256;
 const BM25_K1: f32 = 1.2;
 const BM25_B: f32 = 0.75;
 
@@ -754,6 +758,87 @@ pub struct SearchOptions {
     pub truncate_dim: Option<usize>,
 }
 
+/// HNSW tuning parameters. Exposed so callers can trade off recall, latency,
+/// memory and build time.
+///
+/// Defaults mirror VectLite's historical built-in values (`m = 16`,
+/// `ef_construction = 200`). `ef_search = None` means VectLite picks an
+/// `ef_search` derived from `top_k * ANN_OVERSAMPLE`.
+///
+/// Reference: Malkov & Yashunin, *Efficient and robust approximate nearest
+/// neighbor search using Hierarchical Navigable Small World graphs*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexConfig {
+    /// Max number of bidirectional links per node. Higher = better recall,
+    /// more memory, slower build. Typical range: 8..64.
+    pub m: usize,
+    /// Width of the search during graph construction. Higher = better recall,
+    /// slower build. Typical range: 64..800.
+    pub ef_construction: usize,
+    /// Width of the search at query time. None = auto (derived from top_k).
+    /// Higher = better recall, slower search.
+    pub ef_search: Option<usize>,
+    /// Use parallel (Rayon-backed) HNSW insertion when the dataset has at
+    /// least this many vectors. Defaults to `ANN_PARALLEL_INSERT_THRESHOLD`.
+    /// Set very high to disable parallel insert.
+    pub parallel_insert_threshold: usize,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            m: ANN_M,
+            ef_construction: ANN_EF_CONSTRUCTION,
+            ef_search: None,
+            parallel_insert_threshold: ANN_PARALLEL_INSERT_THRESHOLD,
+        }
+    }
+}
+
+impl IndexConfig {
+    /// A preset tuned for higher recall at the cost of build/search time.
+    /// Useful for benchmark comparisons where recall@10 must approach 1.0.
+    pub fn high_recall() -> Self {
+        Self {
+            m: 32,
+            ef_construction: 400,
+            ef_search: Some(200),
+            parallel_insert_threshold: ANN_PARALLEL_INSERT_THRESHOLD,
+        }
+    }
+
+    /// A preset tuned for fast build & low latency, lower recall.
+    pub fn fast() -> Self {
+        Self {
+            m: 8,
+            ef_construction: 100,
+            ef_search: Some(40),
+            parallel_insert_threshold: ANN_PARALLEL_INSERT_THRESHOLD,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.m == 0 {
+            return Err(VectLiteError::InvalidFormat(
+                "IndexConfig.m must be >= 1".to_owned(),
+            ));
+        }
+        if self.ef_construction == 0 {
+            return Err(VectLiteError::InvalidFormat(
+                "IndexConfig.ef_construction must be >= 1".to_owned(),
+            ));
+        }
+        if let Some(ef) = self.ef_search {
+            if ef == 0 {
+                return Err(VectLiteError::InvalidFormat(
+                    "IndexConfig.ef_search must be >= 1 when set".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for SearchOptions {
     fn default() -> Self {
         Self {
@@ -1230,6 +1315,10 @@ pub struct Database {
     payload_index_defs: BTreeMap<String, PayloadIndexType>,
     /// Live payload indexes, populated from records.
     payload_indexes: BTreeMap<String, PayloadIndexData>,
+    /// HNSW tuning parameters. Not persisted to disk: this is a per-session
+    /// knob so callers can change recall/latency tradeoffs without migrating
+    /// data files. A subsequent `set_index_config` triggers a rebuild.
+    index_config: IndexConfig,
 }
 
 #[derive(Default)]
@@ -1327,6 +1416,7 @@ impl Database {
             multi_vector_quantized_keys: BTreeMap::new(),
             payload_index_defs: BTreeMap::new(),
             payload_indexes: BTreeMap::new(),
+            index_config: IndexConfig::default(),
         };
 
         database.flush()?;
@@ -2487,11 +2577,41 @@ impl Database {
     /// `batch_size`, but the ANN index and sparse index are only rebuilt once
     /// at the very end, making this much faster than `upsert_many` for large
     /// imports.
+    ///
+    /// Performance notes:
+    /// - The WAL is written without a per-batch `fsync` (each batch goes
+    ///   through `BufWriter` and is appended to the open file). A single
+    ///   `sync_all` is issued at the end. This avoids the per-batch fsync
+    ///   tax that dominates ingestion latency on macOS and modern SSDs.
+    /// - The final ANN rebuild uses parallel HNSW insertion (Rayon) when
+    ///   the dataset is large enough (see
+    ///   `IndexConfig.parallel_insert_threshold`).
     pub fn bulk_ingest<I>(&mut self, records: I, batch_size: usize) -> Result<usize>
     where
         I: IntoIterator<Item = Record>,
     {
+        self.bulk_ingest_with_config(records, batch_size, None)
+    }
+
+    /// Bulk-ingest with an override for the HNSW index configuration. The
+    /// override is applied for the rebuild step at the end, so the resulting
+    /// graph uses the requested `m` / `ef_construction`. The new config is
+    /// also stored on the database (so subsequent searches use the
+    /// corresponding `ef_search`).
+    pub fn bulk_ingest_with_config<I>(
+        &mut self,
+        records: I,
+        batch_size: usize,
+        config: Option<IndexConfig>,
+    ) -> Result<usize>
+    where
+        I: IntoIterator<Item = Record>,
+    {
         self.check_writable()?;
+        if let Some(cfg) = config {
+            cfg.validate()?;
+            self.index_config = cfg;
+        }
         let batch_size = batch_size.max(1);
         let mut total = 0_usize;
         let mut batch = Vec::with_capacity(batch_size);
@@ -2502,7 +2622,8 @@ impl Database {
 
             if batch.len() >= batch_size {
                 total += batch.len();
-                self.append_wal_batch(&batch)?;
+                // Coalesced WAL writes: append without per-batch fsync.
+                self.append_wal_batch_unsynced(&batch)?;
                 self.apply_ops_in_memory(batch);
                 batch = Vec::with_capacity(batch_size);
             }
@@ -2510,11 +2631,16 @@ impl Database {
 
         if !batch.is_empty() {
             total += batch.len();
-            self.append_wal_batch(&batch)?;
+            self.append_wal_batch_unsynced(&batch)?;
             self.apply_ops_in_memory(batch);
         }
 
         if total > 0 {
+            // Single fsync at the very end to make all batches durable in
+            // one shot. This is the major ingestion optimisation: instead
+            // of paying fsync per batch (every `batch_size` records) we pay
+            // it once for the whole bulk_ingest call.
+            self.sync_wal()?;
             self.rebuild_sparse_index();
             self.rebuild_ann();
             self.ann_loaded_from_disk = false;
@@ -2524,6 +2650,42 @@ impl Database {
         }
 
         Ok(total)
+    }
+
+    /// Replace the HNSW tuning parameters and rebuild the ANN index.
+    /// Use this to trade off recall vs latency without re-ingesting data.
+    pub fn set_index_config(&mut self, config: IndexConfig) -> Result<()> {
+        self.check_writable()?;
+        config.validate()?;
+        let changed_build_params = self.index_config.m != config.m
+            || self.index_config.ef_construction != config.ef_construction;
+        self.index_config = config;
+        if changed_build_params {
+            // m / ef_construction affect graph structure → full rebuild.
+            self.rebuild_ann();
+            self.ann_loaded_from_disk = false;
+            self.persist_ann_to_disk()?;
+        }
+        Ok(())
+    }
+
+    /// Return the current HNSW tuning parameters.
+    pub fn index_config(&self) -> IndexConfig {
+        self.index_config
+    }
+
+    /// Convenience: update only the query-time `ef_search` without rebuilding
+    /// the index. Higher = better recall, slower search.
+    pub fn set_ef_search(&mut self, ef_search: Option<usize>) -> Result<()> {
+        if let Some(ef) = ef_search {
+            if ef == 0 {
+                return Err(VectLiteError::InvalidFormat(
+                    "ef_search must be >= 1".to_owned(),
+                ));
+            }
+        }
+        self.index_config.ef_search = ef_search;
+        Ok(())
     }
 
     pub fn compact(&mut self) -> Result<()> {
@@ -3498,6 +3660,17 @@ impl Database {
     }
 
     fn append_wal_batch(&self, ops: &[WalOp]) -> Result<()> {
+        self.append_wal_batch_inner(ops, true)
+    }
+
+    /// Append a WAL batch without issuing an fsync. The caller is responsible
+    /// for issuing `sync_wal` later (typically once at the end of a bulk
+    /// ingest). This is the hot path for `bulk_ingest`.
+    fn append_wal_batch_unsynced(&self, ops: &[WalOp]) -> Result<()> {
+        self.append_wal_batch_inner(ops, false)
+    }
+
+    fn append_wal_batch_inner(&self, ops: &[WalOp], sync: bool) -> Result<()> {
         if let Some(parent) = self.wal_path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
@@ -3522,6 +3695,21 @@ impl Database {
 
         write_u32(&mut file, u32_from_usize(buffer.len())?)?;
         file.write_all(&buffer)?;
+        if sync {
+            file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Force a durability fence on the WAL file. Opens the file in append
+    /// mode and calls `sync_all`, which makes all previous unsynced writes
+    /// durable in one shot. This is used by `bulk_ingest` to amortise fsync
+    /// cost across many batches.
+    fn sync_wal(&self) -> Result<()> {
+        if !self.wal_path.exists() {
+            return Ok(());
+        }
+        let file = OpenOptions::new().append(true).open(&self.wal_path)?;
         file.sync_all()?;
         Ok(())
     }
@@ -3696,6 +3884,7 @@ impl Database {
             multi_vector_quantized_keys: BTreeMap::new(),
             payload_index_defs: BTreeMap::new(),
             payload_indexes: BTreeMap::new(),
+            index_config: IndexConfig::default(),
         })
     }
 
@@ -3854,13 +4043,14 @@ impl Database {
             }
         }
 
+        let cfg = self.index_config;
         self.ann.global = global_by_vector
             .into_iter()
             .filter_map(|(vector_name, records)| {
                 if records.len() < ANN_MIN_POINTS {
                     None
                 } else {
-                    Some((vector_name, build_ann_index(records, self.metric)))
+                    Some((vector_name, build_ann_index(records, self.metric, &cfg)))
                 }
             })
             .collect();
@@ -3874,7 +4064,7 @@ impl Database {
                         if records.len() < ANN_MIN_POINTS {
                             None
                         } else {
-                            Some((vector_name, build_ann_index(records, self.metric)))
+                            Some((vector_name, build_ann_index(records, self.metric, &cfg)))
                         }
                     })
                     .collect::<BTreeMap<_, _>>();
@@ -4205,7 +4395,14 @@ impl Database {
             return None;
         }
 
-        let ef_search = candidate_count.max(ANN_EF_CONSTRUCTION);
+        // ef_search controls recall vs latency at query time. When the user
+        // explicitly sets `IndexConfig.ef_search`, honour it directly.
+        // Otherwise default to max(candidate_count, ef_construction) which is
+        // a conservative high-recall heuristic.
+        let ef_search = match self.index_config.ef_search {
+            Some(ef) => ef.max(candidate_count),
+            None => candidate_count.max(self.index_config.ef_construction),
+        };
         let neighbours = index.hnsw.search(query, candidate_count, ef_search);
         Some(
             neighbours
@@ -4475,23 +4672,41 @@ fn score_dense_prefix(
     metric.score(&left[..dimension], &right[..dimension])
 }
 
-fn build_ann_index(records: Vec<(RecordKey, &Vec<f32>)>, metric: DistanceMetric) -> AnnIndex {
+fn build_ann_index(
+    records: Vec<(RecordKey, &Vec<f32>)>,
+    metric: DistanceMetric,
+    config: &IndexConfig,
+) -> AnnIndex {
     let max_layer = compute_hnsw_layers(records.len());
     let count = records.len();
+    let use_parallel = count >= config.parallel_insert_threshold;
 
     macro_rules! build_hnsw {
         ($dist_type:ty, $dist_val:expr, $variant:ident) => {{
             let mut hnsw = Hnsw::<f32, $dist_type>::new(
-                ANN_M,
-                count,
+                config.m,
+                count.max(1),
                 max_layer,
-                ANN_EF_CONSTRUCTION,
+                config.ef_construction,
                 $dist_val,
             );
             let mut keys = Vec::with_capacity(count);
-            for (origin_id, (key, vector)) in records.into_iter().enumerate() {
-                hnsw.insert((vector.as_slice(), origin_id));
-                keys.push(key);
+            if use_parallel {
+                // hnsw_rs's `parallel_insert` takes `&[(&Vec<T>, usize)]`
+                // (the API is built around owned-Vec borrows) and uses Rayon
+                // internally so the dominant cost (distance calculations
+                // during graph neighbour selection) is multi-threaded.
+                let mut batch: Vec<(&Vec<f32>, usize)> = Vec::with_capacity(count);
+                for (origin_id, (key, vector)) in records.into_iter().enumerate() {
+                    batch.push((vector, origin_id));
+                    keys.push(key);
+                }
+                hnsw.parallel_insert(&batch);
+            } else {
+                for (origin_id, (key, vector)) in records.into_iter().enumerate() {
+                    hnsw.insert((vector.as_slice(), origin_id));
+                    keys.push(key);
+                }
             }
             hnsw.set_searching_mode(true);
             AnnIndex {

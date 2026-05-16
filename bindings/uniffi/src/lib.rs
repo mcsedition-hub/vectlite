@@ -9,9 +9,9 @@ use vectlite::quantization::{
     ScalarQuantizationConfig,
 };
 use vectlite::{
-    Database as CoreDatabase, DistanceMetric, FusionStrategy, HybridSearchOptions, Metadata,
-    MetadataFilter, MetadataValue, PayloadIndexType, Record, SparseVector, Store as CoreStore,
-    WriteOperation,
+    Database as CoreDatabase, DistanceMetric, FusionStrategy, HybridSearchOptions, IndexConfig,
+    Metadata, MetadataFilter, MetadataValue, PayloadIndexType, Record, SparseVector,
+    Store as CoreStore, WriteOperation,
 };
 
 // ---------------------------------------------------------------------------
@@ -90,6 +90,24 @@ pub struct CursorPage {
 pub struct SearchStatsResult {
     pub results: Vec<SearchResult>,
     pub stats_json: String,
+}
+
+pub struct IndexConfigResult {
+    pub m: u32,
+    pub ef_construction: u32,
+    pub ef_search: Option<u32>,
+    pub parallel_insert_threshold: u32,
+}
+
+impl From<IndexConfig> for IndexConfigResult {
+    fn from(cfg: IndexConfig) -> Self {
+        Self {
+            m: cfg.m as u32,
+            ef_construction: cfg.ef_construction as u32,
+            ef_search: cfg.ef_search.map(|v| v as u32),
+            parallel_insert_threshold: cfg.parallel_insert_threshold as u32,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +518,85 @@ impl Database {
             .write()
             .bulk_ingest(records.into_iter(), batch_size as usize)?;
         Ok(count as u32)
+    }
+
+    fn bulk_ingest_tuned(
+        &self,
+        records_json: String,
+        batch_size: u32,
+        m: Option<u32>,
+        ef_construction: Option<u32>,
+        ef_search: Option<u32>,
+        parallel_insert_threshold: Option<u32>,
+    ) -> Result<u32, VectLiteError> {
+        let value: Value =
+            serde_json::from_str(&records_json).map_err(|e| json_err(e.to_string()))?;
+        let arr = value
+            .as_array()
+            .ok_or_else(|| json_err("bulk_ingest_tuned expects a JSON array"))?;
+        let mut records = Vec::with_capacity(arr.len());
+        for item in arr {
+            let obj = item
+                .as_object()
+                .ok_or_else(|| json_err("each record must be a JSON object"))?;
+            records.push(json_to_record(obj)?);
+        }
+        let mut db = self.write();
+        let mut cfg = db.index_config();
+        if let Some(v) = m {
+            cfg.m = v as usize;
+        }
+        if let Some(v) = ef_construction {
+            cfg.ef_construction = v as usize;
+        }
+        // For ef_search, any positive value overrides, 0 reverts to auto.
+        if let Some(v) = ef_search {
+            cfg.ef_search = if v == 0 { None } else { Some(v as usize) };
+        }
+        if let Some(v) = parallel_insert_threshold {
+            cfg.parallel_insert_threshold = v as usize;
+        }
+        let count =
+            db.bulk_ingest_with_config(records.into_iter(), batch_size as usize, Some(cfg))?;
+        Ok(count as u32)
+    }
+
+    // -- HNSW tuning --
+
+    fn index_config(&self) -> IndexConfigResult {
+        self.read().index_config().into()
+    }
+
+    fn set_ef_search(&self, ef_search: Option<u32>) -> Result<(), VectLiteError> {
+        // 0 = revert to auto, anything else is the requested value.
+        let ef = ef_search.and_then(|v| if v == 0 { None } else { Some(v as usize) });
+        self.write().set_ef_search(ef)?;
+        Ok(())
+    }
+
+    fn set_index_config(
+        &self,
+        m: Option<u32>,
+        ef_construction: Option<u32>,
+        ef_search: Option<u32>,
+        parallel_insert_threshold: Option<u32>,
+    ) -> Result<(), VectLiteError> {
+        let mut db = self.write();
+        let mut cfg = db.index_config();
+        if let Some(v) = m {
+            cfg.m = v as usize;
+        }
+        if let Some(v) = ef_construction {
+            cfg.ef_construction = v as usize;
+        }
+        if let Some(v) = ef_search {
+            cfg.ef_search = if v == 0 { None } else { Some(v as usize) };
+        }
+        if let Some(v) = parallel_insert_threshold {
+            cfg.parallel_insert_threshold = v as usize;
+        }
+        db.set_index_config(cfg)?;
+        Ok(())
     }
 
     // -- Maintenance --

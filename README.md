@@ -278,7 +278,8 @@ results = db.search(
 
 ### Bulk Ingestion
 
-For large imports, use `bulk_ingest()` instead of calling `upsert()` in a loop. It batches WAL writes and rebuilds indexes only once at the end.
+For large imports, use `bulk_ingest()` instead of calling `upsert()` in a loop. It batches WAL writes (a single fsync at the end) and builds the HNSW
+graph in parallel (Rayon-backed) once at the end.
 
 ```python
 records = [
@@ -294,6 +295,36 @@ db.bulk_ingest(records, batch_size=5000)
 ```
 
 `upsert_many(records)` and `insert_many(records)` accept the same format and also rebuild indexes once.
+
+#### Tuning the HNSW index
+
+`bulk_ingest` accepts optional HNSW knobs so you can trade off recall, latency
+and build time per workload:
+
+```python
+db.bulk_ingest(
+    records,
+    batch_size=5000,
+    m=32,                 # max links per node (default 16)
+    ef_construction=400,  # search width while building (default 200)
+    ef_search=200,        # search width at query time (default: auto)
+)
+```
+
+You can also retune an existing database:
+
+```python
+db.set_index_config(m=32, ef_construction=400)  # rebuilds the ANN index
+db.set_ef_search(200)                            # query-time only, no rebuild
+db.set_ef_search(None)                           # back to auto
+
+print(db.index_config())
+# {'m': 32, 'ef_construction': 400, 'ef_search': 200, 'parallel_insert_threshold': 256}
+```
+
+Rule of thumb: raise `m` and `ef_construction` for higher recall at the cost
+of build time; raise `ef_search` for higher recall at the cost of latency
+without rebuilding the index.
 
 ### Collections
 

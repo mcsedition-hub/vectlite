@@ -415,7 +415,34 @@ class Database {
 
   bulkIngest(records, options = {}) {
     return wrapError(() =>
-      this._native.bulkIngest(encode(records), options.namespace ?? null, options.batchSize ?? 10_000),
+      this._native.bulkIngest(
+        encode(records),
+        options.namespace ?? null,
+        options.batchSize ?? 10_000,
+        options.m ?? null,
+        options.efConstruction ?? null,
+        options.efSearch ?? null,
+        options.parallelInsertThreshold ?? null,
+      ),
+    )
+  }
+
+  indexConfig() {
+    return wrapError(() => decode(this._native.indexConfig()))
+  }
+
+  setEfSearch(efSearch) {
+    return wrapError(() => this._native.setEfSearch(efSearch ?? null))
+  }
+
+  setIndexConfig(config = {}) {
+    return wrapError(() =>
+      this._native.setIndexConfig(
+        config.m ?? null,
+        config.efConstruction ?? null,
+        config.efSearch ?? null,
+        config.parallelInsertThreshold ?? null,
+      ),
     )
   }
 
@@ -585,7 +612,15 @@ class Database {
 
   bulkIngestAsync(records, options = {}) {
     return wrapAsync(
-      this._native.bulkIngestAsync(encode(records), options.namespace ?? null, options.batchSize ?? 10_000),
+      this._native.bulkIngestAsync(
+        encode(records),
+        options.namespace ?? null,
+        options.batchSize ?? 10_000,
+        options.m ?? null,
+        options.efConstruction ?? null,
+        options.efSearch ?? null,
+        options.parallelInsertThreshold ?? null,
+      ),
     )
   }
 }
