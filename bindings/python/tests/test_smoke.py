@@ -513,17 +513,24 @@ def test_index_config_tuning(tmp_path: Path) -> None:
         "ef_construction": 200,
         "ef_search": None,
         "parallel_insert_threshold": 256,
+        "tombstone_rebuild_pct": 30,
     }
 
     db.set_ef_search(40)
     assert db.index_config()["ef_search"] == 40
 
-    db.set_index_config(m=8, ef_construction=100, parallel_insert_threshold=9999)
+    db.set_index_config(
+        m=8,
+        ef_construction=100,
+        parallel_insert_threshold=9999,
+        tombstone_rebuild_pct=40,
+    )
     assert db.index_config() == {
         "m": 8,
         "ef_construction": 100,
         "ef_search": 40,
         "parallel_insert_threshold": 9999,
+        "tombstone_rebuild_pct": 40,
     }
 
     db.set_ef_search(None)
@@ -540,6 +547,7 @@ def test_index_config_tuning(tmp_path: Path) -> None:
         ef_construction=150,
         ef_search=80,
         parallel_insert_threshold=1,
+        tombstone_rebuild_pct=50,
     )
     assert count == 8
     assert db.index_config() == {
@@ -547,10 +555,13 @@ def test_index_config_tuning(tmp_path: Path) -> None:
         "ef_construction": 150,
         "ef_search": 80,
         "parallel_insert_threshold": 1,
+        "tombstone_rebuild_pct": 50,
     }
 
     with pytest.raises(vectlite.VectLiteError, match="IndexConfig.m"):
         db.set_index_config(m=0)
+    with pytest.raises(vectlite.VectLiteError, match="tombstone_rebuild_pct"):
+        db.set_index_config(tombstone_rebuild_pct=101)
 
 
 def test_nested_metadata_filters(tmp_path: Path) -> None:

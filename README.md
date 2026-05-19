@@ -281,6 +281,39 @@ results = db.search(
 For large imports, use `bulk_ingest()` instead of calling `upsert()` in a loop. It batches WAL writes (a single fsync at the end) and builds the HNSW
 graph in parallel (Rayon-backed) once at the end.
 
+> Since 0.11 single `insert()` calls also use an **incremental HNSW path** (no
+> rebuild per record) and **lazy index persistence**, so streaming workloads
+> are 10–50× faster than 0.10. For maximum throughput on very large streaming
+> imports you can also relax the WAL durability mode: `on_flush` mode
+> coalesces all fsyncs into a single one at `flush()` time, trading a bounded
+> amount of recently-acked data on a crash for another 5–10× ingestion
+> speedup.
+
+```python
+# Python — fastest single-insert streaming path
+db.set_wal_sync_mode("on_flush")
+for record in stream:
+    db.insert(record.id, record.vector, record.metadata)
+db.flush()  # one fsync makes the whole batch durable
+db.set_wal_sync_mode("per_op")  # back to per-record durability
+
+# Monitor tombstones (deleted records still in the HNSW graph)
+live, dead = db.tombstone_stats()
+if dead / max(live + dead, 1) > 0.2:
+    db.compact()  # rebuilds the graph, clears tombstones
+```
+
+```javascript
+// Node — same knobs, camelCase
+db.setWalSyncMode('on_flush')
+for (const r of stream) db.insert(r.id, r.vector, r.metadata)
+db.flush()
+db.setWalSyncMode('per_op')
+
+const { live, dead } = db.tombstoneStats()
+if (dead / Math.max(live + dead, 1) > 0.2) db.compact()
+```
+
 ```python
 records = [
     {

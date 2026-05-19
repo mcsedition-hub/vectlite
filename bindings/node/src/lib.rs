@@ -15,7 +15,7 @@ use vectlite::{
     Database as CoreDatabase, DistanceMetric, FusionStrategy, HybridSearchOptions, IndexConfig,
     Metadata, MetadataFilter, MetadataValue, MultiVectorSearchOptions, MultiVectors, NamedVectors,
     PayloadIndexType, Record, SearchOutcome, SearchResult, SparseVector, Store as CoreStore,
-    WriteOperation,
+    WalSyncMode, WriteOperation,
 };
 
 #[napi(js_name = "NativeDatabase")]
@@ -421,10 +421,17 @@ impl NativeDatabase {
         ef_construction: Option<u32>,
         ef_search: Option<u32>,
         parallel_insert_threshold: Option<u32>,
+        tombstone_rebuild_pct: Option<u32>,
     ) -> Result<u32> {
         let records = parse_record_batch_json(&records_json, namespace.as_deref())?;
         let mut database = self.write_open()?;
-        let tuning = merge_index_config(m, ef_construction, ef_search, parallel_insert_threshold);
+        let tuning = merge_index_config(
+            m,
+            ef_construction,
+            ef_search,
+            parallel_insert_threshold,
+            tombstone_rebuild_pct,
+        );
         let count = if let Some(cfg) = tuning {
             let merged = apply_index_overrides(database.index_config(), cfg);
             database.bulk_ingest_with_config(records, batch_size as usize, Some(merged))
@@ -442,6 +449,7 @@ impl NativeDatabase {
             "ef_construction": cfg.ef_construction as u32,
             "ef_search": cfg.ef_search.map(|v| v as u32),
             "parallel_insert_threshold": cfg.parallel_insert_threshold as u32,
+            "tombstone_rebuild_pct": cfg.tombstone_rebuild_pct as u32,
         });
         stringify_value(value)
     }
@@ -459,13 +467,90 @@ impl NativeDatabase {
         ef_construction: Option<u32>,
         ef_search: Option<u32>,
         parallel_insert_threshold: Option<u32>,
+        tombstone_rebuild_pct: Option<u32>,
     ) -> Result<()> {
         let mut database = self.write_open()?;
-        let overrides =
-            merge_index_config(m, ef_construction, ef_search, parallel_insert_threshold)
-                .ok_or_else(|| err("setIndexConfig requires at least one field"))?;
+        let overrides = merge_index_config(
+            m,
+            ef_construction,
+            ef_search,
+            parallel_insert_threshold,
+            tombstone_rebuild_pct,
+        )
+        .ok_or_else(|| err("setIndexConfig requires at least one field"))?;
         let merged = apply_index_overrides(database.index_config(), overrides);
         database.set_index_config(merged).map_err(to_napi_error)
+    }
+
+    /// Configure WAL durability. `mode` is one of: `"per_op"` (the default,
+    /// fsync after every insert), `"every_n"` (fsync once every `n` inserts
+    /// — provide `n`), `"on_flush"` (only fsync at flush / compact / close).
+    ///
+    /// Relaxing this knob is the single biggest ingestion throughput lever
+    /// on macOS APFS: `on_flush` typically multiplies throughput by 5–10×
+    /// at the cost of losing un-flushed writes on a crash.
+    #[napi(js_name = "setWalSyncMode")]
+    pub fn set_wal_sync_mode(&self, mode: String, n: Option<u32>) -> Result<()> {
+        let parsed = match mode.to_ascii_lowercase().as_str() {
+            "per_op" | "perop" => WalSyncMode::PerOp,
+            "every_n" | "everyn" => {
+                let n = n.ok_or_else(|| {
+                    err("setWalSyncMode(\"every_n\", ...) requires the second `n` argument")
+                })?;
+                WalSyncMode::EveryN(n as usize)
+            }
+            "on_flush" | "onflush" => WalSyncMode::OnFlush,
+            other => {
+                return Err(err(format!(
+                    "unknown WAL sync mode '{other}' (expected 'per_op', 'every_n', or 'on_flush')"
+                )));
+            }
+        };
+        let mut database = self.write_open()?;
+        database.set_wal_sync_mode(parsed).map_err(to_napi_error)
+    }
+
+    /// Return the current WAL sync mode as a JSON string: either
+    /// `{"mode":"per_op"}`, `{"mode":"every_n","n":64}`, or
+    /// `{"mode":"on_flush"}`.
+    #[napi(js_name = "walSyncMode")]
+    pub fn wal_sync_mode(&self) -> Result<String> {
+        let database = self.read()?;
+        let value = match database.wal_sync_mode() {
+            WalSyncMode::PerOp => json!({"mode": "per_op"}),
+            WalSyncMode::EveryN(n) => json!({"mode": "every_n", "n": n as u32}),
+            WalSyncMode::OnFlush => json!({"mode": "on_flush"}),
+        };
+        stringify_value(value)
+    }
+
+    /// Return `[live, dead]` summed across every HNSW graph (global +
+    /// namespaced). Useful for monitoring when to `compact()`.
+    #[napi(js_name = "tombstoneStats")]
+    pub fn tombstone_stats(&self) -> Result<Vec<u32>> {
+        let database = self.read()?;
+        let (live, dead) = database.tombstone_stats();
+        Ok(vec![live as u32, dead as u32])
+    }
+
+    /// Materialise the contiguous-vector arena. Mirrors every record's
+    /// default dense vector into a single flat `Float32Array`-shaped
+    /// buffer for cache- and SIMD-friendly brute-force / rescoring scans.
+    /// Normally built lazily; call this before a heavy scan to pay the
+    /// build cost up front. Cheap when already fresh.
+    #[napi(js_name = "prepareForScan")]
+    pub fn prepare_for_scan(&self) -> Result<()> {
+        let mut database = self.write_open()?;
+        database.prepare_for_scan();
+        Ok(())
+    }
+
+    /// Number of vectors in the contiguous arena, or `null` if it has
+    /// not been materialised yet in this session.
+    #[napi(js_name = "vectorArenaLen")]
+    pub fn vector_arena_len(&self) -> Result<Option<u32>> {
+        let database = self.read()?;
+        Ok(database.vector_arena_len().map(|n| n as u32))
     }
 
     #[napi]
@@ -1009,9 +1094,16 @@ impl NativeDatabase {
         ef_construction: Option<u32>,
         ef_search: Option<u32>,
         parallel_insert_threshold: Option<u32>,
+        tombstone_rebuild_pct: Option<u32>,
     ) -> Result<AsyncTask<BulkIngestTask>> {
         let records = parse_record_batch_json(&records_json, namespace.as_deref())?;
-        let tuning = merge_index_config(m, ef_construction, ef_search, parallel_insert_threshold);
+        let tuning = merge_index_config(
+            m,
+            ef_construction,
+            ef_search,
+            parallel_insert_threshold,
+            tombstone_rebuild_pct,
+        );
         Ok(AsyncTask::new(BulkIngestTask {
             db: self.inner.clone(),
             records,
@@ -2020,9 +2112,10 @@ struct IndexConfigPatch {
     ef_construction: Option<usize>,
     ef_search: Option<usize>,
     parallel_insert_threshold: Option<usize>,
+    tombstone_rebuild_pct: Option<u8>,
 }
 
-/// Pack the four optional HNSW tuning fields into a patch. Returns `None`
+/// Pack the five optional HNSW tuning fields into a patch. Returns `None`
 /// when every field is `None`; explicit zeroes are preserved so core
 /// validation can reject invalid build/search widths instead of treating
 /// them as "not provided".
@@ -2031,11 +2124,13 @@ fn merge_index_config(
     ef_construction: Option<u32>,
     ef_search: Option<u32>,
     parallel_insert_threshold: Option<u32>,
+    tombstone_rebuild_pct: Option<u32>,
 ) -> Option<IndexConfigPatch> {
     if m.is_none()
         && ef_construction.is_none()
         && ef_search.is_none()
         && parallel_insert_threshold.is_none()
+        && tombstone_rebuild_pct.is_none()
     {
         return None;
     }
@@ -2044,6 +2139,7 @@ fn merge_index_config(
         ef_construction: ef_construction.map(|v| v as usize),
         ef_search: ef_search.map(|v| v as usize),
         parallel_insert_threshold: parallel_insert_threshold.map(|v| v as usize),
+        tombstone_rebuild_pct: tombstone_rebuild_pct.map(|v| if v > 100 { 101 } else { v as u8 }),
     })
 }
 
@@ -2058,6 +2154,9 @@ fn apply_index_overrides(current: IndexConfig, patch: IndexConfigPatch) -> Index
         parallel_insert_threshold: patch
             .parallel_insert_threshold
             .unwrap_or(current.parallel_insert_threshold),
+        tombstone_rebuild_pct: patch
+            .tombstone_rebuild_pct
+            .unwrap_or(current.tombstone_rebuild_pct),
     }
 }
 

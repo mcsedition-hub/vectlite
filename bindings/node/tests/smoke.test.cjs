@@ -117,17 +117,24 @@ test('index tuning is exposed on public wrapper', () => {
     ef_construction: 200,
     ef_search: null,
     parallel_insert_threshold: 256,
+    tombstone_rebuild_pct: 30,
   })
 
   db.setEfSearch(40)
   assert.equal(db.indexConfig().ef_search, 40)
 
-  db.setIndexConfig({ m: 8, efConstruction: 100, parallelInsertThreshold: 9999 })
+  db.setIndexConfig({
+    m: 8,
+    efConstruction: 100,
+    parallelInsertThreshold: 9999,
+    tombstoneRebuildPct: 40,
+  })
   assert.deepEqual(db.indexConfig(), {
     m: 8,
     ef_construction: 100,
     ef_search: 40,
     parallel_insert_threshold: 9999,
+    tombstone_rebuild_pct: 40,
   })
 
   db.setEfSearch(null)
@@ -144,6 +151,7 @@ test('index tuning is exposed on public wrapper', () => {
     efConstruction: 150,
     efSearch: 80,
     parallelInsertThreshold: 1,
+    tombstoneRebuildPct: 50,
   })
   assert.equal(count, 8)
   assert.deepEqual(db.indexConfig(), {
@@ -151,9 +159,11 @@ test('index tuning is exposed on public wrapper', () => {
     ef_construction: 150,
     ef_search: 80,
     parallel_insert_threshold: 1,
+    tombstone_rebuild_pct: 50,
   })
 
   assert.throws(() => db.setIndexConfig({ m: 0 }), /IndexConfig\.m/)
+  assert.throws(() => db.setIndexConfig({ tombstoneRebuildPct: 101 }), /tombstone_rebuild_pct/)
   assert.throws(() => db.setIndexConfig(), /requires at least one field/)
 })
 

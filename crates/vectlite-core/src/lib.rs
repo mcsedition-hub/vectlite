@@ -782,6 +782,14 @@ pub struct IndexConfig {
     /// least this many vectors. Defaults to `ANN_PARALLEL_INSERT_THRESHOLD`.
     /// Set very high to disable parallel insert.
     pub parallel_insert_threshold: usize,
+    /// Percentage (0..=100) of tombstoned nodes at which the HNSW graph is
+    /// rebuilt during `compact()`. A `delete` doesn't physically remove a
+    /// node from HNSW (that operation is not supported by the library); the
+    /// node is just marked dead and filtered out at search time. Once enough
+    /// nodes are dead, search recall and latency degrade, so we rebuild.
+    /// Default `30` (rebuild when ≥30% of the graph is dead). Set to `100`
+    /// to disable automatic rebuild.
+    pub tombstone_rebuild_pct: u8,
 }
 
 impl Default for IndexConfig {
@@ -791,6 +799,7 @@ impl Default for IndexConfig {
             ef_construction: ANN_EF_CONSTRUCTION,
             ef_search: None,
             parallel_insert_threshold: ANN_PARALLEL_INSERT_THRESHOLD,
+            tombstone_rebuild_pct: 30,
         }
     }
 }
@@ -804,6 +813,7 @@ impl IndexConfig {
             ef_construction: 400,
             ef_search: Some(200),
             parallel_insert_threshold: ANN_PARALLEL_INSERT_THRESHOLD,
+            tombstone_rebuild_pct: 30,
         }
     }
 
@@ -814,6 +824,7 @@ impl IndexConfig {
             ef_construction: 100,
             ef_search: Some(40),
             parallel_insert_threshold: ANN_PARALLEL_INSERT_THRESHOLD,
+            tombstone_rebuild_pct: 30,
         }
     }
 
@@ -832,6 +843,59 @@ impl IndexConfig {
             if ef == 0 {
                 return Err(VectLiteError::InvalidFormat(
                     "IndexConfig.ef_search must be >= 1 when set".to_owned(),
+                ));
+            }
+        }
+        if self.tombstone_rebuild_pct > 100 {
+            return Err(VectLiteError::InvalidFormat(
+                "IndexConfig.tombstone_rebuild_pct must be in 0..=100".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Controls when the WAL file is `fsync`'d to disk.
+///
+/// Per-record durability is the default (`PerOp`) but on macOS APFS — and to
+/// a lesser extent on Linux ext4 — `fsync` is the dominant cost of single
+/// `insert` calls. Relaxing this knob can multiply ingestion throughput by
+/// 5–10× at the cost of losing some recently-acknowledged records on an
+/// unclean shutdown.
+///
+/// The WAL is *always* fully synced on `flush()`, `compact()`, and `close()`.
+/// So even with `OnFlush`, any data that survives a clean shutdown is
+/// durable. The window of vulnerability is limited to:
+/// - `EveryN(n)`: at most the last `n - 1` inserts since the last fsync.
+/// - `OnFlush`: every insert since the last `flush()` / `compact()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalSyncMode {
+    /// `fsync` after every WAL append. Strongest durability, slowest. This is
+    /// the default and matches pre-0.11 behaviour.
+    PerOp,
+    /// `fsync` once every `n` ops. On a crash, up to the last `n - 1` ops
+    /// since the last sync may be lost. A good middle ground when streaming
+    /// thousands of small records: pick `n` so the worst-case loss is
+    /// tolerable (e.g. `64` ≈ a fraction of a second of data).
+    EveryN(usize),
+    /// Never `fsync` from the per-op path. Sync only at `flush()` / `compact()`
+    /// / `close()`. Maximum throughput, weakest durability — appropriate for
+    /// bulk ingestion of data that can be regenerated.
+    OnFlush,
+}
+
+impl Default for WalSyncMode {
+    fn default() -> Self {
+        WalSyncMode::PerOp
+    }
+}
+
+impl WalSyncMode {
+    fn validate(self) -> Result<()> {
+        if let WalSyncMode::EveryN(n) = self {
+            if n == 0 {
+                return Err(VectLiteError::InvalidFormat(
+                    "WalSyncMode::EveryN must be >= 1".to_owned(),
                 ));
             }
         }
@@ -1299,6 +1363,29 @@ pub struct Database {
     /// Holds the lock file open for the lifetime of the database.
     /// Dropping this releases the advisory lock.
     _lock_file: Option<File>,
+    /// Cached WAL writer: avoids paying the open() syscall on every insert.
+    /// Reset whenever the WAL is rotated (compact, clear_wal).
+    wal_writer: Option<BufWriter<File>>,
+    /// Controls when `fsync` is issued against the WAL — see [`WalSyncMode`].
+    wal_sync_mode: WalSyncMode,
+    /// Number of ops appended to the WAL since the last fsync. Used by the
+    /// `EveryN` sync mode to decide when to flush+sync.
+    wal_ops_since_sync: usize,
+    /// True if the in-memory ANN graph(s) have unsaved changes (incremental
+    /// inserts, fresh build, or a full rebuild) that have not been written
+    /// out via `persist_ann_to_disk`. Set on every mutation in
+    /// `apply_wal_batch` / `bulk_ingest` and cleared by `compact_inner` or
+    /// an explicit `persist_ann_to_disk`.
+    ann_dirty: bool,
+    /// True if the quantized PQ index needs to be rebuilt at the next flush
+    /// (because records have been inserted/deleted since the last rebuild).
+    /// While dirty, the in-memory `quantized` field is set to `None` so
+    /// searches transparently fall back to the HNSW path instead of
+    /// returning candidates from a stale codebook.
+    quantized_dirty: bool,
+    /// Same as `quantized_dirty`, but for multi-vector (ColBERT-style)
+    /// quantization spaces. Lazy rebuild happens at flush time.
+    multi_vector_quantized_dirty: bool,
     /// Optional quantized index for accelerated search.
     quantized: Option<QuantizedIndex>,
     /// Configuration used to build the quantized index (persisted).
@@ -1319,6 +1406,87 @@ pub struct Database {
     /// knob so callers can change recall/latency tradeoffs without migrating
     /// data files. A subsequent `set_index_config` triggers a rebuild.
     index_config: IndexConfig,
+    /// Contiguous f32 mirror of the default dense vector for every record.
+    /// Used by brute-force / rescoring scans for cache-friendly SIMD.
+    /// `None` when the arena hasn't been materialised yet for this session.
+    vector_arena: Option<VectorArena>,
+    /// When true, `vector_arena` is stale (e.g. a delete happened) and must
+    /// be rebuilt before use.
+    vector_arena_dirty: bool,
+}
+
+/// Contiguous-storage mirror of the default dense vector per record.
+///
+/// In the original layout each `Record.vector` is a separately-allocated
+/// `Vec<f32>` and the records themselves live in `BTreeMap` nodes, so a
+/// brute-force or rescoring scan pays two pointer hops per record AND
+/// touches one cache line per vector — terrible for SIMD throughput.
+///
+/// This arena stores every vector in a single flat `buf: Vec<f32>` so a scan
+/// is a straight contiguous walk (one cache miss per ~16 vectors, vs ~2 per
+/// vector). Lance / Arrow use the same trick — see the v0.11 CHANGELOG note.
+///
+/// The arena is maintained incrementally on insert; deletes are too
+/// expensive to compact in place (would shift O(N) f32s) so they just mark
+/// the arena dirty and force a lazy full rebuild on next use.
+struct VectorArena {
+    buf: Vec<f32>,
+    keys: Vec<RecordKey>,
+    key_to_index: HashMap<RecordKey, usize>,
+    dim: usize,
+}
+
+impl VectorArena {
+    fn new(dim: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            keys: Vec::new(),
+            key_to_index: HashMap::new(),
+            dim,
+        }
+    }
+
+    fn append(&mut self, key: RecordKey, vector: &[f32]) {
+        // Defensive: ignore mismatched dims rather than panicking — this is
+        // a perf cache, not the source of truth.
+        if vector.len() != self.dim {
+            return;
+        }
+        let idx = self.keys.len();
+        self.buf.extend_from_slice(vector);
+        self.key_to_index.insert(key.clone(), idx);
+        self.keys.push(key);
+    }
+
+    /// Rebuild from records in BTreeMap order. Called lazily when the arena
+    /// is dirty (i.e. after a delete or a full ANN rebuild).
+    fn rebuild_from(records: &BTreeMap<RecordKey, Record>, dim: usize) -> Self {
+        let mut arena = Self::new(dim);
+        arena.buf.reserve(records.len() * dim);
+        arena.keys.reserve(records.len());
+        arena.key_to_index.reserve(records.len());
+        for (key, record) in records {
+            if record.vector.len() == dim {
+                arena.append(key.clone(), &record.vector);
+            }
+        }
+        arena
+    }
+
+    /// Iterator yielding `(key, vector_slice)` pairs. The slice references
+    /// the contiguous `buf`, so consumers get cache-friendly SIMD scans.
+    #[allow(dead_code)]
+    fn iter(&self) -> impl Iterator<Item = (&RecordKey, &[f32])> {
+        let dim = self.dim;
+        self.keys.iter().enumerate().map(move |(i, k)| {
+            let start = i * dim;
+            (k, &self.buf[start..start + dim])
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
 }
 
 #[derive(Default)]
@@ -1344,6 +1512,42 @@ impl AnnHnsw {
         }
     }
 
+    /// Incrementally insert a single vector into an existing HNSW graph.
+    /// `origin_id` must be unique within the graph and is used to map back
+    /// to the caller's record key array.
+    fn insert_one(&mut self, vector: &[f32], origin_id: usize) {
+        match self {
+            AnnHnsw::Cosine(h) => h.insert((vector, origin_id)),
+            AnnHnsw::Euclidean(h) => h.insert((vector, origin_id)),
+            AnnHnsw::DotProduct(h) => h.insert((vector, origin_id)),
+            AnnHnsw::Manhattan(h) => h.insert((vector, origin_id)),
+        }
+    }
+
+    /// Bulk-insert a batch of vectors in parallel (Rayon-multithreaded).
+    /// Significantly faster than repeated `insert_one` when the batch is
+    /// large enough to amortise thread setup.
+    fn parallel_insert_batch(&mut self, batch: &[(&Vec<f32>, usize)]) {
+        match self {
+            AnnHnsw::Cosine(h) => h.parallel_insert(batch),
+            AnnHnsw::Euclidean(h) => h.parallel_insert(batch),
+            AnnHnsw::DotProduct(h) => h.parallel_insert(batch),
+            AnnHnsw::Manhattan(h) => h.parallel_insert(batch),
+        }
+    }
+
+    /// Toggle the `searching_mode` hint on the underlying HNSW. When `true`
+    /// the graph is treated as read-only and lookups skip some bookkeeping;
+    /// when `false` further inserts are allowed.
+    fn set_searching_mode(&mut self, value: bool) {
+        match self {
+            AnnHnsw::Cosine(h) => h.set_searching_mode(value),
+            AnnHnsw::Euclidean(h) => h.set_searching_mode(value),
+            AnnHnsw::DotProduct(h) => h.set_searching_mode(value),
+            AnnHnsw::Manhattan(h) => h.set_searching_mode(value),
+        }
+    }
+
     fn file_dump(&self, directory: &Path, basename: &str) -> Result<()> {
         let result = match self {
             AnnHnsw::Cosine(h) => h.file_dump(directory, basename),
@@ -1359,7 +1563,38 @@ impl AnnHnsw {
 
 struct AnnIndex {
     hnsw: AnnHnsw,
+    /// `keys[i]` is the record key for HNSW origin_id `i`. Always grows; we
+    /// never shrink it (HNSW doesn't support compacted deletion). Tombstoned
+    /// slots stay in the vec to keep origin_id ↔ key mapping stable.
     keys: Vec<RecordKey>,
+    /// Reverse index: `key → origin_id`. Lets `delete` find a record's HNSW
+    /// node in O(1). Built alongside `keys` on every (re)build.
+    key_to_origin: HashMap<RecordKey, usize>,
+    /// Origin_ids that have been logically deleted but are still part of the
+    /// HNSW graph. Search filters these out by lookup; a `compact()` rebuilds
+    /// the graph once the ratio exceeds `IndexConfig.tombstone_rebuild_pct`.
+    tombstones: HashSet<usize>,
+}
+
+impl AnnIndex {
+    /// Number of live (non-tombstoned) records in the graph.
+    fn live_count(&self) -> usize {
+        self.keys.len().saturating_sub(self.tombstones.len())
+    }
+
+    /// True when the fraction of dead nodes is at or above the configured
+    /// rebuild threshold (`IndexConfig.tombstone_rebuild_pct`). Currently
+    /// `compact_inner` rebuilds on *any* tombstones because the persisted
+    /// manifest format only tracks live record counts — when we add a
+    /// tombstone-aware manifest (planned), this becomes the trigger.
+    #[allow(dead_code)]
+    fn should_rebuild(&self, threshold_pct: u8) -> bool {
+        if self.keys.is_empty() {
+            return false;
+        }
+        let pct = (self.tombstones.len() * 100) / self.keys.len();
+        pct >= threshold_pct as usize
+    }
 }
 
 struct AnnManifestEntry {
@@ -1408,6 +1643,12 @@ impl Database {
             ann_loaded_from_disk: false,
             read_only: false,
             _lock_file: Some(lock),
+            wal_writer: None,
+            wal_sync_mode: WalSyncMode::default(),
+            wal_ops_since_sync: 0,
+            ann_dirty: false,
+            quantized_dirty: false,
+            multi_vector_quantized_dirty: false,
             quantized: None,
             quantization_config: None,
             quantized_keys: Vec::new(),
@@ -1417,6 +1658,8 @@ impl Database {
             payload_index_defs: BTreeMap::new(),
             payload_indexes: BTreeMap::new(),
             index_config: IndexConfig::default(),
+            vector_arena: None,
+            vector_arena_dirty: false,
         };
 
         database.flush()?;
@@ -1522,6 +1765,8 @@ impl Database {
         if !self.read_only {
             self.compact_inner()?;
         }
+        // Drop the cached WAL writer (also closes the underlying file handle).
+        self.wal_writer = None;
         // Release the lock by dropping the file handle
         self._lock_file = None;
         // Clear in-memory state
@@ -1531,6 +1776,8 @@ impl Database {
         self.quantized = None;
         self.quantization_config = None;
         self.quantized_keys.clear();
+        self.vector_arena = None;
+        self.vector_arena_dirty = false;
         self.dimension = 0;
         Ok(())
     }
@@ -2128,8 +2375,12 @@ impl Database {
         self.rebuild_ann();
         self.ann_loaded_from_disk = false;
         self.persist_ann_to_disk()?;
+        self.ann_dirty = false;
+        self.vector_arena_dirty = true;
         self.rebuild_quantized_index();
+        self.quantized_dirty = false;
         self.rebuild_all_multi_vector_quantized_indexes();
+        self.multi_vector_quantized_dirty = false;
         Ok(count)
     }
 
@@ -2156,8 +2407,12 @@ impl Database {
         self.rebuild_ann();
         self.ann_loaded_from_disk = false;
         self.persist_ann_to_disk()?;
+        self.ann_dirty = false;
+        self.vector_arena_dirty = true;
         self.rebuild_quantized_index();
+        self.quantized_dirty = false;
         self.rebuild_all_multi_vector_quantized_indexes();
+        self.multi_vector_quantized_dirty = false;
         Ok(count)
     }
 
@@ -2361,8 +2616,12 @@ impl Database {
         self.rebuild_ann();
         self.ann_loaded_from_disk = false;
         self.persist_ann_to_disk()?;
+        self.ann_dirty = false;
+        self.vector_arena_dirty = true;
         self.rebuild_quantized_index();
+        self.quantized_dirty = false;
         self.rebuild_all_multi_vector_quantized_indexes();
+        self.multi_vector_quantized_dirty = false;
         Ok(())
     }
 
@@ -2573,6 +2832,80 @@ impl Database {
         self.compact_inner()
     }
 
+    /// Configure WAL durability. See [`WalSyncMode`] for the safety / speed
+    /// tradeoffs.
+    ///
+    /// Switching to a more relaxed mode while there are unsync'd bytes in
+    /// the WAL is safe — the bytes simply stay in the BufWriter / OS cache
+    /// until the next sync point (`flush()`, `compact()`, `close()`, or the
+    /// counter reaching `EveryN(n)`). Switching to a *stricter* mode forces
+    /// an immediate sync so there is no surprise loss window.
+    pub fn set_wal_sync_mode(&mut self, mode: WalSyncMode) -> Result<()> {
+        self.check_writable()?;
+        mode.validate()?;
+        let previous = self.wal_sync_mode;
+        self.wal_sync_mode = mode;
+        // If we just tightened durability (e.g. moved from OnFlush back to
+        // PerOp) and there are pending ops, sync immediately so the user's
+        // mental model — "after this call any acknowledged write is durable"
+        // — holds.
+        let became_stricter = matches!(
+            (previous, mode),
+            (
+                WalSyncMode::OnFlush,
+                WalSyncMode::PerOp | WalSyncMode::EveryN(_)
+            ) | (WalSyncMode::EveryN(_), WalSyncMode::PerOp)
+        );
+        if became_stricter && self.wal_ops_since_sync > 0 {
+            self.sync_wal()?;
+            self.wal_ops_since_sync = 0;
+        }
+        Ok(())
+    }
+
+    /// Return the current WAL sync mode.
+    pub fn wal_sync_mode(&self) -> WalSyncMode {
+        self.wal_sync_mode
+    }
+
+    /// Materialise the contiguous-vector arena up front.
+    ///
+    /// The arena mirrors the default dense vector of every record in a
+    /// single flat `Vec<f32>` — much more cache- and SIMD-friendly than the
+    /// default `BTreeMap<Record>` layout. It's normally built lazily on
+    /// first use, but if you know a heavy brute-force or rescoring scan is
+    /// coming you can pay the build cost up front by calling this. Cheap
+    /// when already fresh.
+    pub fn prepare_for_scan(&mut self) {
+        let _ = self.ensure_vector_arena();
+    }
+
+    /// Number of vectors in the contiguous arena, or `None` if the arena
+    /// hasn't been materialised yet for this session. Useful for tests and
+    /// observability.
+    pub fn vector_arena_len(&self) -> Option<usize> {
+        self.vector_arena.as_ref().map(VectorArena::len)
+    }
+
+    /// Return (live_count, tombstoned_count) summed across every HNSW graph
+    /// (global + per-namespace). Useful for monitoring when a `compact()`
+    /// would benefit from rebuilding the graph(s).
+    pub fn tombstone_stats(&self) -> (usize, usize) {
+        let mut live = 0usize;
+        let mut dead = 0usize;
+        for idx in self.ann.global.values() {
+            live += idx.live_count();
+            dead += idx.tombstones.len();
+        }
+        for indexes in self.ann.namespaces.values() {
+            for idx in indexes.values() {
+                live += idx.live_count();
+                dead += idx.tombstones.len();
+            }
+        }
+        (live, dead)
+    }
+
     /// Bulk-ingest many records efficiently. WAL writes happen in batches of
     /// `batch_size`, but the ANN index and sparse index are only rebuilt once
     /// at the very end, making this much faster than `upsert_many` for large
@@ -2644,9 +2977,16 @@ impl Database {
             self.rebuild_sparse_index();
             self.rebuild_ann();
             self.ann_loaded_from_disk = false;
+            // Persist the freshly-built ANN so a subsequent reopen can skip
+            // the rebuild — bulk_ingest is a "batch" operation and callers
+            // expect index state to be on disk afterwards.
             self.persist_ann_to_disk()?;
+            self.ann_dirty = false;
+            self.vector_arena_dirty = true;
             self.rebuild_quantized_index();
+            self.quantized_dirty = false;
             self.rebuild_all_multi_vector_quantized_indexes();
+            self.multi_vector_quantized_dirty = false;
         }
 
         Ok(total)
@@ -2665,6 +3005,7 @@ impl Database {
             self.rebuild_ann();
             self.ann_loaded_from_disk = false;
             self.persist_ann_to_disk()?;
+            self.ann_dirty = false;
         }
         Ok(())
     }
@@ -2710,6 +3051,7 @@ impl Database {
         validate_quantization_config(&config, self.dimension)?;
         self.quantization_config = Some(config);
         self.rebuild_quantized_index();
+        self.quantized_dirty = false;
         self.persist_quantization_params()?;
         Ok(())
     }
@@ -2720,6 +3062,7 @@ impl Database {
         self.quantized = None;
         self.quantization_config = None;
         self.quantized_keys.clear();
+        self.quantized_dirty = false;
         // Remove the sidecar file
         let params_path = quantization_params_path(&self.path);
         if params_path.exists() {
@@ -3401,6 +3744,54 @@ impl Database {
             self.records.remove(key);
         }
 
+        // If any HNSW graph has tombstones, rebuild it before persisting.
+        //
+        // Two reasons:
+        //   1. Crossing `tombstone_rebuild_pct` means search recall has
+        //      degraded enough that the user wants a clean graph.
+        //   2. Even below the threshold, the persisted manifest's
+        //      `record_count` is derived from `self.records` (live only),
+        //      but the in-memory `keys` array includes dead slots — so a
+        //      persisted-with-tombstones graph would always fail the
+        //      record_count check on reopen and rebuild anyway. Rebuilding
+        //      *now* dumps a clean graph that survives reload.
+        let threshold = self.index_config.tombstone_rebuild_pct;
+        let any_tombstones = self
+            .ann
+            .global
+            .values()
+            .any(|idx| !idx.tombstones.is_empty())
+            || self
+                .ann
+                .namespaces
+                .values()
+                .flat_map(|m| m.values())
+                .any(|idx| !idx.tombstones.is_empty());
+        // (We track `threshold` even though we currently rebuild on any
+        // tombstones, so `should_rebuild` could later replace this when we
+        // add tombstone persistence in the manifest.)
+        let _ = threshold;
+        if any_tombstones {
+            self.rebuild_ann();
+        }
+
+        // Rebuild any lazy indexes that were marked dirty during the session
+        // before we persist. This is the point where we pay back the work
+        // we deferred from the per-insert hot path:
+        //   - the HNSW graph is already up-to-date (incremental inserts),
+        //     we just need to dump it.
+        //   - the quantized PQ index was dropped on first insert and is
+        //     rebuilt now so search can use it again next session.
+        //   - same for multi-vector PQ.
+        if self.quantized_dirty {
+            self.rebuild_quantized_index();
+            self.quantized_dirty = false;
+        }
+        if self.multi_vector_quantized_dirty {
+            self.rebuild_all_multi_vector_quantized_indexes();
+            self.multi_vector_quantized_dirty = false;
+        }
+
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
@@ -3423,6 +3814,7 @@ impl Database {
         self.clear_wal()?;
         self.wal_entries_replayed = 0;
         self.persist_ann_to_disk()?;
+        self.ann_dirty = false;
 
         Ok(())
     }
@@ -3563,6 +3955,65 @@ impl Database {
             .iter()
             .all(|op| matches!(op, WalOp::UpdateMetadata { .. } | WalOp::SetTtl { .. }));
 
+        // Categorise each op so we can route to the fastest correct path:
+        //   incremental insert (Upsert with new key) → ann_apply_incremental
+        //   tombstone delete   (Delete of present key) → ann_apply_tombstones
+        //   anything else (upsert of existing key, etc) → full rebuild
+        let mut incremental_eligible = !metadata_only;
+        let mut tombstone_only = !metadata_only;
+        for op in &ops {
+            match op {
+                WalOp::Upsert(record) => {
+                    let exists = self
+                        .records
+                        .contains_key(&(record.namespace.clone(), record.id.clone()));
+                    if exists {
+                        incremental_eligible = false;
+                        tombstone_only = false;
+                    } else {
+                        // New upsert — fine for incremental, but not tombstone-only.
+                        tombstone_only = false;
+                    }
+                }
+                WalOp::Delete { namespace, id } => {
+                    let exists = self.records.contains_key(&(namespace.clone(), id.clone()));
+                    if exists {
+                        // OK for tombstone path, but not for incremental.
+                        incremental_eligible = false;
+                    }
+                    // (A delete of a non-existent key is a no-op for both
+                    // paths, but we still let it through.)
+                }
+                WalOp::UpdateMetadata { .. } | WalOp::SetTtl { .. } => {
+                    incremental_eligible = false;
+                    tombstone_only = false;
+                }
+            }
+        }
+
+        // Collect the keys we'll need to feed to the relevant updater
+        // before we move `ops` into `apply_ops_in_memory`.
+        let new_keys: Vec<RecordKey> = if incremental_eligible {
+            ops.iter()
+                .filter_map(|op| match op {
+                    WalOp::Upsert(record) => Some((record.namespace.clone(), record.id.clone())),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let deleted_keys: Vec<RecordKey> = if tombstone_only {
+            ops.iter()
+                .filter_map(|op| match op {
+                    WalOp::Delete { namespace, id } => Some((namespace.clone(), id.clone())),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         self.append_wal_batch(&ops)?;
         self.apply_ops_in_memory(ops);
 
@@ -3571,11 +4022,55 @@ impl Database {
             if has_sparse {
                 self.rebuild_sparse_index();
             }
-            self.rebuild_ann();
+            if incremental_eligible {
+                // Fast path: just append the new vectors into the existing
+                // HNSW graph(s) instead of rebuilding from scratch. Converts
+                // single-record ingestion from O(N log N) per insert to
+                // amortised O(log N).
+                self.ann_apply_incremental(&new_keys);
+                // Keep the contiguous arena in sync. If it hasn't been
+                // materialised yet, leave it alone — it'll be lazily built
+                // on first read.
+                if self.vector_arena.is_some() && !self.vector_arena_dirty {
+                    self.arena_apply_incremental(&new_keys);
+                }
+            } else if tombstone_only {
+                // Delete-only fast path: tombstone the corresponding
+                // `origin_id`s in each affected HNSW graph. No rebuild;
+                // search filters out tombstoned candidates. The graph is
+                // rebuilt automatically at the next `compact()` once the
+                // tombstone ratio crosses `tombstone_rebuild_pct`.
+                self.ann_apply_tombstones(&deleted_keys);
+                // The arena can't compact in place without shifting O(N)
+                // floats; mark dirty so it's lazily rebuilt on next scan.
+                self.vector_arena_dirty = true;
+            } else {
+                // Slow path: a mixed-mode batch or an update-of-existing.
+                // Rebuild the whole catalog.
+                self.rebuild_ann();
+                self.vector_arena_dirty = true;
+            }
+            // Defer persistence of the HNSW graph to disk: writing the graph
+            // files is expensive (full re-dump + fsync) and is only required
+            // for crash recovery on reopen. The WAL gives us that durability
+            // already — on reopen, if the persisted graph is stale, it's
+            // detected via the manifest signature check and rebuilt from
+            // records in memory. Persistence happens at `flush` / `compact`.
             self.ann_loaded_from_disk = false;
-            self.persist_ann_to_disk()?;
-            self.rebuild_quantized_index();
-            self.rebuild_all_multi_vector_quantized_indexes();
+            self.ann_dirty = true;
+            // Lazy-rebuild quantized indexes too. Drop the in-memory
+            // structures so callers get correct (HNSW-fallback) results
+            // until the next flush, where we rebuild from the new corpus.
+            if self.quantization_config.is_some() {
+                self.quantized = None;
+                self.quantized_keys.clear();
+                self.quantized_dirty = true;
+            }
+            if !self.multi_vector_quantization_config.is_empty() {
+                self.multi_vector_quantized.clear();
+                self.multi_vector_quantized_keys.clear();
+                self.multi_vector_quantized_dirty = true;
+            }
         }
         Ok(())
     }
@@ -3659,58 +4154,109 @@ impl Database {
         }
     }
 
-    fn append_wal_batch(&self, ops: &[WalOp]) -> Result<()> {
-        self.append_wal_batch_inner(ops, true)
+    fn append_wal_batch(&mut self, ops: &[WalOp]) -> Result<()> {
+        // Decide whether this batch should trigger an fsync. We use the
+        // ops count in the batch (not 1) so `EveryN` semantics scale across
+        // both single inserts and `insert_many` calls.
+        let n_ops = ops.len();
+        let should_sync = match self.wal_sync_mode {
+            WalSyncMode::PerOp => true,
+            WalSyncMode::EveryN(n) => {
+                self.wal_ops_since_sync = self.wal_ops_since_sync.saturating_add(n_ops);
+                if self.wal_ops_since_sync >= n {
+                    self.wal_ops_since_sync = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+            WalSyncMode::OnFlush => {
+                self.wal_ops_since_sync = self.wal_ops_since_sync.saturating_add(n_ops);
+                false
+            }
+        };
+        self.append_wal_batch_inner(ops, should_sync)
     }
 
     /// Append a WAL batch without issuing an fsync. The caller is responsible
     /// for issuing `sync_wal` later (typically once at the end of a bulk
     /// ingest). This is the hot path for `bulk_ingest`.
-    fn append_wal_batch_unsynced(&self, ops: &[WalOp]) -> Result<()> {
+    fn append_wal_batch_unsynced(&mut self, ops: &[WalOp]) -> Result<()> {
+        // Track pending ops so future `sync_wal` / `compact_inner` calls
+        // know to flush them.
+        self.wal_ops_since_sync = self.wal_ops_since_sync.saturating_add(ops.len());
         self.append_wal_batch_inner(ops, false)
     }
 
-    fn append_wal_batch_inner(&self, ops: &[WalOp], sync: bool) -> Result<()> {
+    /// Append a WAL batch. Reuses a cached `BufWriter<File>` across calls so
+    /// the WAL file is only opened once per database session — saving the
+    /// `open()` syscall on every single `insert` call, which matters when
+    /// per-record overhead is the bottleneck.
+    fn append_wal_batch_inner(&mut self, ops: &[WalOp], sync: bool) -> Result<()> {
         if let Some(parent) = self.wal_path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
         }
 
-        let new_file = !self.wal_path.exists();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.wal_path)?;
-
-        if new_file {
-            file.write_all(WAL_MAGIC)?;
+        // Lazily create the cached BufWriter, writing the WAL_MAGIC header
+        // on first use of a brand-new file.
+        if self.wal_writer.is_none() {
+            let new_file = !self.wal_path.exists();
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.wal_path)?;
+            let mut writer = BufWriter::with_capacity(64 * 1024, file);
+            if new_file {
+                writer.write_all(WAL_MAGIC)?;
+            }
+            self.wal_writer = Some(writer);
         }
 
+        // Serialise the batch into a temporary buffer first, so that the
+        // single `write_all` we issue to the cached writer is one contiguous
+        // user-space copy (BufWriter then bunches everything up further).
         let mut buffer = Vec::new();
         write_u32(&mut buffer, u32_from_usize(ops.len())?)?;
         for op in ops {
             write_wal_op(&mut buffer, op)?;
         }
 
-        write_u32(&mut file, u32_from_usize(buffer.len())?)?;
-        file.write_all(&buffer)?;
+        let writer = self.wal_writer.as_mut().unwrap();
+        write_u32(writer, u32_from_usize(buffer.len())?)?;
+        writer.write_all(&buffer)?;
+
         if sync {
-            file.sync_all()?;
+            // Flush BufWriter into the OS, then ask the kernel to make the
+            // bytes durable. We must `flush()` before `sync_all()` — sync_all
+            // only operates on what's already in the kernel's page cache.
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
         }
         Ok(())
     }
 
-    /// Force a durability fence on the WAL file. Opens the file in append
-    /// mode and calls `sync_all`, which makes all previous unsynced writes
-    /// durable in one shot. This is used by `bulk_ingest` to amortise fsync
-    /// cost across many batches.
-    fn sync_wal(&self) -> Result<()> {
+    /// Force a durability fence on the WAL file. Flushes any buffered bytes
+    /// from the cached writer and asks the kernel to make them durable in a
+    /// single `sync_all`. Used by `bulk_ingest`, `flush`, `close`, and as a
+    /// manual fence when running in `EveryN` or `OnFlush` mode.
+    fn sync_wal(&mut self) -> Result<()> {
+        if let Some(writer) = self.wal_writer.as_mut() {
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            self.wal_ops_since_sync = 0;
+            return Ok(());
+        }
+        // Fallback: no cached writer (e.g. WAL was opened externally). Open
+        // the file briefly just to issue the sync.
         if !self.wal_path.exists() {
+            self.wal_ops_since_sync = 0;
             return Ok(());
         }
         let file = OpenOptions::new().append(true).open(&self.wal_path)?;
         file.sync_all()?;
+        self.wal_ops_since_sync = 0;
         Ok(())
     }
 
@@ -3764,7 +4310,12 @@ impl Database {
         Ok(())
     }
 
-    fn clear_wal(&self) -> Result<()> {
+    fn clear_wal(&mut self) -> Result<()> {
+        // Drop the cached writer first: on POSIX the file would survive the
+        // unlink because we still hold an open handle, but we'd then keep
+        // appending into the now-detached inode and never see those bytes on
+        // disk after reopen.
+        self.wal_writer = None;
         if self.wal_path.exists() {
             fs::remove_file(&self.wal_path)?;
         }
@@ -3876,6 +4427,12 @@ impl Database {
             ann_loaded_from_disk: false,
             read_only: false,
             _lock_file: None,
+            wal_writer: None,
+            wal_sync_mode: WalSyncMode::default(),
+            wal_ops_since_sync: 0,
+            ann_dirty: false,
+            quantized_dirty: false,
+            multi_vector_quantized_dirty: false,
             quantized: None,
             quantization_config: None,
             quantized_keys: Vec::new(),
@@ -3885,6 +4442,8 @@ impl Database {
             payload_index_defs: BTreeMap::new(),
             payload_indexes: BTreeMap::new(),
             index_config: IndexConfig::default(),
+            vector_arena: None,
+            vector_arena_dirty: false,
         })
     }
 
@@ -4022,6 +4581,237 @@ impl Database {
         Ok(())
     }
 
+    /// Incremental ANN update. Appends the given new records into the
+    /// existing HNSW graph(s) without rebuilding them from scratch.
+    ///
+    /// Preconditions:
+    /// - `new_keys` are keys that already live in `self.records` (caller
+    ///   must have applied the WAL ops to memory first).
+    /// - Each key referenced by `new_keys` did NOT previously exist in
+    ///   `self.records` (i.e. it's a true insert, not an update).
+    ///
+    /// Behaviour per (namespace, vector_name) "slot":
+    /// - If a graph already exists, the new vectors are appended to it
+    ///   via single-element `hnsw.insert` calls (or `parallel_insert` if
+    ///   the batch is large enough to amortise thread overhead).
+    /// - If no graph exists but the total record count for that slot has
+    ///   now crossed `ANN_MIN_POINTS`, a fresh graph is built from all
+    ///   matching records.
+    /// - Below `ANN_MIN_POINTS`, we skip — searches will brute-force
+    ///   without harm.
+    fn ann_apply_incremental(&mut self, new_keys: &[RecordKey]) {
+        if new_keys.is_empty() {
+            return;
+        }
+        let cfg = self.index_config;
+
+        // Group the new records by (Option<namespace>, vector_name). Each
+        // upserted record contributes to exactly one global slot and one
+        // namespace-scoped slot per dense vector it owns.
+        let mut groups: BTreeMap<(Option<String>, String), Vec<(RecordKey, Vec<f32>)>> =
+            BTreeMap::new();
+        for key in new_keys {
+            let Some(record) = self.records.get(key) else {
+                continue;
+            };
+            for (vector_name, vector) in record.dense_vectors() {
+                let item = (key.clone(), vector.clone());
+                groups
+                    .entry((None, vector_name.to_owned()))
+                    .or_default()
+                    .push(item.clone());
+                groups
+                    .entry((Some(record.namespace.clone()), vector_name.to_owned()))
+                    .or_default()
+                    .push(item);
+            }
+        }
+
+        // Two-phase processing to keep the borrow checker happy:
+        //   phase 1: classify each slot (needs fresh build vs incremental
+        //            append), reading `self.records` only.
+        //   phase 2: mutate `self.ann` based on the classifications.
+        let mut fresh_builds: Vec<((Option<String>, String), Vec<(RecordKey, Vec<f32>)>)> =
+            Vec::new();
+        let mut incremental: Vec<((Option<String>, String), Vec<(RecordKey, Vec<f32>)>)> =
+            Vec::new();
+
+        for ((opt_ns, vector_name), new_items) in groups {
+            let has_existing = match &opt_ns {
+                None => self.ann.global.contains_key(&vector_name),
+                Some(ns) => self
+                    .ann
+                    .namespaces
+                    .get(ns)
+                    .map_or(false, |m| m.contains_key(&vector_name)),
+            };
+
+            if has_existing {
+                incremental.push(((opt_ns, vector_name), new_items));
+                continue;
+            }
+
+            // Count matching records (post-insert state) to decide whether
+            // we've crossed the build threshold.
+            let total = self
+                .records
+                .iter()
+                .filter(|(_, r)| match &opt_ns {
+                    Some(ns) => r.namespace == *ns,
+                    None => true,
+                })
+                .filter(|(_, r)| {
+                    r.dense_vectors()
+                        .any(|(name, _)| name == vector_name.as_str())
+                })
+                .count();
+
+            if total < ANN_MIN_POINTS {
+                continue;
+            }
+
+            // Need to build a fresh graph for this slot. Collect ALL matching
+            // records (not just the new ones) — owned clones so the build
+            // step doesn't borrow `self.records`.
+            let mut all_items: Vec<(RecordKey, Vec<f32>)> = Vec::with_capacity(total);
+            for (k, r) in &self.records {
+                if let Some(ns) = &opt_ns {
+                    if r.namespace != *ns {
+                        continue;
+                    }
+                }
+                for (name, vec) in r.dense_vectors() {
+                    if name == vector_name.as_str() {
+                        all_items.push((k.clone(), vec.clone()));
+                        break;
+                    }
+                }
+            }
+            let _ = new_items; // already folded into `all_items`
+            fresh_builds.push(((opt_ns, vector_name), all_items));
+        }
+
+        // Phase 2a: build-from-scratch for slots that just crossed the
+        // threshold.
+        for ((opt_ns, vector_name), all_items) in fresh_builds {
+            let records_for_build: Vec<(RecordKey, &Vec<f32>)> =
+                all_items.iter().map(|(k, v)| (k.clone(), v)).collect();
+            let new_index = build_ann_index(records_for_build, self.metric, &cfg);
+            match opt_ns {
+                None => {
+                    self.ann.global.insert(vector_name, new_index);
+                }
+                Some(ns) => {
+                    self.ann
+                        .namespaces
+                        .entry(ns)
+                        .or_default()
+                        .insert(vector_name, new_index);
+                }
+            }
+        }
+
+        // Phase 2b: incremental appends into existing graphs.
+        for ((opt_ns, vector_name), new_items) in incremental {
+            let idx_opt = match &opt_ns {
+                None => self.ann.global.get_mut(&vector_name),
+                Some(ns) => self
+                    .ann
+                    .namespaces
+                    .get_mut(ns)
+                    .and_then(|m| m.get_mut(&vector_name)),
+            };
+            let Some(idx) = idx_opt else {
+                continue;
+            };
+
+            // hnsw_rs marks indexes that have been searched as "searching
+            // mode" (a hint that skips some bookkeeping in the data layer).
+            // Re-enable mutation mode before we insert — cheap toggle.
+            idx.hnsw.set_searching_mode(false);
+
+            if new_items.len() >= cfg.parallel_insert_threshold {
+                let start_id = idx.keys.len();
+                let batch: Vec<(&Vec<f32>, usize)> = new_items
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, (_, v))| (v, start_id + offset))
+                    .collect();
+                idx.hnsw.parallel_insert_batch(&batch);
+                for (offset, (k, _)) in new_items.into_iter().enumerate() {
+                    let origin_id = start_id + offset;
+                    idx.key_to_origin.insert(k.clone(), origin_id);
+                    idx.keys.push(k);
+                }
+            } else {
+                for (key, vector) in new_items {
+                    let origin_id = idx.keys.len();
+                    idx.key_to_origin.insert(key.clone(), origin_id);
+                    idx.keys.push(key);
+                    idx.hnsw.insert_one(vector.as_slice(), origin_id);
+                }
+            }
+        }
+    }
+
+    /// Append newly-inserted vectors to the contiguous arena. Caller must
+    /// have already inserted the records into `self.records` and confirmed
+    /// the arena exists and isn't dirty.
+    fn arena_apply_incremental(&mut self, new_keys: &[RecordKey]) {
+        let Some(arena) = self.vector_arena.as_mut() else {
+            return;
+        };
+        for key in new_keys {
+            if let Some(record) = self.records.get(key) {
+                arena.append(key.clone(), &record.vector);
+            }
+        }
+    }
+
+    /// Ensure the contiguous arena is materialised and fresh. Cheap when
+    /// already clean; rebuilds from `self.records` (in BTreeMap order) on
+    /// first call or after a delete. Allocates `dim * N` f32s.
+    fn ensure_vector_arena(&mut self) -> &VectorArena {
+        let needs_build = self
+            .vector_arena
+            .as_ref()
+            .map_or(true, |a| self.vector_arena_dirty || a.dim != self.dimension);
+        if needs_build {
+            self.vector_arena = Some(VectorArena::rebuild_from(&self.records, self.dimension));
+            self.vector_arena_dirty = false;
+        }
+        self.vector_arena.as_ref().unwrap()
+    }
+
+    /// Mark the given record keys as deleted in every HNSW graph they live
+    /// in. The graph itself is not modified — search filters tombstoned
+    /// `origin_id`s. A subsequent `compact()` will rebuild any graph whose
+    /// dead ratio exceeds `IndexConfig.tombstone_rebuild_pct`.
+    fn ann_apply_tombstones(&mut self, deleted_keys: &[RecordKey]) {
+        if deleted_keys.is_empty() {
+            return;
+        }
+        for key in deleted_keys {
+            // Global graphs (per vector_name): every graph that contains
+            // this key gets the corresponding origin_id tombstoned.
+            for (_, idx) in self.ann.global.iter_mut() {
+                if let Some(&origin_id) = idx.key_to_origin.get(key) {
+                    idx.tombstones.insert(origin_id);
+                }
+            }
+            // Per-namespace graphs: only the namespace this key belongs to
+            // has a chance of containing it, but checking all of them is
+            // fine — `key_to_origin.get` is O(1) and misses immediately.
+            for (_, indexes) in self.ann.namespaces.iter_mut() {
+                for (_, idx) in indexes.iter_mut() {
+                    if let Some(&origin_id) = idx.key_to_origin.get(key) {
+                        idx.tombstones.insert(origin_id);
+                    }
+                }
+            }
+        }
+    }
+
     fn rebuild_ann(&mut self) {
         self.ann = AnnCatalog::default();
         let mut global_by_vector: BTreeMap<String, Vec<(RecordKey, &Vec<f32>)>> = BTreeMap::new();
@@ -4109,6 +4899,24 @@ impl Database {
                 return false;
             }
 
+            // For ANN2 manifests, use the persisted keys verbatim — they
+            // match the `origin_id`s baked into the HNSW graph file. For
+            // ANN1 (no persisted keys), fall back to the recomputed
+            // BTreeMap-ordered list, which matches the way ANN1 graphs were
+            // always built.
+            let keys = if manifest_entry.keys.is_empty() {
+                expected_entry.keys.clone()
+            } else {
+                // Defensive: persisted keys length must agree with the
+                // declared record_count and the live record set, else the
+                // manifest is inconsistent and we'd rather rebuild than
+                // serve wrong neighbours.
+                if manifest_entry.keys.len() != manifest_entry.record_count {
+                    return false;
+                }
+                manifest_entry.keys.clone()
+            };
+
             let Some(index) = load_ann_index(
                 parent,
                 &ann_basename(
@@ -4116,7 +4924,7 @@ impl Database {
                     expected_entry.namespace.as_deref(),
                     &expected_entry.vector_name,
                 ),
-                expected_entry.keys.clone(),
+                keys,
                 self.metric,
             ) else {
                 return false;
@@ -4147,7 +4955,11 @@ impl Database {
             return Ok(());
         }
 
-        let entries = self.expected_ann_entries();
+        // Use `actual_ann_entries` (NOT `expected_ann_entries`) so the
+        // persisted keys array matches the order the HNSW graph stored its
+        // `origin_id`s in. After incremental inserts the in-memory keys vec
+        // is in insertion order, which usually differs from BTreeMap order.
+        let entries = self.actual_ann_entries();
         for entry in &entries {
             let basename = ann_basename(&self.path, entry.namespace.as_deref(), &entry.vector_name);
             let graph_path = parent.join(format!("{basename}.hnsw.graph"));
@@ -4173,6 +4985,41 @@ impl Database {
         }
 
         write_ann_manifest(&ann_manifest_path(&self.path), &entries)
+    }
+
+    /// Like `expected_ann_entries`, but populates each entry's `keys` field
+    /// from the actual in-memory `AnnIndex.keys` array (insertion order).
+    /// This is what gets serialised into the ANN2 manifest, and matches the
+    /// `origin_id`s baked into the dumped HNSW graph files.
+    fn actual_ann_entries(&self) -> Vec<AnnManifestEntry> {
+        let mut entries = Vec::new();
+        for (vector_name, index) in &self.ann.global {
+            if index.keys.len() < ANN_MIN_POINTS {
+                continue;
+            }
+            entries.push(AnnManifestEntry {
+                namespace: None,
+                vector_name: vector_name.clone(),
+                record_count: index.keys.len(),
+                key_signature: record_key_signature(&index.keys),
+                keys: index.keys.clone(),
+            });
+        }
+        for (namespace, indexes) in &self.ann.namespaces {
+            for (vector_name, index) in indexes {
+                if index.keys.len() < ANN_MIN_POINTS {
+                    continue;
+                }
+                entries.push(AnnManifestEntry {
+                    namespace: Some(namespace.clone()),
+                    vector_name: vector_name.clone(),
+                    record_count: index.keys.len(),
+                    key_signature: record_key_signature(&index.keys),
+                    keys: index.keys.clone(),
+                });
+            }
+        }
+        entries
     }
 
     fn expected_ann_entries(&self) -> Vec<AnnManifestEntry> {
@@ -4386,11 +5233,14 @@ impl Database {
                 .global
                 .get(vector_name.unwrap_or(DEFAULT_VECTOR_NAME)),
         }?;
-        if index.keys.len() < ANN_SEARCH_MIN_POINTS {
+        // Gate on live (non-tombstoned) record count: if half the graph is
+        // dead, treat the live half as if it were the whole corpus.
+        let live = index.live_count();
+        if live < ANN_SEARCH_MIN_POINTS {
             return None;
         }
 
-        let candidate_count = candidate_count(top_k, index.keys.len());
+        let candidate_count = candidate_count(top_k, live);
         if candidate_count == 0 {
             return None;
         }
@@ -4399,15 +5249,29 @@ impl Database {
         // explicitly sets `IndexConfig.ef_search`, honour it directly.
         // Otherwise default to max(candidate_count, ef_construction) which is
         // a conservative high-recall heuristic.
-        let ef_search = match self.index_config.ef_search {
+        let mut ef_search = match self.index_config.ef_search {
             Some(ef) => ef.max(candidate_count),
             None => candidate_count.max(self.index_config.ef_construction),
         };
-        let neighbours = index.hnsw.search(query, candidate_count, ef_search);
+        // Over-fetch to compensate for tombstoned candidates we'll drop. Cap
+        // at the live count so we don't waste work; we'd never get more
+        // distinct results than that anyway.
+        if !index.tombstones.is_empty() {
+            let dead = index.tombstones.len();
+            ef_search = ef_search
+                .saturating_add(dead.min(ef_search))
+                .min(index.keys.len());
+        }
+        let fetch_count = candidate_count
+            .saturating_add(index.tombstones.len().min(candidate_count))
+            .min(index.keys.len());
+        let neighbours = index.hnsw.search(query, fetch_count, ef_search);
         Some(
             neighbours
                 .into_iter()
+                .filter(|n| !index.tombstones.contains(&n.d_id))
                 .filter_map(|neighbour| index.keys.get(neighbour.d_id).cloned())
+                .take(candidate_count)
                 .collect(),
         )
     }
@@ -4691,6 +5555,7 @@ fn build_ann_index(
                 $dist_val,
             );
             let mut keys = Vec::with_capacity(count);
+            let mut key_to_origin = HashMap::with_capacity(count);
             if use_parallel {
                 // hnsw_rs's `parallel_insert` takes `&[(&Vec<T>, usize)]`
                 // (the API is built around owned-Vec borrows) and uses Rayon
@@ -4699,12 +5564,14 @@ fn build_ann_index(
                 let mut batch: Vec<(&Vec<f32>, usize)> = Vec::with_capacity(count);
                 for (origin_id, (key, vector)) in records.into_iter().enumerate() {
                     batch.push((vector, origin_id));
+                    key_to_origin.insert(key.clone(), origin_id);
                     keys.push(key);
                 }
                 hnsw.parallel_insert(&batch);
             } else {
                 for (origin_id, (key, vector)) in records.into_iter().enumerate() {
                     hnsw.insert((vector.as_slice(), origin_id));
+                    key_to_origin.insert(key.clone(), origin_id);
                     keys.push(key);
                 }
             }
@@ -4712,6 +5579,8 @@ fn build_ann_index(
             AnnIndex {
                 hnsw: AnnHnsw::$variant(hnsw),
                 keys,
+                key_to_origin,
+                tombstones: HashSet::new(),
             }
         }};
     }
@@ -4906,9 +5775,21 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Order-independent FNV-1a hash over a set of record keys. We sort first so
+/// the signature only depends on the SET of keys, not the order they were
+/// inserted. Callers can use this to check whether a persisted ANN graph
+/// matches the live record set regardless of whether the live `keys` vec is
+/// BTreeMap-ordered (full rebuild) or insertion-ordered (incremental
+/// updates).
+///
+/// Historical note: previously the input was always BTreeMap-iterated and
+/// therefore already sorted, so the sort step is a no-op for old ANN1
+/// manifests — backwards compatible.
 fn record_key_signature(keys: &[RecordKey]) -> u64 {
+    let mut sorted: Vec<&RecordKey> = keys.iter().collect();
+    sorted.sort();
     let mut state = 0xcbf29ce484222325_u64;
-    for (namespace, id) in keys {
+    for (namespace, id) in sorted {
         for byte in namespace
             .as_bytes()
             .iter()
@@ -4935,9 +5816,16 @@ fn load_ann_index(
         ($dist_val:expr, $variant:ident) => {{
             let mut hnsw = reloader.load_hnsw_with_dist($dist_val).ok()?;
             hnsw.set_searching_mode(true);
+            let key_to_origin = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), i))
+                .collect();
             Some(AnnIndex {
                 hnsw: AnnHnsw::$variant(hnsw),
                 keys,
+                key_to_origin,
+                tombstones: HashSet::new(),
             })
         }};
     }
@@ -4950,9 +5838,16 @@ fn load_ann_index(
     }
 }
 
+/// Write the ANN sidecar manifest. We use format `ANN2`, which (compared to
+/// the original `ANN1`) also serialises the actual key array per index in
+/// the order the HNSW knows its `origin_id`s. This is required for
+/// incremental insertion: without it, a reload would associate the wrong
+/// (BTreeMap-ordered) record key with each HNSW origin_id whenever the in
+/// memory key array isn't sorted (which happens any time we incrementally
+/// append).
 fn write_ann_manifest(path: &Path, entries: &[AnnManifestEntry]) -> Result<()> {
-    let mut file = File::create(path)?;
-    file.write_all(b"ANN1")?;
+    let mut file = BufWriter::new(File::create(path)?);
+    file.write_all(b"ANN2")?;
     write_u32(&mut file, u32_from_usize(entries.len())?)?;
     for entry in entries {
         write_u8(&mut file, u8::from(entry.namespace.is_some()))?;
@@ -4962,8 +5857,15 @@ fn write_ann_manifest(path: &Path, entries: &[AnnManifestEntry]) -> Result<()> {
         write_string(&mut file, &entry.vector_name)?;
         write_u64(&mut file, u64_from_usize(entry.record_count)?)?;
         write_u64(&mut file, entry.key_signature)?;
+        // ANN2 addition: the full keys array in insertion order.
+        write_u64(&mut file, u64_from_usize(entry.keys.len())?)?;
+        for (ns, id) in &entry.keys {
+            write_string(&mut file, ns)?;
+            write_string(&mut file, id)?;
+        }
     }
-    file.sync_all()?;
+    file.flush()?;
+    file.get_ref().sync_all()?;
     Ok(())
 }
 
@@ -4971,11 +5873,15 @@ fn read_ann_manifest(path: &Path) -> Result<Vec<AnnManifestEntry>> {
     let mut file = BufReader::new(File::open(path)?);
     let mut magic = [0_u8; 4];
     file.read_exact(&mut magic)?;
-    if &magic != b"ANN1" {
-        return Err(VectLiteError::InvalidFormat(
-            "invalid ANN manifest".to_owned(),
-        ));
-    }
+    let version = match &magic {
+        b"ANN1" => 1u8,
+        b"ANN2" => 2u8,
+        _ => {
+            return Err(VectLiteError::InvalidFormat(
+                "invalid ANN manifest".to_owned(),
+            ));
+        }
+    };
 
     let count = usize_from_u32(read_u32(&mut file)?)?;
     let mut entries = Vec::with_capacity(count);
@@ -4989,12 +5895,27 @@ fn read_ann_manifest(path: &Path) -> Result<Vec<AnnManifestEntry>> {
         let vector_name = read_string(&mut file)?;
         let record_count = usize_from_u64(read_u64(&mut file)?)?;
         let key_signature = read_u64(&mut file)?;
+        let keys = if version >= 2 {
+            let n = usize_from_u64(read_u64(&mut file)?)?;
+            let mut keys = Vec::with_capacity(n);
+            for _ in 0..n {
+                let ns = read_string(&mut file)?;
+                let id = read_string(&mut file)?;
+                keys.push((ns, id));
+            }
+            keys
+        } else {
+            // ANN1 had no persisted keys; caller falls back to recomputing
+            // them from `self.records` (which yields BTreeMap-sorted keys,
+            // matching the order ANN1 indexes were always built in).
+            Vec::new()
+        };
         entries.push(AnnManifestEntry {
             namespace,
             vector_name,
             record_count,
             key_signature,
-            keys: Vec::new(),
+            keys,
         });
     }
     Ok(entries)

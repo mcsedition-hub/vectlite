@@ -15,7 +15,7 @@ use vectlite::{
     Database as CoreDatabase, DistanceMetric, FusionStrategy, HybridSearchOptions, IndexConfig,
     Metadata, MetadataFilter, MetadataValue, MultiVectorSearchOptions, MultiVectors, NamedVectors,
     PayloadIndexType, Record, SearchOutcome, SearchResult, SparseVector, Store as CoreStore,
-    WriteOperation,
+    WalSyncMode, WriteOperation,
 };
 
 create_exception!(vectlite, VectLiteError, PyException);
@@ -254,6 +254,7 @@ impl PyDatabase {
         ef_construction=None,
         ef_search=None,
         parallel_insert_threshold=None,
+        tombstone_rebuild_pct=None,
     ))]
     fn bulk_ingest(
         &self,
@@ -265,6 +266,7 @@ impl PyDatabase {
         ef_construction: Option<usize>,
         ef_search: Option<usize>,
         parallel_insert_threshold: Option<usize>,
+        tombstone_rebuild_pct: Option<u8>,
     ) -> PyResult<usize> {
         let records = parse_record_batch(py, records, namespace.as_deref())?;
         let mut database = self.write_open()?;
@@ -272,6 +274,7 @@ impl PyDatabase {
             || ef_construction.is_some()
             || ef_search.is_some()
             || parallel_insert_threshold.is_some()
+            || tombstone_rebuild_pct.is_some()
         {
             let mut cfg = database.index_config();
             if let Some(v) = m {
@@ -285,6 +288,9 @@ impl PyDatabase {
             }
             if let Some(v) = parallel_insert_threshold {
                 cfg.parallel_insert_threshold = v;
+            }
+            if let Some(v) = tombstone_rebuild_pct {
+                cfg.tombstone_rebuild_pct = v;
             }
             Some(cfg)
         } else {
@@ -305,13 +311,14 @@ impl PyDatabase {
 
     /// Replace the HNSW index configuration. Changing m or ef_construction
     /// triggers a full ANN index rebuild.
-    #[pyo3(signature = (m=None, ef_construction=None, ef_search=None, parallel_insert_threshold=None))]
+    #[pyo3(signature = (m=None, ef_construction=None, ef_search=None, parallel_insert_threshold=None, tombstone_rebuild_pct=None))]
     fn set_index_config(
         &self,
         m: Option<usize>,
         ef_construction: Option<usize>,
         ef_search: Option<usize>,
         parallel_insert_threshold: Option<usize>,
+        tombstone_rebuild_pct: Option<u8>,
     ) -> PyResult<()> {
         let mut database = self.write_open()?;
         let mut cfg = database.index_config();
@@ -331,6 +338,9 @@ impl PyDatabase {
         if let Some(v) = parallel_insert_threshold {
             cfg.parallel_insert_threshold = v;
         }
+        if let Some(v) = tombstone_rebuild_pct {
+            cfg.tombstone_rebuild_pct = v;
+        }
         database.set_index_config(cfg).map_err(to_py_error)
     }
 
@@ -343,7 +353,84 @@ impl PyDatabase {
         dict.set_item("ef_construction", cfg.ef_construction)?;
         dict.set_item("ef_search", cfg.ef_search)?;
         dict.set_item("parallel_insert_threshold", cfg.parallel_insert_threshold)?;
+        dict.set_item("tombstone_rebuild_pct", cfg.tombstone_rebuild_pct)?;
         Ok(dict.into())
+    }
+
+    /// Configure WAL durability. `mode` is one of: ``"per_op"`` (the default,
+    /// fsync after every insert), ``"every_n"`` (fsync once every ``n``
+    /// inserts — provide ``n``), ``"on_flush"`` (only fsync at
+    /// ``flush()`` / ``compact()`` / ``close()``).
+    ///
+    /// Relaxing this knob is the single biggest ingestion throughput lever
+    /// on macOS APFS: ``on_flush`` typically multiplies throughput by 5–10×
+    /// at the cost of losing un-flushed writes on a crash.
+    #[pyo3(signature = (mode, n=None))]
+    fn set_wal_sync_mode(&self, mode: &str, n: Option<usize>) -> PyResult<()> {
+        let parsed = match mode.to_ascii_lowercase().as_str() {
+            "per_op" | "perop" => WalSyncMode::PerOp,
+            "every_n" | "everyn" => {
+                let n = n.ok_or_else(|| {
+                    PyValueError::new_err(
+                        "set_wal_sync_mode(\"every_n\", ...) requires the `n` argument",
+                    )
+                })?;
+                WalSyncMode::EveryN(n)
+            }
+            "on_flush" | "onflush" => WalSyncMode::OnFlush,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown WAL sync mode '{other}' (expected 'per_op', 'every_n', or 'on_flush')"
+                )));
+            }
+        };
+        let mut database = self.write_open()?;
+        database.set_wal_sync_mode(parsed).map_err(to_py_error)
+    }
+
+    /// Return the current WAL sync mode as a dict like
+    /// ``{"mode": "per_op"}`` or ``{"mode": "every_n", "n": 64}``.
+    fn wal_sync_mode(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let database = self.read()?;
+        let dict = PyDict::new(py);
+        match database.wal_sync_mode() {
+            WalSyncMode::PerOp => {
+                dict.set_item("mode", "per_op")?;
+            }
+            WalSyncMode::EveryN(n) => {
+                dict.set_item("mode", "every_n")?;
+                dict.set_item("n", n)?;
+            }
+            WalSyncMode::OnFlush => {
+                dict.set_item("mode", "on_flush")?;
+            }
+        }
+        Ok(dict.into())
+    }
+
+    /// Return ``(live_count, tombstoned_count)`` summed across every HNSW
+    /// graph (global + namespaced). Useful for monitoring when to compact.
+    fn tombstone_stats(&self) -> PyResult<(usize, usize)> {
+        let database = self.read()?;
+        Ok(database.tombstone_stats())
+    }
+
+    /// Materialise the contiguous-vector arena up front. Mirrors every
+    /// record's default dense vector into a single flat ``Vec<f32>`` for
+    /// cache- and SIMD-friendly brute-force / rescoring scans. Normally
+    /// built lazily on first use; call this before a heavy scan to pay the
+    /// build cost up front. Cheap when already fresh.
+    fn prepare_for_scan(&self) -> PyResult<()> {
+        let mut database = self.write_open()?;
+        database.prepare_for_scan();
+        Ok(())
+    }
+
+    /// Number of vectors in the contiguous arena, or ``None`` if it has
+    /// not been materialised in this session.
+    fn vector_arena_len(&self) -> PyResult<Option<usize>> {
+        let database = self.read()?;
+        Ok(database.vector_arena_len())
     }
 
     #[pyo3(signature = (id, namespace=None))]

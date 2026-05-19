@@ -423,6 +423,7 @@ class Database {
         options.efConstruction ?? null,
         options.efSearch ?? null,
         options.parallelInsertThreshold ?? null,
+        options.tombstoneRebuildPct ?? null,
       ),
     )
   }
@@ -442,8 +443,59 @@ class Database {
         config.efConstruction ?? null,
         config.efSearch ?? null,
         config.parallelInsertThreshold ?? null,
+        config.tombstoneRebuildPct ?? null,
       ),
     )
+  }
+
+  /**
+   * Configure WAL durability. Valid modes are:
+   *   - "per_op"  : fsync after every insert (default, strongest durability)
+   *   - "every_n" : fsync once every `n` inserts — pass `n` as second arg
+   *   - "on_flush": fsync only at flush() / compact() / close()
+   * On macOS APFS, "on_flush" typically multiplies ingestion throughput by
+   * 5–10× at the cost of losing un-flushed writes on a crash.
+   */
+  setWalSyncMode(mode, n = null) {
+    return wrapError(() => this._native.setWalSyncMode(mode, n))
+  }
+
+  /**
+   * Return the current WAL sync mode. Shape:
+   *   { mode: "per_op" } | { mode: "every_n", n: number } | { mode: "on_flush" }
+   */
+  walSyncMode() {
+    return wrapError(() => decode(this._native.walSyncMode()))
+  }
+
+  /**
+   * Return `{ live, dead }` summed across every HNSW graph (global +
+   * namespaced). Use to monitor when a compact() will rebuild the graph
+   * for recall.
+   */
+  tombstoneStats() {
+    return wrapError(() => {
+      const [live, dead] = this._native.tombstoneStats()
+      return { live, dead }
+    })
+  }
+
+  /**
+   * Materialise the contiguous-vector arena up front. The arena mirrors
+   * every record's default dense vector into a single flat Float32 buffer
+   * for cache- and SIMD-friendly brute-force / rescoring scans. Built
+   * lazily on first use otherwise.
+   */
+  prepareForScan() {
+    return wrapError(() => this._native.prepareForScan())
+  }
+
+  /**
+   * Number of vectors in the contiguous arena, or `null` if it has not
+   * been materialised yet in this session.
+   */
+  vectorArenaLen() {
+    return wrapError(() => this._native.vectorArenaLen())
   }
 
   get(id, options = {}) {
@@ -620,6 +672,7 @@ class Database {
         options.efConstruction ?? null,
         options.efSearch ?? null,
         options.parallelInsertThreshold ?? null,
+        options.tombstoneRebuildPct ?? null,
       ),
     )
   }

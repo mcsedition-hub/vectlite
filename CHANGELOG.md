@@ -4,6 +4,102 @@ All notable changes to `vectlite` will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows Semantic Versioning while the public API stabilizes.
 
+## [0.11.0] - 2026-05-18
+
+### Performance
+
+This release rewrites the single-record ingestion hot path that bottlenecked
+streaming workloads at ~150 vec/s. Expected throughput is now 10–50× higher
+out of the box on a typical SSD, and another 5–10× on top of that when the
+new WAL `sync_mode` is relaxed.
+
+- **Incremental HNSW insertion.** `insert` / `upsert` no longer rebuild the
+  entire HNSW graph(s) on each call. Instead the new vector is appended
+  directly into the existing graph via `hnsw_rs::Hnsw::insert` (or
+  `parallel_insert` for larger batches). Per-record cost drops from
+  `O(N log N)` to `O(log N)`. Falling back to a full rebuild only happens
+  when an op is a delete or replaces an existing key — see HNSW tombstoning
+  below for the delete fix.
+- **Lazy persistence of the ANN graph.** `persist_ann_to_disk` is no longer
+  called on every insert. Instead an `ann_dirty` flag is raised and the
+  HNSW sidecar files are dumped at `flush` / `compact` / `close` time. The
+  WAL still gives per-record durability, so on a crash the ANN is rebuilt
+  from records on the next `open()`.
+- **Lazy rebuild of quantized indexes.** When quantization is enabled, the
+  in-memory PQ / scalar / binary codebook is dropped on the first
+  post-build insert and rebuilt at the next flush. Searches between inserts
+  and flush transparently fall back to HNSW, never returning stale
+  candidates.
+- **Cached WAL writer.** A single `BufWriter<File>` is now held for the
+  lifetime of the database session. Previous behaviour opened and closed
+  the WAL file on every `insert`, paying the `open(2)` syscall per record.
+- **WAL `sync_mode` knob (`WalSyncMode`).** Choose `PerOp` (the default,
+  fsync per insert), `EveryN(n)` (fsync every N inserts — amortises the
+  fsync tax) or `OnFlush` (fsync only at `flush` / `compact` / `close`).
+  Configurable via `Database::set_wal_sync_mode`, exposed in the bindings.
+  Tradeoff: relaxing the mode trades a bounded amount of recently-acked
+  data on crash for a 5–10× throughput multiplier on macOS APFS.
+- **HNSW tombstoning.** `delete` no longer triggers a full HNSW rebuild.
+  The deleted record's `origin_id` is marked in a per-index tombstone set
+  and silently skipped during search. A rebuild happens automatically at
+  `compact()` time, or whenever the tombstone ratio crosses
+  `IndexConfig.tombstone_rebuild_pct` (default 30).
+- **Contiguous dense-vector arena (`VectorArena`).** The default dense
+  vector is now mirrored into a single global contiguous `Vec<f32>` arena.
+  Per-record vectors are appended at insert time (no extra allocations
+  beyond the amortised arena growth), and the arena is lazily rebuilt
+  after a delete (which cannot compact in place). Call
+  `Database::prepare_for_scan()` to materialise it ahead of a heavy
+  brute-force / rescoring workload. Search-path integration is incremental:
+  the arena is currently exposed for callers and used as the cache-friendly
+  storage layer; wiring it into the default `collect_results` scan is in
+  progress in a follow-up to keep this release minimally invasive.
+- **ANN manifest format bumped to `ANN2`** to persist the per-graph
+  insertion-order keys alongside the HNSW sidecar files. The old `ANN1`
+  format is still readable. Required for the incremental-insert path to
+  survive a reopen.
+
+### Added
+
+- `WalSyncMode` enum (Rust core) with `PerOp`, `EveryN(usize)`, `OnFlush`.
+  Default remains `PerOp` for safety.
+- `Database::set_wal_sync_mode`, `Database::wal_sync_mode` (Rust core).
+- `IndexConfig.tombstone_rebuild_pct` (default `30`) — once a graph
+  accumulates this percentage of tombstones it is rebuilt at the next
+  `compact()`.
+- `Database::tombstone_stats()` returning the per-graph live / tombstoned
+  counts.
+
+### Bindings
+
+The new core APIs are surfaced in both the Python and Node bindings.
+
+**Python (`vectlite`):**
+- `db.set_wal_sync_mode(mode, n=None)` — `mode` is `"per_op"`,
+  `"every_n"` (pass `n`), or `"on_flush"`.
+- `db.wal_sync_mode()` returns `{"mode": "per_op"}` |
+  `{"mode": "every_n", "n": 64}` | `{"mode": "on_flush"}`.
+- `db.tombstone_stats()` returns `(live, dead)`.
+- `db.prepare_for_scan()` materialises the contiguous arena up front.
+- `db.vector_arena_len()` returns the arena size or `None`.
+- `db.bulk_ingest(..., tombstone_rebuild_pct=N)` and
+  `db.set_index_config(..., tombstone_rebuild_pct=N)` accept the new
+  HNSW knob. `db.index_config()` includes a `tombstone_rebuild_pct`
+  key in the returned dict.
+
+**Node (`vectlite`):**
+- `db.setWalSyncMode(mode, n)` — same semantics.
+- `db.walSyncMode()` returns `{ mode, n? }`.
+- `db.tombstoneStats()` returns `{ live, dead }`.
+- `db.prepareForScan()`, `db.vectorArenaLen()`.
+- `bulkIngest`, `setIndexConfig`, `indexConfig`, and `bulkIngestAsync`
+  accept / return `tombstoneRebuildPct`.
+- TypeScript types updated: `WalSyncMode`, `WalSyncModeInfo`,
+  `TombstoneStats`.
+
+UniFFI (Swift / Kotlin) plumbing is still pending — open an issue if
+you need it for a binding outside Python / Node.
+
 ## [0.10.0] - 2026-05-16
 
 ### Performance

@@ -68,7 +68,7 @@ db.close()
 ### Data Management
 
 - **Physical collections** -- `vectlite.openStore()` manages a directory of independent databases
-- **Bulk ingestion** -- `bulkIngest()` with Rayon-parallel HNSW build, coalesced WAL fsync, and tunable `m` / `efConstruction` / `efSearch`
+- **Bulk ingestion** -- `bulkIngest()` with Rayon-parallel HNSW build, coalesced WAL fsync, and tunable `m` / `efConstruction` / `efSearch` / tombstone rebuild threshold
 - **Listing & filtered counts** -- `list()` and `count({ namespace, filter })` without a vector query
 - **Delete by filter** -- `deleteByFilter()` for bulk deletion by metadata filter
 - **Partial metadata updates** -- `updateMetadata()` merges a patch without re-writing the vector or rebuilding indexes
@@ -429,10 +429,15 @@ before re-throwing.
 | `db.insert(id, vector, metadata, options)` | Insert a record (throws on duplicate id) |
 | `db.upsertMany(records, { namespace })` | Upsert a batch of records |
 | `db.insertMany(records, { namespace })` | Insert a batch |
-| `db.bulkIngest(records, { namespace, batchSize, m, efConstruction, efSearch, parallelInsertThreshold })` | Fastest bulk import with coalesced WAL fsync and Rayon-parallel HNSW build |
-| `db.setIndexConfig({ m, efConstruction, efSearch, parallelInsertThreshold })` | Update HNSW parameters; rebuilds the ANN graph if `m`/`efConstruction` changed |
+| `db.bulkIngest(records, { namespace, batchSize, m, efConstruction, efSearch, parallelInsertThreshold, tombstoneRebuildPct })` | Fastest bulk import with coalesced WAL fsync and Rayon-parallel HNSW build |
+| `db.setIndexConfig({ m, efConstruction, efSearch, parallelInsertThreshold, tombstoneRebuildPct })` | Update HNSW parameters; rebuilds the ANN graph if `m`/`efConstruction` changed |
 | `db.setEfSearch(efSearch)` | Adjust query-time HNSW search width without rebuilding |
 | `db.indexConfig()` | Return the current HNSW configuration |
+| `db.setWalSyncMode(mode, n)` | Configure WAL fsync cadence: `'per_op'`, `'every_n'`, or `'on_flush'` |
+| `db.walSyncMode()` | Return the current WAL sync mode |
+| `db.tombstoneStats()` | Return live and tombstoned HNSW node counts |
+| `db.prepareForScan()` | Materialise the contiguous vector arena |
+| `db.vectorArenaLen()` | Return the vector arena size or `null` |
 | `db.delete(id, { namespace })` | Delete a single record |
 | `db.deleteMany(ids, { namespace })` | Delete multiple records by id |
 | `db.deleteByFilter(filter, { namespace })` | Delete all records matching a filter |

@@ -64,7 +64,7 @@ with vectlite.open("knowledge.vdb", dimension=384) as db:
 ### Data Management
 
 - **Physical collections** -- `vectlite.open_store()` manages a directory of independent databases
-- **Bulk ingestion** -- `bulk_ingest()` with Rayon-parallel HNSW build, coalesced WAL fsync, and tunable `m` / `ef_construction` / `ef_search`
+- **Bulk ingestion** -- `bulk_ingest()` with Rayon-parallel HNSW build, coalesced WAL fsync, and tunable `m` / `ef_construction` / `ef_search` / tombstone rebuild threshold
 - **Listing & filtered counts** -- `list()` and `count(namespace=..., filter=...)` without a vector query
 - **Delete by filter** -- remove matching records across a namespace slice in one call
 - **Partial metadata updates** -- `update_metadata()` merges a patch without re-writing the vector or rebuilding indexes
@@ -614,8 +614,8 @@ The Python API exposes passive database metadata as properties (`db.path`,
 | `db.insert(id, vector, metadata, sparse=..., vectors=...)` | Insert a record (raises on duplicate id) |
 | `db.upsert_many(records, namespace=None)` | Upsert a batch of records (single index rebuild) |
 | `db.insert_many(records, namespace=None)` | Insert a batch (raises on duplicate ids) |
-| `db.bulk_ingest(records, namespace=None, batch_size=10000, m=None, ef_construction=None, ef_search=None, parallel_insert_threshold=None)` | Fastest bulk import with coalesced WAL fsync and Rayon-parallel HNSW build |
-| `db.set_index_config(m=None, ef_construction=None, ef_search=None, parallel_insert_threshold=None)` | Update HNSW parameters; rebuilds the ANN graph if `m`/`ef_construction` changed |
+| `db.bulk_ingest(records, namespace=None, batch_size=10000, m=None, ef_construction=None, ef_search=None, parallel_insert_threshold=None, tombstone_rebuild_pct=None)` | Fastest bulk import with coalesced WAL fsync and Rayon-parallel HNSW build |
+| `db.set_index_config(m=None, ef_construction=None, ef_search=None, parallel_insert_threshold=None, tombstone_rebuild_pct=None)` | Update HNSW parameters; rebuilds the ANN graph if `m`/`ef_construction` changed |
 | `db.set_ef_search(ef_search)` | Adjust query-time HNSW search width without rebuilding |
 | `db.index_config()` | Return the current HNSW configuration dict |
 | `db.delete(id, namespace=None)` | Delete a single record |

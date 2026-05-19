@@ -174,6 +174,7 @@ class Database:
         ef_construction: int | None = None,
         ef_search: int | None = None,
         parallel_insert_threshold: int | None = None,
+        tombstone_rebuild_pct: int | None = None,
     ) -> int:
         """Bulk-ingest many records efficiently.
 
@@ -192,6 +193,9 @@ class Database:
             slower search. ``None`` = auto-derived from ``top_k``.
         :param parallel_insert_threshold: minimum dataset size to engage
             Rayon-backed parallel HNSW insertion. Default 256.
+        :param tombstone_rebuild_pct: 0..=100. At ``compact()`` time the
+            HNSW graph is rebuilt once tombstoned (deleted) nodes account
+            for at least this percentage of the graph. Default 30.
         """
         ...
     def set_ef_search(self, ef_search: int | None) -> None:
@@ -207,6 +211,7 @@ class Database:
         ef_construction: int | None = None,
         ef_search: int | None = None,
         parallel_insert_threshold: int | None = None,
+        tombstone_rebuild_pct: int | None = None,
     ) -> None:
         """Replace the HNSW index configuration.
 
@@ -220,7 +225,49 @@ class Database:
         """Return the current HNSW index configuration.
 
         Keys: ``m``, ``ef_construction``, ``ef_search``,
-        ``parallel_insert_threshold``.
+        ``parallel_insert_threshold``, ``tombstone_rebuild_pct``.
+        """
+        ...
+    def set_wal_sync_mode(self, mode: str, n: int | None = None) -> None:
+        """Configure WAL durability vs throughput.
+
+        :param mode: one of ``"per_op"`` (fsync after every insert, the
+            default and strongest durability), ``"every_n"`` (fsync every
+            ``n`` inserts — provide ``n``), or ``"on_flush"`` (only fsync
+            at ``flush()`` / ``compact()`` / ``close()``).
+        :param n: required when ``mode == "every_n"``.
+
+        On macOS APFS, ``on_flush`` typically multiplies ingestion
+        throughput by 5–10× vs ``per_op``. The tradeoff is that
+        recently-acked writes can be lost on an unclean shutdown.
+        """
+        ...
+    def wal_sync_mode(self) -> dict[str, int | str]:
+        """Return the current WAL sync mode.
+
+        Result shape: ``{"mode": "per_op"}`` |
+        ``{"mode": "every_n", "n": 64}`` | ``{"mode": "on_flush"}``.
+        """
+        ...
+    def tombstone_stats(self) -> tuple[int, int]:
+        """Return ``(live_count, tombstoned_count)`` summed across every
+        HNSW graph (global + per-namespace). High tombstoned counts mean
+        a ``compact()`` will rebuild the graph(s) for recall.
+        """
+        ...
+    def prepare_for_scan(self) -> None:
+        """Materialise the contiguous-vector arena up front.
+
+        The arena mirrors every record's default dense vector into a
+        single flat ``Vec[f32]`` for cache- and SIMD-friendly brute-force
+        or rescoring scans. Built lazily on first use; call this before a
+        heavy scan to pay the build cost up front. Cheap when already
+        fresh.
+        """
+        ...
+    def vector_arena_len(self) -> int | None:
+        """Number of vectors in the contiguous arena, or ``None`` if it
+        has not been materialised yet in this session.
         """
         ...
     def get(self, id: str, namespace: str | None = None) -> Record | None: ...

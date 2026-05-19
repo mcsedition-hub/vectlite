@@ -118,6 +118,11 @@ export interface BulkIngestOptions {
   efSearch?: number | null
   /** Minimum dataset size to engage Rayon-parallel HNSW insertion (default 256). */
   parallelInsertThreshold?: number | null
+  /**
+   * Percentage (0..=100) of dead nodes at which `compact()` triggers an
+   * HNSW rebuild. Default 30. Set to 100 to disable automatic rebuild.
+   */
+  tombstoneRebuildPct?: number | null
 }
 
 export interface IndexConfig {
@@ -125,6 +130,7 @@ export interface IndexConfig {
   ef_construction: number
   ef_search: number | null
   parallel_insert_threshold: number
+  tombstone_rebuild_pct: number
 }
 
 export interface SetIndexConfigOptions {
@@ -132,6 +138,22 @@ export interface SetIndexConfigOptions {
   efConstruction?: number | null
   efSearch?: number | null
   parallelInsertThreshold?: number | null
+  tombstoneRebuildPct?: number | null
+}
+
+/** WAL fsync mode. See `Database.setWalSyncMode`. */
+export type WalSyncMode = 'per_op' | 'every_n' | 'on_flush'
+
+export type WalSyncModeInfo =
+  | { mode: 'per_op' }
+  | { mode: 'every_n'; n: number }
+  | { mode: 'on_flush' }
+
+export interface TombstoneStats {
+  /** Live (non-tombstoned) records across all HNSW graphs. */
+  live: number
+  /** Dead (tombstoned) records still in the graphs, awaiting compact(). */
+  dead: number
 }
 
 export interface SearchOptions {
@@ -240,6 +262,31 @@ export class Database {
   setEfSearch(efSearch: number | null): void
   /** Update HNSW parameters; rebuilds the ANN graph if `m`/`efConstruction` changed. */
   setIndexConfig(config: SetIndexConfigOptions): void
+  /**
+   * Configure WAL durability.
+   *
+   * - `"per_op"`   (default): fsync after every insert. Strongest durability.
+   * - `"every_n"`  : fsync once every `n` inserts (pass `n` as 2nd arg).
+   * - `"on_flush"` : only fsync at `flush()` / `compact()` / `close()`.
+   *
+   * On macOS APFS, `"on_flush"` typically multiplies ingestion throughput
+   * by 5–10× at the cost of losing un-flushed writes on a crash.
+   */
+  setWalSyncMode(mode: WalSyncMode, n?: number | null): void
+  /** Return the current WAL sync mode. */
+  walSyncMode(): WalSyncModeInfo
+  /** Total live and tombstoned record counts across every HNSW graph. */
+  tombstoneStats(): TombstoneStats
+  /**
+   * Materialise the contiguous-vector arena up front for cache- and
+   * SIMD-friendly scans. Normally built lazily on first use.
+   */
+  prepareForScan(): void
+  /**
+   * Number of vectors in the contiguous arena, or `null` if it hasn't
+   * been materialised yet in this session.
+   */
+  vectorArenaLen(): number | null
   get(id: string, options?: { namespace?: string | null }): Record | null
   delete(id: string, options?: { namespace?: string | null }): boolean
   deleteMany(ids: string[], options?: { namespace?: string | null }): number
