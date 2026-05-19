@@ -424,6 +424,51 @@ class Database {
         options.efSearch ?? null,
         options.parallelInsertThreshold ?? null,
         options.tombstoneRebuildPct ?? null,
+        options.segmentSizeThreshold ?? null,
+      ),
+    )
+  }
+
+  /**
+   * Zero-copy bulk ingest from a Float32Array.
+   *
+   * 10–30× faster than `bulkIngest(records)` for large batches: the
+   * vector data isn't JSON-serialised between JS and Rust (napi-rs gives
+   * us a direct reference to the underlying ArrayBuffer).
+   *
+   * @param {string[]} ids                 — N record ids
+   * @param {Float32Array} vectorsFlat     — N × dim row-major floats
+   * @param {number} dim                   — must equal db.dimension
+   * @param {object} [options]
+   * @param {Array<object|null>} [options.metadata]
+   * @param {string|null} [options.namespace]
+   * @param {number} [options.batchSize=10000]
+   * @param {number} [options.m]
+   * @param {number} [options.efConstruction]
+   * @param {number} [options.efSearch]
+   * @param {number} [options.parallelInsertThreshold]
+   * @param {number} [options.tombstoneRebuildPct]
+   * @param {number} [options.segmentSizeThreshold]
+   */
+  bulkIngestArray(ids, vectorsFlat, dim, options = {}) {
+    if (!(vectorsFlat instanceof Float32Array)) {
+      throw new TypeError('bulkIngestArray: vectorsFlat must be a Float32Array')
+    }
+    const metaJson = options.metadata != null ? JSON.stringify(options.metadata) : null
+    return wrapError(() =>
+      this._native.bulkIngestArray(
+        ids,
+        vectorsFlat,
+        dim,
+        metaJson,
+        options.namespace ?? null,
+        options.batchSize ?? 10_000,
+        options.m ?? null,
+        options.efConstruction ?? null,
+        options.efSearch ?? null,
+        options.parallelInsertThreshold ?? null,
+        options.tombstoneRebuildPct ?? null,
+        options.segmentSizeThreshold ?? null,
       ),
     )
   }
@@ -444,8 +489,18 @@ class Database {
         config.efSearch ?? null,
         config.parallelInsertThreshold ?? null,
         config.tombstoneRebuildPct ?? null,
+        config.segmentSizeThreshold ?? null,
       ),
     )
+  }
+
+  /**
+   * Number of HNSW segments in the active index for the given
+   * (namespace, vectorName). Returns 0 if no graph exists. Useful for
+   * tests and observability.
+   */
+  annSegmentCount(namespace = null, vectorName = null) {
+    return wrapError(() => this._native.annSegmentCount(namespace, vectorName))
   }
 
   /**
@@ -673,6 +728,7 @@ class Database {
         options.efSearch ?? null,
         options.parallelInsertThreshold ?? null,
         options.tombstoneRebuildPct ?? null,
+        options.segmentSizeThreshold ?? null,
       ),
     )
   }

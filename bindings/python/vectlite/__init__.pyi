@@ -175,6 +175,7 @@ class Database:
         ef_search: int | None = None,
         parallel_insert_threshold: int | None = None,
         tombstone_rebuild_pct: int | None = None,
+        segment_size_threshold: int | None = None,
     ) -> int:
         """Bulk-ingest many records efficiently.
 
@@ -212,6 +213,7 @@ class Database:
         ef_search: int | None = None,
         parallel_insert_threshold: int | None = None,
         tombstone_rebuild_pct: int | None = None,
+        segment_size_threshold: int | None = None,
     ) -> None:
         """Replace the HNSW index configuration.
 
@@ -225,7 +227,47 @@ class Database:
         """Return the current HNSW index configuration.
 
         Keys: ``m``, ``ef_construction``, ``ef_search``,
-        ``parallel_insert_threshold``, ``tombstone_rebuild_pct``.
+        ``parallel_insert_threshold``, ``tombstone_rebuild_pct``,
+        ``segment_size_threshold``.
+        """
+        ...
+    def bulk_ingest_array(
+        self,
+        ids: list[str],
+        vectors: Any,  # numpy.ndarray[float32, (N, D)]
+        metadata: list[dict] | None = None,
+        namespace: str | None = None,
+        batch_size: int = 10000,
+        m: int | None = None,
+        ef_construction: int | None = None,
+        ef_search: int | None = None,
+        parallel_insert_threshold: int | None = None,
+        tombstone_rebuild_pct: int | None = None,
+        segment_size_threshold: int | None = None,
+    ) -> int:
+        """Zero-copy bulk ingest from a NumPy float32 array of shape (N, D).
+
+        10–30× faster than ``bulk_ingest(list_of_dicts)`` for large batches
+        because the vector data isn't parsed from Python objects and the
+        GIL is released for the ingest itself. Only writes the default
+        dense vector; for named vectors / sparse / multi-vectors use
+        ``bulk_ingest(list_of_dicts)``.
+
+        The ``vectors`` array must be C-contiguous (use
+        ``np.ascontiguousarray(arr, dtype=np.float32)``) and have shape
+        ``(len(ids), db.dimension)``.
+        """
+        ...
+    def ann_segment_count(
+        self,
+        namespace: str | None = None,
+        vector_name: str | None = None,
+    ) -> int:
+        """Number of HNSW segments in the active index for the given
+        (namespace, vector_name). Returns 0 if no graph exists.
+
+        With ``segment_size_threshold`` set (default 50_000), an index
+        with N records will have roughly ``ceil(N / threshold)`` segments.
         """
         ...
     def set_wal_sync_mode(self, mode: str, n: int | None = None) -> None:

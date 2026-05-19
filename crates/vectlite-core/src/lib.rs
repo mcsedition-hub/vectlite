@@ -790,6 +790,13 @@ pub struct IndexConfig {
     /// Default `30` (rebuild when ≥30% of the graph is dead). Set to `100`
     /// to disable automatic rebuild.
     pub tombstone_rebuild_pct: u8,
+    /// Soft cap on the number of vectors per HNSW segment. Once the active
+    /// segment hits this size, a new segment is started for subsequent
+    /// inserts. Search queries every segment and merges top-K. Default
+    /// `50_000` — chosen so per-insert HNSW cost stays roughly constant as
+    /// the corpus grows (LSM-tree style). Set to `usize::MAX` to disable
+    /// segmenting (single-segment behaviour like pre-0.11).
+    pub segment_size_threshold: usize,
 }
 
 impl Default for IndexConfig {
@@ -800,6 +807,7 @@ impl Default for IndexConfig {
             ef_search: None,
             parallel_insert_threshold: ANN_PARALLEL_INSERT_THRESHOLD,
             tombstone_rebuild_pct: 30,
+            segment_size_threshold: 50_000,
         }
     }
 }
@@ -814,6 +822,7 @@ impl IndexConfig {
             ef_search: Some(200),
             parallel_insert_threshold: ANN_PARALLEL_INSERT_THRESHOLD,
             tombstone_rebuild_pct: 30,
+            segment_size_threshold: 50_000,
         }
     }
 
@@ -825,6 +834,7 @@ impl IndexConfig {
             ef_search: Some(40),
             parallel_insert_threshold: ANN_PARALLEL_INSERT_THRESHOLD,
             tombstone_rebuild_pct: 30,
+            segment_size_threshold: 50_000,
         }
     }
 
@@ -849,6 +859,11 @@ impl IndexConfig {
         if self.tombstone_rebuild_pct > 100 {
             return Err(VectLiteError::InvalidFormat(
                 "IndexConfig.tombstone_rebuild_pct must be in 0..=100".to_owned(),
+            ));
+        }
+        if self.segment_size_threshold == 0 {
+            return Err(VectLiteError::InvalidFormat(
+                "IndexConfig.segment_size_threshold must be >= 1".to_owned(),
             ));
         }
         Ok(())
@@ -1524,18 +1539,6 @@ impl AnnHnsw {
         }
     }
 
-    /// Bulk-insert a batch of vectors in parallel (Rayon-multithreaded).
-    /// Significantly faster than repeated `insert_one` when the batch is
-    /// large enough to amortise thread setup.
-    fn parallel_insert_batch(&mut self, batch: &[(&Vec<f32>, usize)]) {
-        match self {
-            AnnHnsw::Cosine(h) => h.parallel_insert(batch),
-            AnnHnsw::Euclidean(h) => h.parallel_insert(batch),
-            AnnHnsw::DotProduct(h) => h.parallel_insert(batch),
-            AnnHnsw::Manhattan(h) => h.parallel_insert(batch),
-        }
-    }
-
     /// Toggle the `searching_mode` hint on the underlying HNSW. When `true`
     /// the graph is treated as read-only and lookups skip some bookkeeping;
     /// when `false` further inserts are allowed.
@@ -1561,38 +1564,82 @@ impl AnnHnsw {
     }
 }
 
-struct AnnIndex {
+/// A single HNSW segment. Multiple segments compose an `AnnIndex`,
+/// LSM-tree style: an "active" segment receives new inserts; once it hits
+/// `IndexConfig.segment_size_threshold` a new active segment is started.
+/// Search queries every segment and merges top-K. This trades a small
+/// query-time merge cost for two big wins:
+///   1. Per-insert HNSW cost stays bounded — `O(log segment_size)`
+///      instead of `O(log total)`, so streaming throughput doesn't
+///      degrade as the corpus grows.
+///   2. Each segment can be (re)built in parallel.
+struct AnnSegment {
     hnsw: AnnHnsw,
-    /// `keys[i]` is the record key for HNSW origin_id `i`. Always grows; we
-    /// never shrink it (HNSW doesn't support compacted deletion). Tombstoned
-    /// slots stay in the vec to keep origin_id ↔ key mapping stable.
+    /// `keys[i]` is the record key for HNSW origin_id `i` *within this
+    /// segment*. Always grows; never compacted (HNSW lib doesn't support
+    /// deletion).
     keys: Vec<RecordKey>,
-    /// Reverse index: `key → origin_id`. Lets `delete` find a record's HNSW
-    /// node in O(1). Built alongside `keys` on every (re)build.
-    key_to_origin: HashMap<RecordKey, usize>,
-    /// Origin_ids that have been logically deleted but are still part of the
-    /// HNSW graph. Search filters these out by lookup; a `compact()` rebuilds
-    /// the graph once the ratio exceeds `IndexConfig.tombstone_rebuild_pct`.
+    /// Tombstoned local origin_ids — filtered out at search time.
     tombstones: HashSet<usize>,
 }
 
-impl AnnIndex {
-    /// Number of live (non-tombstoned) records in the graph.
+impl AnnSegment {
     fn live_count(&self) -> usize {
         self.keys.len().saturating_sub(self.tombstones.len())
     }
+}
+
+struct AnnIndex {
+    /// All segments. `segments.last()` is the active (insert target).
+    /// Segments are never removed (except by full rebuild); a "merge"
+    /// at compact time rebuilds the whole thing as one segment.
+    segments: Vec<AnnSegment>,
+    /// Global key → (segment_index, local_origin_id) reverse map. Lets
+    /// delete find the right segment+node in O(1) and lets incremental
+    /// insert detect duplicates without scanning every segment.
+    key_to_location: HashMap<RecordKey, (usize, usize)>,
+}
+
+impl AnnIndex {
+    /// Build an `AnnIndex` containing a single segment from a pre-built
+    /// `AnnSegment`. Used by both `build_ann_index` and `load_ann_index`.
+    fn from_single(segment: AnnSegment) -> Self {
+        let mut key_to_location = HashMap::with_capacity(segment.keys.len());
+        for (origin_id, key) in segment.keys.iter().enumerate() {
+            key_to_location.insert(key.clone(), (0, origin_id));
+        }
+        Self {
+            segments: vec![segment],
+            key_to_location,
+        }
+    }
+
+    /// Total live (non-tombstoned) records across every segment.
+    fn live_count(&self) -> usize {
+        self.segments.iter().map(AnnSegment::live_count).sum()
+    }
+
+    /// Total records (including tombstoned) across every segment.
+    fn total_count(&self) -> usize {
+        self.segments.iter().map(|s| s.keys.len()).sum()
+    }
+
+    /// Total tombstoned across every segment.
+    fn tombstone_count(&self) -> usize {
+        self.segments.iter().map(|s| s.tombstones.len()).sum()
+    }
 
     /// True when the fraction of dead nodes is at or above the configured
-    /// rebuild threshold (`IndexConfig.tombstone_rebuild_pct`). Currently
-    /// `compact_inner` rebuilds on *any* tombstones because the persisted
-    /// manifest format only tracks live record counts — when we add a
-    /// tombstone-aware manifest (planned), this becomes the trigger.
+    /// rebuild threshold. Currently `compact_inner` rebuilds on *any*
+    /// tombstones because the persisted manifest format only tracks live
+    /// record counts.
     #[allow(dead_code)]
     fn should_rebuild(&self, threshold_pct: u8) -> bool {
-        if self.keys.is_empty() {
+        let total = self.total_count();
+        if total == 0 {
             return false;
         }
-        let pct = (self.tombstones.len() * 100) / self.keys.len();
+        let pct = (self.tombstone_count() * 100) / total;
         pct >= threshold_pct as usize
     }
 }
@@ -1600,8 +1647,19 @@ impl AnnIndex {
 struct AnnManifestEntry {
     namespace: Option<String>,
     vector_name: String,
+    /// Sum of segment record counts (live + tombstoned).
     record_count: usize,
+    /// Order-independent (sorted) hash of the union of all segment keys.
+    /// Used to detect "manifest matches in-memory record set" on reload.
     key_signature: u64,
+    /// One entry per segment. Empty when reading an ANN1 manifest (which
+    /// had no persisted keys at all — caller falls back to BTreeMap order).
+    /// ANN2 manifests have exactly one entry. ANN3+ may have multiple.
+    segments: Vec<AnnManifestSegment>,
+}
+
+struct AnnManifestSegment {
+    /// Per-segment keys in insertion order (matches HNSW origin_ids).
     keys: Vec<RecordKey>,
 }
 
@@ -1669,20 +1727,17 @@ impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let lock = acquire_exclusive_lock(&path)?;
-        let mut file = File::open(&path)?;
-        let mut database = Self::read_from(&path, &mut file)?;
+        // Wrap the open file in a 256 KiB BufReader: on warm databases
+        // the dominant `read_from` cost is the kernel `read(2)` syscall
+        // round-trip per record (the default 8 KiB buffer is too small
+        // when records carry full embeddings + metadata blobs).
+        let file = File::open(&path)?;
+        let mut reader = BufReader::with_capacity(256 * 1024, file);
+        let mut database = Self::read_from(&path, &mut reader)?;
         database._lock_file = Some(lock);
         database.read_only = false;
         database.replay_wal()?;
-        database.rebuild_sparse_index();
-        database.ann_loaded_from_disk = database.try_load_ann_from_disk();
-        if !database.ann_loaded_from_disk {
-            database.rebuild_ann();
-        }
-        database.try_load_quantization();
-        database.try_load_multi_vector_quantization();
-        database.try_load_payload_index_defs();
-        database.rebuild_payload_indexes();
+        database.startup_load_indexes();
         Ok(database)
     }
 
@@ -1693,20 +1748,17 @@ impl Database {
         let path = path.as_ref().to_path_buf();
         let timeout = timeout_duration(timeout_secs, "lock_timeout")?;
         let lock = acquire_exclusive_lock_with_timeout(&path, Some(timeout))?;
-        let mut file = File::open(&path)?;
-        let mut database = Self::read_from(&path, &mut file)?;
+        // Wrap the open file in a 256 KiB BufReader: on warm databases
+        // the dominant `read_from` cost is the kernel `read(2)` syscall
+        // round-trip per record (the default 8 KiB buffer is too small
+        // when records carry full embeddings + metadata blobs).
+        let file = File::open(&path)?;
+        let mut reader = BufReader::with_capacity(256 * 1024, file);
+        let mut database = Self::read_from(&path, &mut reader)?;
         database._lock_file = Some(lock);
         database.read_only = false;
         database.replay_wal()?;
-        database.rebuild_sparse_index();
-        database.ann_loaded_from_disk = database.try_load_ann_from_disk();
-        if !database.ann_loaded_from_disk {
-            database.rebuild_ann();
-        }
-        database.try_load_quantization();
-        database.try_load_multi_vector_quantization();
-        database.try_load_payload_index_defs();
-        database.rebuild_payload_indexes();
+        database.startup_load_indexes();
         Ok(database)
     }
 
@@ -1728,21 +1780,134 @@ impl Database {
             .map(|seconds| timeout_duration(seconds, "lock_timeout"))
             .transpose()?;
         let lock = acquire_shared_lock_with_timeout(&path, timeout)?;
-        let mut file = File::open(&path)?;
-        let mut database = Self::read_from(&path, &mut file)?;
+        // Wrap the open file in a 256 KiB BufReader: on warm databases
+        // the dominant `read_from` cost is the kernel `read(2)` syscall
+        // round-trip per record (the default 8 KiB buffer is too small
+        // when records carry full embeddings + metadata blobs).
+        let file = File::open(&path)?;
+        let mut reader = BufReader::with_capacity(256 * 1024, file);
+        let mut database = Self::read_from(&path, &mut reader)?;
         database._lock_file = Some(lock);
         database.read_only = true;
         database.replay_wal()?;
-        database.rebuild_sparse_index();
-        database.ann_loaded_from_disk = database.try_load_ann_from_disk();
-        if !database.ann_loaded_from_disk {
-            database.rebuild_ann();
-        }
-        database.try_load_quantization();
-        database.try_load_multi_vector_quantization();
-        database.try_load_payload_index_defs();
-        database.rebuild_payload_indexes();
+        database.startup_load_indexes();
         Ok(database)
+    }
+
+    /// Shared open-path index loading: tries every sidecar/cached form
+    /// first and falls back to in-memory rebuild only when necessary. This
+    /// is the dominant startup cost on warm databases, so we go to some
+    /// lengths to avoid re-iterating every record:
+    ///
+    /// - Sparse index: load from `.sparse` sidecar when WAL replay didn't
+    ///   touch records; otherwise rebuild. Skip entirely if no record
+    ///   has sparse content (common in dense-only workloads).
+    /// - Vector arena: load from `.col.vector` sidecar to populate the
+    ///   contiguous column up front; otherwise leave it lazy.
+    /// - ANN graphs: try the existing manifest-based load; rebuild if the
+    ///   manifest is stale.
+    /// - Quantization & multi-vector quantization: lazy (load sidecars,
+    ///   rebuild codes only if quantization is enabled).
+    /// - Payload indexes: lazy — defs are loaded but per-record build is
+    ///   deferred to first filtered query.
+    fn startup_load_indexes(&mut self) {
+        // ---- Sparse index ----
+        // If WAL replay added/changed any records, sidecar is stale; rebuild.
+        // If the database is empty or fully dense, skip entirely.
+        let need_sparse_rebuild = self.wal_entries_replayed > 0 || !self.any_sparse_record();
+        if need_sparse_rebuild {
+            if self.any_sparse_record() {
+                self.rebuild_sparse_index();
+            } else {
+                // Dense-only: reset to empty index without iterating.
+                self.sparse_index = SparseIndex {
+                    doc_count: self.records.len(),
+                    ..Default::default()
+                };
+            }
+        } else if !self.try_load_sparse_from_disk() {
+            self.rebuild_sparse_index();
+        }
+
+        // ---- Vector arena (columnar) ----
+        // Best-effort load from the sidecar. Stale sidecars are detected
+        // by key count mismatch and trigger a lazy rebuild on first use.
+        if self.wal_entries_replayed == 0 {
+            self.try_load_vector_arena_from_disk();
+        } else {
+            // WAL replay changed records → arena will be lazily rebuilt
+            // next time `ensure_vector_arena` is called.
+            self.vector_arena_dirty = true;
+        }
+
+        // ---- ANN graphs ----
+        self.ann_loaded_from_disk = self.try_load_ann_from_disk();
+        if !self.ann_loaded_from_disk && !self.records.is_empty() {
+            self.rebuild_ann();
+        }
+
+        // ---- Quantization ----
+        self.try_load_quantization();
+        self.try_load_multi_vector_quantization();
+
+        // ---- Payload indexes ----
+        self.try_load_payload_index_defs();
+        if !self.payload_index_defs.is_empty() {
+            self.rebuild_payload_indexes();
+        }
+    }
+
+    /// Cheap O(N) scan to decide whether any record carries non-empty
+    /// sparse content. Skipping the full sparse-index rebuild when this
+    /// returns `false` is a big win on dense-only corpora.
+    fn any_sparse_record(&self) -> bool {
+        self.records.values().any(|r| !r.sparse.is_empty())
+    }
+
+    /// Best-effort load of the sparse index from `.sparse`. Returns true
+    /// on success. Validates only that the doc_count matches the current
+    /// record count — the WAL-replay check in the caller protects against
+    /// subtler staleness.
+    fn try_load_sparse_from_disk(&mut self) -> bool {
+        let path = sparse_index_path(&self.path);
+        if !path.exists() {
+            return false;
+        }
+        match read_sparse_index(&path) {
+            Ok(idx) if idx.doc_count == self.records.len() => {
+                self.sparse_index = idx;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Best-effort load of the contiguous vector arena from `.col.vector`.
+    fn try_load_vector_arena_from_disk(&mut self) {
+        let path = vector_arena_path(&self.path);
+        if !path.exists() {
+            return;
+        }
+        match read_vector_arena(&path) {
+            Ok(arena)
+                if arena.dim == self.dimension
+                    && arena.keys.len() == self.records.len()
+                    && arena.key_to_index.len() == self.records.len()
+                    && self
+                        .records
+                        .keys()
+                        .all(|key| arena.key_to_index.contains_key(key)) =>
+            {
+                self.vector_arena = Some(arena);
+                self.vector_arena_dirty = false;
+            }
+            _ => {
+                // Stale: leave the lazy slot empty so `ensure_vector_arena`
+                // rebuilds on first use.
+                self.vector_arena = None;
+                self.vector_arena_dirty = true;
+            }
+        }
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -2345,6 +2510,181 @@ impl Database {
         Ok(())
     }
 
+    /// Upsert a fully-formed `Record` (with optional sparse, named vectors,
+    /// multi-vectors, expires_at). Goes through the *incremental* `apply_wal_batch`
+    /// path, so single-record streaming is O(log N) instead of O(N log N).
+    ///
+    /// This is the high-throughput entry point used by the Python and Node
+    /// bindings for `db.insert()` / `db.upsert()`. Prefer it over
+    /// `insert_many(once(record))`, which always triggers a full rebuild.
+    pub fn upsert_record(&mut self, record: Record) -> Result<()> {
+        self.check_writable()?;
+        self.validate_record(&record)?;
+        self.apply_wal_batch(vec![WalOp::Upsert(record)])?;
+        Ok(())
+    }
+
+    /// `insert_record` is `upsert_record` with a duplicate-key check.
+    /// Returns `DuplicateId` if the (namespace, id) is already present.
+    pub fn insert_record(&mut self, record: Record) -> Result<()> {
+        self.check_writable()?;
+        self.validate_record(&record)?;
+        let key = (record.namespace.clone(), record.id.clone());
+        if self.records.contains_key(&key) {
+            return Err(VectLiteError::DuplicateId {
+                namespace: key.0,
+                id: key.1,
+            });
+        }
+        self.apply_wal_batch(vec![WalOp::Upsert(record)])?;
+        Ok(())
+    }
+
+    /// Bulk-ingest from a flat, contiguous vector buffer.
+    ///
+    /// This is the high-throughput entry point used by the Python and Node
+    /// bindings — it avoids the per-record Python-list / JSON parsing
+    /// overhead and lets us:
+    ///   1. Pre-grow the contiguous arena in one allocation.
+    ///   2. Slice the input buffer into per-record `Vec<f32>`s without
+    ///      iterating Python objects or parsing JSON.
+    ///   3. Reuse the same `bulk_ingest_with_config` end-of-batch rebuild
+    ///      (single fsync, single HNSW build).
+    ///
+    /// Arguments:
+    /// - `ids`: one id per record (length = `vectors_flat.len() / dim`)
+    /// - `vectors_flat`: contiguous f32 buffer; record `i` occupies
+    ///   `vectors_flat[i*dim..(i+1)*dim]`
+    /// - `metadata`: optional, one Metadata per record. `None` → empty maps.
+    /// - `namespace`: default namespace if `None`.
+    pub fn bulk_ingest_array(
+        &mut self,
+        ids: Vec<String>,
+        vectors_flat: &[f32],
+        dim: usize,
+        metadata: Option<Vec<Metadata>>,
+        namespace: Option<&str>,
+        batch_size: usize,
+        config: Option<IndexConfig>,
+    ) -> Result<usize> {
+        self.check_writable()?;
+        if dim == 0 {
+            return Err(VectLiteError::InvalidFormat(
+                "bulk_ingest_array: dim must be >= 1".to_owned(),
+            ));
+        }
+        if vectors_flat.len() != ids.len() * dim {
+            return Err(VectLiteError::InvalidFormat(format!(
+                "bulk_ingest_array: vectors_flat has {} floats but ids has {} entries × dim {} = {}",
+                vectors_flat.len(),
+                ids.len(),
+                dim,
+                ids.len() * dim
+            )));
+        }
+        if let Some(meta) = &metadata {
+            if meta.len() != ids.len() {
+                return Err(VectLiteError::InvalidFormat(format!(
+                    "bulk_ingest_array: metadata len {} != ids len {}",
+                    meta.len(),
+                    ids.len()
+                )));
+            }
+        }
+        if dim != self.dimension {
+            return Err(VectLiteError::DimensionMismatch {
+                expected: self.dimension,
+                found: dim,
+            });
+        }
+
+        let n = ids.len();
+        let namespace_str = namespace.unwrap_or(DEFAULT_NAMESPACE).to_owned();
+
+        let metas = metadata;
+        let mut records = Vec::with_capacity(n);
+        let mut incoming_keys = Vec::with_capacity(n);
+        let mut seen_in_batch = HashSet::with_capacity(n);
+        let mut arena_needs_full_rebuild = false;
+        for (i, id) in ids.into_iter().enumerate() {
+            let slice = &vectors_flat[i * dim..(i + 1) * dim];
+            // Keep Record.vector owned for the (public) Record API
+            // contract. A future format-v8 path could swap this to an
+            // arena handle, but that's a breaking change deferred for now.
+            let vec = slice.to_vec();
+            let meta = metas.as_ref().map(|m| m[i].clone()).unwrap_or_default();
+            let key = (namespace_str.clone(), id.clone());
+            if self.records.contains_key(&key) || !seen_in_batch.insert(key.clone()) {
+                arena_needs_full_rebuild = true;
+            }
+            incoming_keys.push(key);
+            records.push(Record {
+                namespace: namespace_str.clone(),
+                id,
+                vector: vec,
+                vectors: NamedVectors::new(),
+                sparse: SparseVector::new(),
+                metadata: meta,
+                multi_vectors: MultiVectors::new(),
+                expires_at: None,
+            });
+        }
+
+        for record in &records {
+            self.validate_record(record)?;
+        }
+        if let Some(cfg) = config.as_ref() {
+            cfg.validate()?;
+        }
+
+        // === Columnar fast path ===
+        //
+        // When the batch only appends new ids, pre-grow the arena once and
+        // copy the entire input buffer in a single `extend_from_slice`.
+        // If any key is an update or duplicated within the batch, rebuild
+        // after applying the upserts so the arena stays one-entry-per-record.
+        if !arena_needs_full_rebuild {
+            let needs_build = self.vector_arena.as_ref().map_or(true, |arena| {
+                self.vector_arena_dirty || arena.dim != self.dimension
+            });
+            if needs_build {
+                self.vector_arena = Some(VectorArena::rebuild_from(&self.records, self.dimension));
+                self.vector_arena_dirty = false;
+            }
+            if let Some(arena) = self.vector_arena.as_mut() {
+                let arena_start_idx = arena.keys.len();
+                arena.buf.reserve(n * dim);
+                arena.keys.reserve(n);
+                arena.key_to_index.reserve(n);
+                // Single bulk memcpy — the win vs. per-record append.
+                arena.buf.extend_from_slice(vectors_flat);
+                for (i, key) in incoming_keys.into_iter().enumerate() {
+                    arena.key_to_index.insert(key.clone(), arena_start_idx + i);
+                    arena.keys.push(key);
+                }
+            }
+        }
+
+        // Reuse the existing bulk path: it already does single-fsync,
+        // parallel HNSW build, lazy quantized rebuild.  Note: that path
+        // marks `vector_arena_dirty = true` at the end (because in the
+        // generic case it doesn't know we kept the arena in sync). We
+        // clear it here so the next compact persists the warm arena
+        // instead of rebuilding it.
+        let count = match self.bulk_ingest_with_config(records, batch_size.max(1), config) {
+            Ok(count) => count,
+            Err(error) => {
+                self.vector_arena_dirty = true;
+                return Err(error);
+            }
+        };
+        if arena_needs_full_rebuild {
+            self.vector_arena = Some(VectorArena::rebuild_from(&self.records, self.dimension));
+        }
+        self.vector_arena_dirty = false;
+        Ok(count)
+    }
+
     pub fn insert_many<I>(&mut self, records: I) -> Result<usize>
     where
         I: IntoIterator<Item = Record>,
@@ -2888,22 +3228,33 @@ impl Database {
     }
 
     /// Return (live_count, tombstoned_count) summed across every HNSW graph
-    /// (global + per-namespace). Useful for monitoring when a `compact()`
-    /// would benefit from rebuilding the graph(s).
+    /// (global + per-namespace, across every segment).
     pub fn tombstone_stats(&self) -> (usize, usize) {
         let mut live = 0usize;
         let mut dead = 0usize;
         for idx in self.ann.global.values() {
             live += idx.live_count();
-            dead += idx.tombstones.len();
+            dead += idx.tombstone_count();
         }
         for indexes in self.ann.namespaces.values() {
             for idx in indexes.values() {
                 live += idx.live_count();
-                dead += idx.tombstones.len();
+                dead += idx.tombstone_count();
             }
         }
         (live, dead)
+    }
+
+    /// Return the number of HNSW segments in the active index for the
+    /// given (namespace, vector_name). Useful for tests and observability:
+    /// confirms that segmenting is kicking in as expected.
+    pub fn ann_segment_count(&self, namespace: Option<&str>, vector_name: Option<&str>) -> usize {
+        let vn = vector_name.unwrap_or(DEFAULT_VECTOR_NAME);
+        let idx = match namespace {
+            Some(ns) => self.ann.namespaces.get(ns).and_then(|m| m.get(vn)),
+            None => self.ann.global.get(vn),
+        };
+        idx.map(|i| i.segments.len()).unwrap_or(0)
     }
 
     /// Bulk-ingest many records efficiently. WAL writes happen in batches of
@@ -3760,16 +4111,13 @@ impl Database {
             .ann
             .global
             .values()
-            .any(|idx| !idx.tombstones.is_empty())
+            .any(|idx| idx.tombstone_count() > 0)
             || self
                 .ann
                 .namespaces
                 .values()
                 .flat_map(|m| m.values())
-                .any(|idx| !idx.tombstones.is_empty());
-        // (We track `threshold` even though we currently rebuild on any
-        // tombstones, so `should_rebuild` could later replace this when we
-        // add tombstone persistence in the manifest.)
+                .any(|idx| idx.tombstone_count() > 0);
         let _ = threshold;
         if any_tombstones {
             self.rebuild_ann();
@@ -3816,7 +4164,49 @@ impl Database {
         self.persist_ann_to_disk()?;
         self.ann_dirty = false;
 
+        // Startup-speed sidecars: write the sparse index and the columnar
+        // vector arena so the next `open()` skips the per-record rebuilds.
+        // Best-effort — a failure here is logged via Err propagation but
+        // doesn't corrupt the main .vdb file (already renamed atomically
+        // above).
+        self.persist_sparse_index_to_disk()?;
+        self.persist_vector_arena_to_disk()?;
+
         Ok(())
+    }
+
+    /// Write the BM25 sparse index to its `.sparse` sidecar. When the
+    /// corpus has no sparse content, we just remove any stale sidecar so
+    /// the next open hits the "no sparse" fast path.
+    fn persist_sparse_index_to_disk(&self) -> Result<()> {
+        let path = sparse_index_path(&self.path);
+        if !self.any_sparse_record() {
+            if path.exists() {
+                let _ = fs::remove_file(&path);
+            }
+            return Ok(());
+        }
+        write_sparse_index(&path, &self.sparse_index)
+    }
+
+    /// Write the contiguous vector arena to its `.col.vector` sidecar.
+    /// Skip when the arena hasn't been materialised yet (no scan / no
+    /// bulk_ingest_array happened this session); skip when empty.
+    fn persist_vector_arena_to_disk(&self) -> Result<()> {
+        let path = vector_arena_path(&self.path);
+        let Some(arena) = self.vector_arena.as_ref() else {
+            if path.exists() {
+                let _ = fs::remove_file(&path);
+            }
+            return Ok(());
+        };
+        if arena.keys.is_empty() {
+            if path.exists() {
+                let _ = fs::remove_file(&path);
+            }
+            return Ok(());
+        }
+        write_vector_arena(&path, arena)
     }
 
     /// Create an atomic snapshot of the database at `dest`. The snapshot is a
@@ -4265,8 +4655,17 @@ impl Database {
             self.wal_entries_replayed = 0;
             return Ok(());
         }
+        // Skip the open+header-read pair when the file is empty.
+        if let Ok(meta) = fs::metadata(&self.wal_path) {
+            if meta.len() == 0 {
+                self.wal_entries_replayed = 0;
+                return Ok(());
+            }
+        }
 
-        let mut reader = BufReader::new(File::open(&self.wal_path)?);
+        // 256 KiB BufReader: amortises read() syscalls when the WAL has
+        // thousands of small ops to replay.
+        let mut reader = BufReader::with_capacity(256 * 1024, File::open(&self.wal_path)?);
         let mut magic = [0_u8; 4];
         if let Err(err) = reader.read_exact(&mut magic) {
             if err.kind() == ErrorKind::UnexpectedEof {
@@ -4692,7 +5091,8 @@ impl Database {
         }
 
         // Phase 2a: build-from-scratch for slots that just crossed the
-        // threshold.
+        // threshold. The build creates a single segment; further inserts
+        // may spill into new segments when the active one fills up.
         for ((opt_ns, vector_name), all_items) in fresh_builds {
             let records_for_build: Vec<(RecordKey, &Vec<f32>)> =
                 all_items.iter().map(|(k, v)| (k.clone(), v)).collect();
@@ -4711,7 +5111,10 @@ impl Database {
             }
         }
 
-        // Phase 2b: incremental appends into existing graphs.
+        // Phase 2b: incremental appends into existing indexes (one or more
+        // segments). When the active segment hits `segment_size_threshold`
+        // we open a new segment and route the rest of the batch there.
+        let segment_size = cfg.segment_size_threshold.max(1);
         for ((opt_ns, vector_name), new_items) in incremental {
             let idx_opt = match &opt_ns {
                 None => self.ann.global.get_mut(&vector_name),
@@ -4725,31 +5128,27 @@ impl Database {
                 continue;
             };
 
-            // hnsw_rs marks indexes that have been searched as "searching
-            // mode" (a hint that skips some bookkeeping in the data layer).
-            // Re-enable mutation mode before we insert — cheap toggle.
-            idx.hnsw.set_searching_mode(false);
-
-            if new_items.len() >= cfg.parallel_insert_threshold {
-                let start_id = idx.keys.len();
-                let batch: Vec<(&Vec<f32>, usize)> = new_items
-                    .iter()
-                    .enumerate()
-                    .map(|(offset, (_, v))| (v, start_id + offset))
-                    .collect();
-                idx.hnsw.parallel_insert_batch(&batch);
-                for (offset, (k, _)) in new_items.into_iter().enumerate() {
-                    let origin_id = start_id + offset;
-                    idx.key_to_origin.insert(k.clone(), origin_id);
-                    idx.keys.push(k);
+            for (key, vector) in new_items {
+                // Open a fresh segment if the active one is full. We build
+                // an empty HNSW with the same metric and `m`/`ef_construction`
+                // as the index's other segments.
+                let active_full = idx
+                    .segments
+                    .last()
+                    .map(|s| s.keys.len() >= segment_size)
+                    .unwrap_or(true);
+                if active_full {
+                    let new_seg = empty_ann_segment(self.metric, &cfg);
+                    idx.segments.push(new_seg);
                 }
-            } else {
-                for (key, vector) in new_items {
-                    let origin_id = idx.keys.len();
-                    idx.key_to_origin.insert(key.clone(), origin_id);
-                    idx.keys.push(key);
-                    idx.hnsw.insert_one(vector.as_slice(), origin_id);
-                }
+                let seg_idx = idx.segments.len() - 1;
+                let seg = idx.segments.last_mut().unwrap();
+                seg.hnsw.set_searching_mode(false);
+                let local_origin_id = seg.keys.len();
+                idx.key_to_location
+                    .insert(key.clone(), (seg_idx, local_origin_id));
+                seg.keys.push(key);
+                seg.hnsw.insert_one(vector.as_slice(), local_origin_id);
             }
         }
     }
@@ -4785,27 +5184,29 @@ impl Database {
 
     /// Mark the given record keys as deleted in every HNSW graph they live
     /// in. The graph itself is not modified — search filters tombstoned
-    /// `origin_id`s. A subsequent `compact()` will rebuild any graph whose
-    /// dead ratio exceeds `IndexConfig.tombstone_rebuild_pct`.
+    /// `(segment_idx, origin_id)`. A subsequent `compact()` will rebuild
+    /// any graph whose dead ratio exceeds
+    /// `IndexConfig.tombstone_rebuild_pct`.
     fn ann_apply_tombstones(&mut self, deleted_keys: &[RecordKey]) {
         if deleted_keys.is_empty() {
             return;
         }
         for key in deleted_keys {
-            // Global graphs (per vector_name): every graph that contains
-            // this key gets the corresponding origin_id tombstoned.
+            // Global graphs (per vector_name).
             for (_, idx) in self.ann.global.iter_mut() {
-                if let Some(&origin_id) = idx.key_to_origin.get(key) {
-                    idx.tombstones.insert(origin_id);
+                if let Some(&(seg_idx, origin_id)) = idx.key_to_location.get(key) {
+                    if let Some(seg) = idx.segments.get_mut(seg_idx) {
+                        seg.tombstones.insert(origin_id);
+                    }
                 }
             }
-            // Per-namespace graphs: only the namespace this key belongs to
-            // has a chance of containing it, but checking all of them is
-            // fine — `key_to_origin.get` is O(1) and misses immediately.
+            // Per-namespace graphs.
             for (_, indexes) in self.ann.namespaces.iter_mut() {
                 for (_, idx) in indexes.iter_mut() {
-                    if let Some(&origin_id) = idx.key_to_origin.get(key) {
-                        idx.tombstones.insert(origin_id);
+                    if let Some(&(seg_idx, origin_id)) = idx.key_to_location.get(key) {
+                        if let Some(seg) = idx.segments.get_mut(seg_idx) {
+                            seg.tombstones.insert(origin_id);
+                        }
                     }
                 }
             }
@@ -4899,35 +5300,58 @@ impl Database {
                 return false;
             }
 
-            // For ANN2 manifests, use the persisted keys verbatim — they
-            // match the `origin_id`s baked into the HNSW graph file. For
-            // ANN1 (no persisted keys), fall back to the recomputed
-            // BTreeMap-ordered list, which matches the way ANN1 graphs were
-            // always built.
-            let keys = if manifest_entry.keys.is_empty() {
-                expected_entry.keys.clone()
+            // Build the segments. ANN3+ manifests describe one or more
+            // segments; ANN2 describes exactly one; ANN1 had no key data
+            // at all so we fall back to the BTreeMap-ordered expected
+            // keys (single segment matches the pre-segmented era).
+            let segment_specs: Vec<Vec<RecordKey>> = if manifest_entry.segments.is_empty() {
+                // ANN1 fallback.
+                vec![
+                    expected_entry
+                        .segments
+                        .first()
+                        .map(|s| s.keys.clone())
+                        .unwrap_or_default(),
+                ]
             } else {
-                // Defensive: persisted keys length must agree with the
-                // declared record_count and the live record set, else the
-                // manifest is inconsistent and we'd rather rebuild than
-                // serve wrong neighbours.
-                if manifest_entry.keys.len() != manifest_entry.record_count {
-                    return false;
-                }
-                manifest_entry.keys.clone()
+                manifest_entry
+                    .segments
+                    .iter()
+                    .map(|s| s.keys.clone())
+                    .collect()
             };
 
-            let Some(index) = load_ann_index(
-                parent,
-                &ann_basename(
-                    &self.path,
-                    expected_entry.namespace.as_deref(),
-                    &expected_entry.vector_name,
-                ),
-                keys,
-                self.metric,
-            ) else {
+            // Defensive: sum of per-segment key counts must equal record_count.
+            let summed: usize = segment_specs.iter().map(Vec::len).sum();
+            if summed != manifest_entry.record_count {
                 return false;
+            }
+
+            let base = ann_basename(
+                &self.path,
+                expected_entry.namespace.as_deref(),
+                &expected_entry.vector_name,
+            );
+
+            let mut segments = Vec::with_capacity(segment_specs.len());
+            let mut key_to_location: HashMap<RecordKey, (usize, usize)> =
+                HashMap::with_capacity(summed);
+            for (seg_idx, keys) in segment_specs.into_iter().enumerate() {
+                let legacy_single = manifest_entry.segments.is_empty()
+                    || (manifest_entry.segments.len() == 1 && seg_idx == 0);
+                let basename = ann_segment_basename(&base, seg_idx, legacy_single);
+                for (origin_id, key) in keys.iter().enumerate() {
+                    key_to_location.insert(key.clone(), (seg_idx, origin_id));
+                }
+                let Some(segment) = load_ann_segment(parent, &basename, keys, self.metric) else {
+                    return false;
+                };
+                segments.push(segment);
+            }
+
+            let index = AnnIndex {
+                segments,
+                key_to_location,
             };
 
             if let Some(namespace) = expected_entry.namespace {
@@ -4955,20 +5379,27 @@ impl Database {
             return Ok(());
         }
 
-        // Use `actual_ann_entries` (NOT `expected_ann_entries`) so the
-        // persisted keys array matches the order the HNSW graph stored its
-        // `origin_id`s in. After incremental inserts the in-memory keys vec
-        // is in insertion order, which usually differs from BTreeMap order.
         let entries = self.actual_ann_entries();
+
+        // Remove any pre-existing segment files for the entries we're about
+        // to rewrite. We sweep `*.hnsw.{graph,data}` files whose name starts
+        // with the entry's base — covers both old single-segment names
+        // (basename.hnsw.graph) and new segmented names
+        // (basename.s0.hnsw.graph, basename.s1.hnsw.graph, …).
         for entry in &entries {
-            let basename = ann_basename(&self.path, entry.namespace.as_deref(), &entry.vector_name);
-            let graph_path = parent.join(format!("{basename}.hnsw.graph"));
-            let data_path = parent.join(format!("{basename}.hnsw.data"));
-            if graph_path.exists() {
-                fs::remove_file(&graph_path)?;
-            }
-            if data_path.exists() {
-                fs::remove_file(&data_path)?;
+            let base = ann_basename(&self.path, entry.namespace.as_deref(), &entry.vector_name);
+            if let Ok(dir) = fs::read_dir(parent) {
+                for ent in dir.flatten() {
+                    let Some(fname) = ent.file_name().to_str().map(String::from) else {
+                        continue;
+                    };
+                    if !fname.starts_with(&base) {
+                        continue;
+                    }
+                    if fname.ends_with(".hnsw.graph") || fname.ends_with(".hnsw.data") {
+                        let _ = fs::remove_file(ent.path());
+                    }
+                }
             }
 
             let index = match &entry.namespace {
@@ -4980,42 +5411,65 @@ impl Database {
                 None => self.ann.global.get(&entry.vector_name),
             };
             if let Some(index) = index {
-                index.hnsw.file_dump(parent, &basename)?;
+                let single = index.segments.len() == 1;
+                for (seg_idx, seg) in index.segments.iter().enumerate() {
+                    let basename = ann_segment_basename(&base, seg_idx, single);
+                    seg.hnsw.file_dump(parent, &basename)?;
+                }
             }
         }
 
         write_ann_manifest(&ann_manifest_path(&self.path), &entries)
     }
 
-    /// Like `expected_ann_entries`, but populates each entry's `keys` field
-    /// from the actual in-memory `AnnIndex.keys` array (insertion order).
-    /// This is what gets serialised into the ANN2 manifest, and matches the
-    /// `origin_id`s baked into the dumped HNSW graph files.
+    /// Like `expected_ann_entries`, but populates each entry's segments
+    /// from the actual in-memory `AnnIndex.segments[*].keys` arrays
+    /// (insertion order). This is what gets serialised into the ANN3
+    /// manifest, and matches the `origin_id`s baked into the dumped HNSW
+    /// graph files for each segment.
     fn actual_ann_entries(&self) -> Vec<AnnManifestEntry> {
         let mut entries = Vec::new();
         for (vector_name, index) in &self.ann.global {
-            if index.keys.len() < ANN_MIN_POINTS {
+            let total = index.total_count();
+            if total < ANN_MIN_POINTS {
                 continue;
+            }
+            let mut all_keys: Vec<RecordKey> = Vec::with_capacity(total);
+            let mut segments = Vec::with_capacity(index.segments.len());
+            for seg in &index.segments {
+                all_keys.extend(seg.keys.iter().cloned());
+                segments.push(AnnManifestSegment {
+                    keys: seg.keys.clone(),
+                });
             }
             entries.push(AnnManifestEntry {
                 namespace: None,
                 vector_name: vector_name.clone(),
-                record_count: index.keys.len(),
-                key_signature: record_key_signature(&index.keys),
-                keys: index.keys.clone(),
+                record_count: total,
+                key_signature: record_key_signature(&all_keys),
+                segments,
             });
         }
         for (namespace, indexes) in &self.ann.namespaces {
             for (vector_name, index) in indexes {
-                if index.keys.len() < ANN_MIN_POINTS {
+                let total = index.total_count();
+                if total < ANN_MIN_POINTS {
                     continue;
+                }
+                let mut all_keys: Vec<RecordKey> = Vec::with_capacity(total);
+                let mut segments = Vec::with_capacity(index.segments.len());
+                for seg in &index.segments {
+                    all_keys.extend(seg.keys.iter().cloned());
+                    segments.push(AnnManifestSegment {
+                        keys: seg.keys.clone(),
+                    });
                 }
                 entries.push(AnnManifestEntry {
                     namespace: Some(namespace.clone()),
                     vector_name: vector_name.clone(),
-                    record_count: index.keys.len(),
-                    key_signature: record_key_signature(&index.keys),
-                    keys: index.keys.clone(),
+                    record_count: total,
+                    key_signature: record_key_signature(&all_keys),
+                    segments,
                 });
             }
         }
@@ -5047,12 +5501,13 @@ impl Database {
             if keys.len() < ANN_MIN_POINTS {
                 continue;
             }
+            let segment = AnnManifestSegment { keys: keys.clone() };
             entries.push(AnnManifestEntry {
                 namespace: None,
                 vector_name,
                 record_count: keys.len(),
                 key_signature: record_key_signature(&keys),
-                keys,
+                segments: vec![segment],
             });
         }
 
@@ -5061,12 +5516,13 @@ impl Database {
                 if keys.len() < ANN_MIN_POINTS {
                     continue;
                 }
+                let segment = AnnManifestSegment { keys: keys.clone() };
                 entries.push(AnnManifestEntry {
                     namespace: Some(namespace.clone()),
                     vector_name,
                     record_count: keys.len(),
                     key_signature: record_key_signature(&keys),
-                    keys,
+                    segments: vec![segment],
                 });
             }
         }
@@ -5233,47 +5689,69 @@ impl Database {
                 .global
                 .get(vector_name.unwrap_or(DEFAULT_VECTOR_NAME)),
         }?;
-        // Gate on live (non-tombstoned) record count: if half the graph is
-        // dead, treat the live half as if it were the whole corpus.
         let live = index.live_count();
         if live < ANN_SEARCH_MIN_POINTS {
             return None;
         }
-
+        let total = index.total_count();
         let candidate_count = candidate_count(top_k, live);
         if candidate_count == 0 {
             return None;
         }
 
-        // ef_search controls recall vs latency at query time. When the user
-        // explicitly sets `IndexConfig.ef_search`, honour it directly.
-        // Otherwise default to max(candidate_count, ef_construction) which is
-        // a conservative high-recall heuristic.
-        let mut ef_search = match self.index_config.ef_search {
+        // ef_search controls recall vs latency at query time. The same value
+        // is used for every segment; a smaller per-segment `fetch_count` is
+        // sufficient because we merge results across segments below.
+        let ef_search = match self.index_config.ef_search {
             Some(ef) => ef.max(candidate_count),
             None => candidate_count.max(self.index_config.ef_construction),
         };
-        // Over-fetch to compensate for tombstoned candidates we'll drop. Cap
-        // at the live count so we don't waste work; we'd never get more
-        // distinct results than that anyway.
-        if !index.tombstones.is_empty() {
-            let dead = index.tombstones.len();
-            ef_search = ef_search
-                .saturating_add(dead.min(ef_search))
-                .min(index.keys.len());
+
+        // Per-segment over-fetch: each segment is small, and we'll dedup
+        // & sort across segments below, so it's fine to ask each one for
+        // `candidate_count` results (plus a small headroom for tombstones).
+        let tomb_total = index.tombstone_count();
+        let dead_headroom = tomb_total.min(candidate_count);
+        let fetch_per_seg = candidate_count
+            .saturating_add(dead_headroom)
+            .min(total.max(1));
+
+        // Score-keyed merge across segments: collect (distance, key) tuples,
+        // sort ascending (hnsw_rs distances are "smaller = closer"), trim to
+        // candidate_count. For very large segment counts a BinaryHeap would
+        // be faster, but for the typical 1–20 segments the constant factor
+        // of sort_by() is fine.
+        let mut merged: Vec<(f32, RecordKey)> =
+            Vec::with_capacity(index.segments.len().saturating_mul(fetch_per_seg));
+        for seg in &index.segments {
+            if seg.keys.is_empty() {
+                continue;
+            }
+            let neighbours = seg.hnsw.search(query, fetch_per_seg, ef_search);
+            for n in neighbours {
+                if seg.tombstones.contains(&n.d_id) {
+                    continue;
+                }
+                if let Some(key) = seg.keys.get(n.d_id) {
+                    merged.push((n.distance, key.clone()));
+                }
+            }
         }
-        let fetch_count = candidate_count
-            .saturating_add(index.tombstones.len().min(candidate_count))
-            .min(index.keys.len());
-        let neighbours = index.hnsw.search(query, fetch_count, ef_search);
-        Some(
-            neighbours
-                .into_iter()
-                .filter(|n| !index.tombstones.contains(&n.d_id))
-                .filter_map(|neighbour| index.keys.get(neighbour.d_id).cloned())
-                .take(candidate_count)
-                .collect(),
-        )
+        // Sort by distance ascending — smaller = closer for hnsw_rs.
+        merged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Dedup defensively (a key shouldn't appear in two segments, but
+        // be paranoid in case of a buggy ingest path).
+        let mut seen: HashSet<RecordKey> = HashSet::with_capacity(candidate_count);
+        let mut out = Vec::with_capacity(candidate_count);
+        for (_, key) in merged {
+            if seen.insert(key.clone()) {
+                out.push(key);
+                if out.len() >= candidate_count {
+                    break;
+                }
+            }
+        }
+        if out.is_empty() { None } else { Some(out) }
     }
 
     fn sparse_candidate_keys(
@@ -5536,6 +6014,37 @@ fn score_dense_prefix(
     metric.score(&left[..dimension], &right[..dimension])
 }
 
+/// Build an empty single-segment HNSW. Used when a slot rolls over to a
+/// fresh active segment during incremental insertion. Capacity is sized at
+/// the segment_size_threshold so the inner Vec doesn't reallocate as the
+/// segment fills up.
+fn empty_ann_segment(metric: DistanceMetric, config: &IndexConfig) -> AnnSegment {
+    let cap = config.segment_size_threshold.max(1024);
+    let max_layer = compute_hnsw_layers(cap);
+    macro_rules! empty_hnsw {
+        ($dist_type:ty, $dist_val:expr, $variant:ident) => {{
+            let hnsw = Hnsw::<f32, $dist_type>::new(
+                config.m,
+                cap,
+                max_layer,
+                config.ef_construction,
+                $dist_val,
+            );
+            AnnSegment {
+                hnsw: AnnHnsw::$variant(hnsw),
+                keys: Vec::new(),
+                tombstones: HashSet::new(),
+            }
+        }};
+    }
+    match metric {
+        DistanceMetric::Cosine => empty_hnsw!(DistCosine, DistCosine {}, Cosine),
+        DistanceMetric::Euclidean => empty_hnsw!(DistL2, DistL2 {}, Euclidean),
+        DistanceMetric::DotProduct => empty_hnsw!(DistDot, DistDot {}, DotProduct),
+        DistanceMetric::Manhattan => empty_hnsw!(DistL1, DistL1 {}, Manhattan),
+    }
+}
+
 fn build_ann_index(
     records: Vec<(RecordKey, &Vec<f32>)>,
     metric: DistanceMetric,
@@ -5555,42 +6064,35 @@ fn build_ann_index(
                 $dist_val,
             );
             let mut keys = Vec::with_capacity(count);
-            let mut key_to_origin = HashMap::with_capacity(count);
             if use_parallel {
-                // hnsw_rs's `parallel_insert` takes `&[(&Vec<T>, usize)]`
-                // (the API is built around owned-Vec borrows) and uses Rayon
-                // internally so the dominant cost (distance calculations
-                // during graph neighbour selection) is multi-threaded.
                 let mut batch: Vec<(&Vec<f32>, usize)> = Vec::with_capacity(count);
                 for (origin_id, (key, vector)) in records.into_iter().enumerate() {
                     batch.push((vector, origin_id));
-                    key_to_origin.insert(key.clone(), origin_id);
                     keys.push(key);
                 }
                 hnsw.parallel_insert(&batch);
             } else {
                 for (origin_id, (key, vector)) in records.into_iter().enumerate() {
                     hnsw.insert((vector.as_slice(), origin_id));
-                    key_to_origin.insert(key.clone(), origin_id);
                     keys.push(key);
                 }
             }
             hnsw.set_searching_mode(true);
-            AnnIndex {
+            AnnSegment {
                 hnsw: AnnHnsw::$variant(hnsw),
                 keys,
-                key_to_origin,
                 tombstones: HashSet::new(),
             }
         }};
     }
 
-    match metric {
+    let segment = match metric {
         DistanceMetric::Cosine => build_hnsw!(DistCosine, DistCosine {}, Cosine),
         DistanceMetric::Euclidean => build_hnsw!(DistL2, DistL2 {}, Euclidean),
         DistanceMetric::DotProduct => build_hnsw!(DistDot, DistDot {}, DotProduct),
         DistanceMetric::Manhattan => build_hnsw!(DistL1, DistL1 {}, Manhattan),
-    }
+    };
+    AnnIndex::from_single(segment)
 }
 
 fn compute_hnsw_layers(record_count: usize) -> usize {
@@ -5640,6 +6142,23 @@ fn quantization_params_path(path: &Path) -> PathBuf {
 fn multi_vector_quantization_params_path(path: &Path, space: &str) -> PathBuf {
     let mut p = path.as_os_str().to_os_string();
     p.push(format!(".mvquant.{space}"));
+    PathBuf::from(p)
+}
+
+/// Sidecar where the BM25 sparse index is persisted to skip the O(N)
+/// rebuild on every `open()`. See `persist_sparse_index_to_disk`.
+fn sparse_index_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_os_string();
+    p.push(".sparse");
+    PathBuf::from(p)
+}
+
+/// Sidecar where the contiguous vector arena is persisted to enable
+/// columnar-style loading at startup (one bulk read instead of iterating
+/// every record's vector).
+fn vector_arena_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_os_string();
+    p.push(".col.vector");
     PathBuf::from(p)
 }
 
@@ -5767,6 +6286,19 @@ fn ann_basename(path: &Path, namespace: Option<&str>, vector_name: &str) -> Stri
     format!("{stem}.ann.{ns_part}.{vn_part}")
 }
 
+/// For a (namespace, vector_name) entry that has one or more segments, the
+/// segment basename is the entry basename plus `.sN`. When the index has
+/// exactly one segment AND we're loading from an old (ANN1/ANN2) layout
+/// that wrote plain `basename.hnsw.graph` (no segment suffix), we preserve
+/// that name for backwards compatibility — pass `legacy_single = true`.
+fn ann_segment_basename(entry_base: &str, segment_idx: usize, legacy_single: bool) -> String {
+    if legacy_single {
+        entry_base.to_owned()
+    } else {
+        format!("{entry_base}.s{segment_idx}")
+    }
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -5804,27 +6336,21 @@ fn record_key_signature(keys: &[RecordKey]) -> u64 {
     state
 }
 
-fn load_ann_index(
+fn load_ann_segment(
     directory: &Path,
     basename: &str,
     keys: Vec<RecordKey>,
     metric: DistanceMetric,
-) -> Option<AnnIndex> {
+) -> Option<AnnSegment> {
     let reloader = Box::leak(Box::new(HnswIo::new(directory, basename)));
 
     macro_rules! load_with_dist {
         ($dist_val:expr, $variant:ident) => {{
             let mut hnsw = reloader.load_hnsw_with_dist($dist_val).ok()?;
             hnsw.set_searching_mode(true);
-            let key_to_origin = keys
-                .iter()
-                .enumerate()
-                .map(|(i, k)| (k.clone(), i))
-                .collect();
-            Some(AnnIndex {
+            Some(AnnSegment {
                 hnsw: AnnHnsw::$variant(hnsw),
                 keys,
-                key_to_origin,
                 tombstones: HashSet::new(),
             })
         }};
@@ -5838,16 +6364,176 @@ fn load_ann_index(
     }
 }
 
-/// Write the ANN sidecar manifest. We use format `ANN2`, which (compared to
-/// the original `ANN1`) also serialises the actual key array per index in
-/// the order the HNSW knows its `origin_id`s. This is required for
-/// incremental insertion: without it, a reload would associate the wrong
-/// (BTreeMap-ordered) record key with each HNSW origin_id whenever the in
-/// memory key array isn't sorted (which happens any time we incrementally
-/// append).
+/// Write the BM25 sparse-index sidecar.  Skipping the O(N) postings rebuild
+/// on every `open()` is the dominant startup win for any database with
+/// non-trivial sparse content (lex queries, hybrid search, etc.).
+///
+/// On-disk format `SPRS1`:
+///   magic "SPRS1"
+///   doc_count u64
+///   avg_doc_len f32
+///   num_doc_lengths u64; for each: (ns,id,len)
+///   num_terms u64; for each: term (string), num_postings u32,
+///     then [ns,id,term_weight] × num_postings
+fn write_sparse_index(path: &Path, idx: &SparseIndex) -> Result<()> {
+    let mut file = BufWriter::with_capacity(64 * 1024, File::create(path)?);
+    file.write_all(b"SPRS1")?;
+    write_u64(&mut file, u64_from_usize(idx.doc_count)?)?;
+    file.write_all(&idx.avg_doc_len.to_le_bytes())?;
+    write_u64(&mut file, u64_from_usize(idx.doc_lengths.len())?)?;
+    for ((ns, id), len) in &idx.doc_lengths {
+        write_string(&mut file, ns)?;
+        write_string(&mut file, id)?;
+        file.write_all(&len.to_le_bytes())?;
+    }
+    write_u64(&mut file, u64_from_usize(idx.postings.len())?)?;
+    for (term, postings) in &idx.postings {
+        write_string(&mut file, term)?;
+        write_u32(&mut file, u32_from_usize(postings.len())?)?;
+        for p in postings {
+            write_string(&mut file, &p.key.0)?;
+            write_string(&mut file, &p.key.1)?;
+            file.write_all(&p.term_weight.to_le_bytes())?;
+        }
+    }
+    file.flush()?;
+    file.get_ref().sync_all()?;
+    Ok(())
+}
+
+fn read_sparse_index(path: &Path) -> Result<SparseIndex> {
+    let mut file = BufReader::with_capacity(64 * 1024, File::open(path)?);
+    let mut magic = [0_u8; 5];
+    file.read_exact(&mut magic)?;
+    if &magic != b"SPRS1" {
+        return Err(VectLiteError::InvalidFormat(
+            "invalid sparse-index sidecar".to_owned(),
+        ));
+    }
+    let doc_count = usize_from_u64(read_u64(&mut file)?)?;
+    let mut buf4 = [0_u8; 4];
+    file.read_exact(&mut buf4)?;
+    let avg_doc_len = f32::from_le_bytes(buf4);
+    let mut idx = SparseIndex {
+        doc_count,
+        avg_doc_len,
+        ..Default::default()
+    };
+    let num_lens = usize_from_u64(read_u64(&mut file)?)?;
+    for _ in 0..num_lens {
+        let ns = read_string(&mut file)?;
+        let id = read_string(&mut file)?;
+        file.read_exact(&mut buf4)?;
+        let len = f32::from_le_bytes(buf4);
+        idx.doc_lengths.insert((ns, id), len);
+    }
+    let num_terms = usize_from_u64(read_u64(&mut file)?)?;
+    for _ in 0..num_terms {
+        let term = read_string(&mut file)?;
+        let np = usize_from_u32(read_u32(&mut file)?)?;
+        let mut postings = Vec::with_capacity(np);
+        for _ in 0..np {
+            let ns = read_string(&mut file)?;
+            let id = read_string(&mut file)?;
+            file.read_exact(&mut buf4)?;
+            let w = f32::from_le_bytes(buf4);
+            postings.push(SparsePosting {
+                key: (ns, id),
+                term_weight: w,
+            });
+        }
+        idx.postings.insert(term, postings);
+    }
+    Ok(idx)
+}
+
+/// Write the contiguous vector arena to a sidecar so the next `open()`
+/// can `mmap`-style load it in one read instead of building it record by
+/// record. On-disk format `VCOL1`:
+///   magic "VCOL1"  dim u32  count u64
+///   [ns,id] × count   keys (variable-length)
+///   f32 × count*dim   contiguous vector bytes (little-endian)
+fn write_vector_arena(path: &Path, arena: &VectorArena) -> Result<()> {
+    let mut file = BufWriter::with_capacity(256 * 1024, File::create(path)?);
+    file.write_all(b"VCOL1")?;
+    write_u32(&mut file, u32_from_usize(arena.dim)?)?;
+    write_u64(&mut file, u64_from_usize(arena.keys.len())?)?;
+    for (ns, id) in &arena.keys {
+        write_string(&mut file, ns)?;
+        write_string(&mut file, id)?;
+    }
+    // Convert f32 slice → byte slice via to_le_bytes per element.
+    // (We can't safely transmute on big-endian hosts.)
+    if cfg!(target_endian = "little") {
+        // SAFETY: f32 has well-defined byte layout, same align as u8 array;
+        // on LE the in-memory bytes are already the on-disk bytes.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                arena.buf.as_ptr() as *const u8,
+                arena.buf.len() * std::mem::size_of::<f32>(),
+            )
+        };
+        file.write_all(bytes)?;
+    } else {
+        let mut buf = [0_u8; 4];
+        for v in &arena.buf {
+            buf.copy_from_slice(&v.to_le_bytes());
+            file.write_all(&buf)?;
+        }
+    }
+    file.flush()?;
+    file.get_ref().sync_all()?;
+    Ok(())
+}
+
+fn read_vector_arena(path: &Path) -> Result<VectorArena> {
+    let mut file = BufReader::with_capacity(256 * 1024, File::open(path)?);
+    let mut magic = [0_u8; 5];
+    file.read_exact(&mut magic)?;
+    if &magic != b"VCOL1" {
+        return Err(VectLiteError::InvalidFormat(
+            "invalid vector-arena sidecar".to_owned(),
+        ));
+    }
+    let dim = usize_from_u32(read_u32(&mut file)?)?;
+    let count = usize_from_u64(read_u64(&mut file)?)?;
+    let mut arena = VectorArena::new(dim);
+    arena.keys.reserve(count);
+    arena.key_to_index.reserve(count);
+    arena.buf.reserve(count * dim);
+    for _ in 0..count {
+        let ns = read_string(&mut file)?;
+        let id = read_string(&mut file)?;
+        arena
+            .key_to_index
+            .insert((ns.clone(), id.clone()), arena.keys.len());
+        arena.keys.push((ns, id));
+    }
+    let f32_bytes = count * dim * std::mem::size_of::<f32>();
+    let mut bytes = vec![0_u8; f32_bytes];
+    file.read_exact(&mut bytes)?;
+    if cfg!(target_endian = "little") {
+        // SAFETY: bytes is exactly count*dim*4 bytes; we reinterpret as f32.
+        let floats: &[f32] =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, count * dim) };
+        arena.buf.extend_from_slice(floats);
+    } else {
+        let mut buf = [0_u8; 4];
+        for i in 0..(count * dim) {
+            buf.copy_from_slice(&bytes[i * 4..(i + 1) * 4]);
+            arena.buf.push(f32::from_le_bytes(buf));
+        }
+    }
+    Ok(arena)
+}
+
+/// Write the ANN sidecar manifest. We use format `ANN3`, which on top of
+/// `ANN2` allows multiple segments per (namespace, vector_name) entry, in
+/// support of LSM-tree-style segmented HNSW. ANN1/ANN2 manifests can still
+/// be read for backwards compatibility (they're treated as 1-segment).
 fn write_ann_manifest(path: &Path, entries: &[AnnManifestEntry]) -> Result<()> {
     let mut file = BufWriter::new(File::create(path)?);
-    file.write_all(b"ANN2")?;
+    file.write_all(b"ANN3")?;
     write_u32(&mut file, u32_from_usize(entries.len())?)?;
     for entry in entries {
         write_u8(&mut file, u8::from(entry.namespace.is_some()))?;
@@ -5857,11 +6543,14 @@ fn write_ann_manifest(path: &Path, entries: &[AnnManifestEntry]) -> Result<()> {
         write_string(&mut file, &entry.vector_name)?;
         write_u64(&mut file, u64_from_usize(entry.record_count)?)?;
         write_u64(&mut file, entry.key_signature)?;
-        // ANN2 addition: the full keys array in insertion order.
-        write_u64(&mut file, u64_from_usize(entry.keys.len())?)?;
-        for (ns, id) in &entry.keys {
-            write_string(&mut file, ns)?;
-            write_string(&mut file, id)?;
+        // ANN3 addition: per-segment data.
+        write_u32(&mut file, u32_from_usize(entry.segments.len())?)?;
+        for seg in &entry.segments {
+            write_u64(&mut file, u64_from_usize(seg.keys.len())?)?;
+            for (ns, id) in &seg.keys {
+                write_string(&mut file, ns)?;
+                write_string(&mut file, id)?;
+            }
         }
     }
     file.flush()?;
@@ -5876,6 +6565,7 @@ fn read_ann_manifest(path: &Path) -> Result<Vec<AnnManifestEntry>> {
     let version = match &magic {
         b"ANN1" => 1u8,
         b"ANN2" => 2u8,
+        b"ANN3" => 3u8,
         _ => {
             return Err(VectLiteError::InvalidFormat(
                 "invalid ANN manifest".to_owned(),
@@ -5895,27 +6585,45 @@ fn read_ann_manifest(path: &Path) -> Result<Vec<AnnManifestEntry>> {
         let vector_name = read_string(&mut file)?;
         let record_count = usize_from_u64(read_u64(&mut file)?)?;
         let key_signature = read_u64(&mut file)?;
-        let keys = if version >= 2 {
-            let n = usize_from_u64(read_u64(&mut file)?)?;
-            let mut keys = Vec::with_capacity(n);
-            for _ in 0..n {
-                let ns = read_string(&mut file)?;
-                let id = read_string(&mut file)?;
-                keys.push((ns, id));
+        let segments = match version {
+            1 => {
+                // ANN1: no persisted keys at all; caller falls back to
+                // recomputing them from `self.records` (BTreeMap order).
+                Vec::new()
             }
-            keys
-        } else {
-            // ANN1 had no persisted keys; caller falls back to recomputing
-            // them from `self.records` (which yields BTreeMap-sorted keys,
-            // matching the order ANN1 indexes were always built in).
-            Vec::new()
+            2 => {
+                let n = usize_from_u64(read_u64(&mut file)?)?;
+                let mut keys = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let ns = read_string(&mut file)?;
+                    let id = read_string(&mut file)?;
+                    keys.push((ns, id));
+                }
+                // ANN2 was always single-segment.
+                vec![AnnManifestSegment { keys }]
+            }
+            _ => {
+                let num_segs = usize_from_u32(read_u32(&mut file)?)?;
+                let mut segments = Vec::with_capacity(num_segs);
+                for _ in 0..num_segs {
+                    let n = usize_from_u64(read_u64(&mut file)?)?;
+                    let mut keys = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let ns = read_string(&mut file)?;
+                        let id = read_string(&mut file)?;
+                        keys.push((ns, id));
+                    }
+                    segments.push(AnnManifestSegment { keys });
+                }
+                segments
+            }
         };
         entries.push(AnnManifestEntry {
             namespace,
             vector_name,
             record_count,
             key_signature,
-            keys,
+            segments,
         });
     }
     Ok(entries)

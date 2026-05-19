@@ -1,6 +1,6 @@
 {
   "name": "vectlite",
-  "version": "0.11.0",
+  "version": "0.13.0",
   "description": "Embedded vector store for local-first AI applications.",
   "main": "index.js",
   "types": "index.d.ts",

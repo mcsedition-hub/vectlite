@@ -118,6 +118,7 @@ test('index tuning is exposed on public wrapper', () => {
     ef_search: null,
     parallel_insert_threshold: 256,
     tombstone_rebuild_pct: 30,
+    segment_size_threshold: 50000,
   })
 
   db.setEfSearch(40)
@@ -135,6 +136,7 @@ test('index tuning is exposed on public wrapper', () => {
     ef_search: 40,
     parallel_insert_threshold: 9999,
     tombstone_rebuild_pct: 40,
+    segment_size_threshold: 50000,
   })
 
   db.setEfSearch(null)
@@ -160,11 +162,51 @@ test('index tuning is exposed on public wrapper', () => {
     ef_search: 80,
     parallel_insert_threshold: 1,
     tombstone_rebuild_pct: 50,
+    segment_size_threshold: 50000,
   })
 
   assert.throws(() => db.setIndexConfig({ m: 0 }), /IndexConfig\.m/)
   assert.throws(() => db.setIndexConfig({ tombstoneRebuildPct: 101 }), /tombstone_rebuild_pct/)
   assert.throws(() => db.setIndexConfig(), /requires at least one field/)
+})
+
+test('bulkIngestArray ingests Float32Array data and exposes HNSW segments', () => {
+  const dbPath = tempPath('bulk-array.vdb')
+  const db = vectlite.open(dbPath, { dimension: 2 })
+
+  db.upsert('seed', [0, 1], { idx: -1 })
+
+  const ids = Array.from({ length: 40 }, (_, i) => `doc${i}`)
+  const vectors = new Float32Array(ids.length * 2)
+  for (let i = 0; i < ids.length; i += 1) {
+    vectors[i * 2] = 1 - (i / 400)
+    vectors[(i * 2) + 1] = i / 400
+  }
+  const count = db.bulkIngestArray(ids, vectors, 2, {
+    metadata: ids.map((id, idx) => ({ id, idx })),
+    batchSize: 2,
+    segmentSizeThreshold: 10,
+    parallelInsertThreshold: 1,
+  })
+
+  assert.equal(count, ids.length)
+  assert.equal(db.count(), 41)
+  assert.equal(db.vectorArenaLen(), 41)
+  assert.equal(db.get('doc3').metadata.idx, 3)
+  assert.equal(db.indexConfig().segment_size_threshold, 10)
+  assert.equal(db.annSegmentCount(), 1)
+  for (let i = 0; i < 21; i += 1) {
+    db.upsert(`tail${i}`, [0.5, 0.5], { idx: 40 + i })
+  }
+  assert.equal(db.count(), 62)
+  assert.equal(db.vectorArenaLen(), 62)
+  assert.equal(db.annSegmentCount() >= 3, true)
+  assert.equal(db.search([1, 0], { k: 1 })[0].id, 'doc0')
+
+  assert.throws(
+    () => db.bulkIngestArray(['bad'], new Float32Array([1, 2, 3]), 2),
+    /vectors_flat has 3 floats/,
+  )
 })
 
 test('store and text helpers', () => {

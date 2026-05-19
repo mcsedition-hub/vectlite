@@ -4,6 +4,156 @@ All notable changes to `vectlite` will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows Semantic Versioning while the public API stabilizes.
 
+## [0.13.0] - 2026-05-19
+
+### Startup latency
+
+Opening a non-trivial database used to do four O(N)-or-worse passes over
+every record on every `open()`:
+
+1. `rebuild_sparse_index()` — iterate all records, BM25 posting lists.
+2. `try_load_ann_from_disk()` → `rebuild_ann()` fallback.
+3. `rebuild_payload_indexes()` (when indexes existed).
+4. Implicit O(N) walks via the BTreeMap to rebuild quantization codes.
+
+This release replaces (1) and (4) with on-disk sidecars, gates (3) on
+having actual definitions, and skips them entirely for empty databases.
+The dominant remaining cost is then just the bulk read of the `.vdb`
+file itself, which is now done through a 256 KiB `BufReader`.
+
+- **`.sparse` sidecar.** The BM25 sparse index is written at every
+  `flush()` / `compact()` and loaded directly at `open()`. Dense-only
+  databases (no record carries any sparse content) skip the index path
+  entirely. New format `SPRS1`.
+- **`.col.vector` sidecar.** The contiguous `VectorArena` is persisted
+  at every compact and reloaded on open in one bulk read, which gives
+  the columnar fast path a warm start without iterating records. New
+  format `VCOL1`. On little-endian hosts (x86_64 / aarch64) the load is
+  a single `read_exact` into a pre-sized buffer + a reinterpret —
+  essentially memcpy speed.
+- **`startup_load_indexes()` orchestrator** that prefers sidecars,
+  falls back to in-memory rebuild only when the WAL replay changed the
+  record set (so the sidecar would be stale).
+- **`replay_wal` fast path** when the WAL file is missing or zero-byte,
+  and a 256 KiB `BufReader` for non-trivial replays.
+- **Empty-database fast path** — `open()` on a freshly-created
+  database now skips every rebuild call.
+
+### Columnar bulk ingest
+
+`bulk_ingest_array` now writes the entire `vectors_flat` slice into the
+arena via a single `extend_from_slice` (one memcpy on LE hosts) instead
+of N small `slice.to_vec()` allocations. The arena is left in a clean
+state so the *next* `compact()` writes the columnar sidecar straight
+away — i.e. the first ingest already pays for the next open to be fast.
+
+The `Record` public API is unchanged (`Record.vector: Vec<f32>` is kept
+for compat). True format-v8 with arena-backed `Record`s — where the per
+record `Vec<f32>` goes away entirely — is the next milestone; see the
+follow-up note below.
+
+### Follow-ups (not in this release)
+
+- **Format `.vdb` v8** with arena-backed Records (`Record.vector`
+  becomes an arena handle). Requires a clean break of the public Record
+  API. Would let `bulk_ingest_array` skip the N owned `Vec<f32>` clones
+  it still does for backwards compat.
+- **Payload index data sidecar** (`.pidx.data`). Today the *defs* are
+  persisted but the per-record index data is rebuilt on every open.
+  Worth it for users with several large keyword/numeric indexes.
+- **HNSW segment construction parallelised** across segments during
+  bulk_ingest (currently each segment builds with `parallel_insert`
+  internally, but segments build sequentially).
+
+## [0.12.0] - 2026-05-19
+
+### Performance — Python / Node ingestion path
+
+This release fixes the two big "leaks" between the fast Rust core (0.11) and
+the bindings, plus adds two architectural pieces that make vectlite top-tier
+for bulk ingestion.
+
+**Critical fix: single-record routing.** `db.insert()` / `db.upsert()` in
+both the Python and Node bindings previously routed to the core
+`insert_many(once(record))` path, which always triggered a full HNSW
+rebuild + persist per record. They now route to the new
+`Database::insert_record` / `upsert_record` (incremental WAL-batch path),
+so streaming-style writes finally use the 0.11 incremental graph
+updates. This is the single biggest binding-side fix — single-insert
+throughput goes from ~150 vec/s back to the multi-thousand vec/s the
+core can actually deliver.
+
+**Zero-copy bulk ingest from native arrays.**
+- Python: `db.bulk_ingest_array(ids, vectors, metadata=None, ...)` takes
+  a `numpy.ndarray[float32]` of shape `(N, D)`. No per-record dict
+  parsing, no per-element Python→Rust object crossing. 10–30× faster
+  than `bulk_ingest(list_of_dicts)` on large batches.
+- Node: `db.bulkIngestArray(ids, vectorsFlat, dim, options?)` takes a
+  `Float32Array`. The vector data is *not* JSON-serialised between JS
+  and Rust — napi-rs gives the Rust side a reference into the
+  underlying `ArrayBuffer`. The old `bulkIngest(records)` path
+  (JSON-stringify the entire batch) is preserved for compat but should
+  not be used for hot paths.
+
+**GIL release on Python write paths.** `insert`, `upsert`, `insert_many`,
+`upsert_many`, `bulk_ingest`, and `bulk_ingest_array` all wrap the
+underlying Rust ingest call in `py.allow_threads(|| { ... })`. Other
+Python threads can now make progress during ingestion.
+
+### HNSW segmenting (LSM-tree style)
+
+`AnnIndex` is now composed of one or more `AnnSegment`s. New inserts
+land in the "active" segment until it hits
+`IndexConfig.segment_size_threshold` (default 50_000), at which point a
+new active segment is started. Search queries every segment and merges
+top-K with a distance-sorted dedup.
+
+Wins:
+- Per-insert HNSW cost stays roughly bounded (`O(log segment_size)`
+  instead of `O(log total)`), so streaming throughput doesn't degrade as
+  the corpus grows.
+- Sets up future parallel segment construction during bulk ingest.
+- New `Database::ann_segment_count(namespace, vector_name)` accessor
+  for observability (also exposed to Python / Node).
+
+Manifest format bumped to `ANN3` (which tracks per-segment keys and
+filenames). `ANN1` and `ANN2` manifests remain readable for backwards
+compat (treated as 1-segment indexes).
+
+### New core API
+
+- `Database::insert_record(record)` / `upsert_record(record)`: insert a
+  fully-formed `Record` through the incremental WAL-batch path. This is
+  the entry point bindings should use for `db.insert()`.
+- `Database::bulk_ingest_array(ids, vectors_flat, dim, metadata, ...)`:
+  high-throughput bulk entry that takes a flat `&[f32]` buffer plus a
+  parallel `Vec<String>` of ids. Pre-grows the arena, builds records in
+  one pass, single fsync at the end.
+- `Database::ann_segment_count`.
+- `IndexConfig.segment_size_threshold` (default 50_000).
+
+### Binding additions
+
+**Python (`vectlite`):**
+- `db.bulk_ingest_array(ids, vectors, metadata=None, ...)` — NumPy
+  zero-copy bulk ingest.
+- `db.ann_segment_count(namespace=None, vector_name=None)`.
+- `db.bulk_ingest`, `db.set_index_config`, `db.index_config()`,
+  `db.bulk_ingest_array` all accept / expose `segment_size_threshold`.
+- All write paths now release the GIL.
+- New runtime dep: `numpy>=1.23` in the Python package metadata, plus
+  Rust-side `numpy = "0.23"` for the PyO3 array bridge.
+
+**Node (`vectlite`):**
+- `db.bulkIngestArray(ids, vectorsFlat, dim, options?)` — Float32Array
+  zero-copy bulk ingest.
+- `db.annSegmentCount(namespace?, vectorName?)`.
+- `bulkIngest`, `bulkIngestAsync`, `setIndexConfig`, `indexConfig`,
+  `bulkIngestArray` all accept / expose `segmentSizeThreshold`.
+- New TS types: `BulkIngestArrayOptions`, `IndexConfig` /
+  `SetIndexConfigOptions` extended with `segment_size_threshold` /
+  `segmentSizeThreshold`.
+
 ## [0.11.0] - 2026-05-18
 
 ### Performance

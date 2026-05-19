@@ -123,6 +123,17 @@ export interface BulkIngestOptions {
    * HNSW rebuild. Default 30. Set to 100 to disable automatic rebuild.
    */
   tombstoneRebuildPct?: number | null
+  /**
+   * Soft cap on the number of vectors per HNSW segment. Once the active
+   * segment hits this size, a new segment is started for subsequent
+   * inserts. Default 50_000.
+   */
+  segmentSizeThreshold?: number | null
+}
+
+export interface BulkIngestArrayOptions extends BulkIngestOptions {
+  /** Per-record metadata (one entry per id, may contain nulls). */
+  metadata?: Array<object | null>
 }
 
 export interface IndexConfig {
@@ -131,6 +142,7 @@ export interface IndexConfig {
   ef_search: number | null
   parallel_insert_threshold: number
   tombstone_rebuild_pct: number
+  segment_size_threshold: number
 }
 
 export interface SetIndexConfigOptions {
@@ -139,6 +151,7 @@ export interface SetIndexConfigOptions {
   efSearch?: number | null
   parallelInsertThreshold?: number | null
   tombstoneRebuildPct?: number | null
+  segmentSizeThreshold?: number | null
 }
 
 /** WAL fsync mode. See `Database.setWalSyncMode`. */
@@ -256,6 +269,27 @@ export class Database {
   insertMany(records: Record[], options?: { namespace?: string | null }): number
   upsertMany(records: Record[], options?: { namespace?: string | null }): number
   bulkIngest(records: Record[], options?: BulkIngestOptions): number
+  /**
+   * Zero-copy bulk ingest from a Float32Array. 10–30× faster than
+   * `bulkIngest(records)` because the vector data isn't JSON-serialised
+   * between JS and Rust.
+   *
+   * @param ids          N record ids
+   * @param vectorsFlat  Float32Array of length N * dim (row-major)
+   * @param dim          must equal db.dimension
+   */
+  bulkIngestArray(
+    ids: string[],
+    vectorsFlat: Float32Array,
+    dim: number,
+    options?: BulkIngestArrayOptions,
+  ): number
+  /**
+   * Number of HNSW segments in the active index for the given
+   * (namespace, vectorName). Returns 0 when no graph exists. Useful for
+   * tests and observability.
+   */
+  annSegmentCount(namespace?: string | null, vectorName?: string | null): number
   /** Get the current HNSW configuration. */
   indexConfig(): IndexConfig
   /** Adjust query-time `ef_search` only (no rebuild). `null` reverts to auto. */

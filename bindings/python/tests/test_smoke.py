@@ -6,6 +6,8 @@ import pytest
 
 import vectlite
 
+np = pytest.importorskip("numpy")
+
 
 def embed(text: str) -> list[float]:
     text = text.lower()
@@ -503,6 +505,43 @@ def test_bulk_ingest(tmp_path: Path) -> None:
     assert db.get("doc49") is not None
 
 
+def test_bulk_ingest_array(tmp_path: Path) -> None:
+    """bulk_ingest_array writes NumPy data and keeps the vector arena complete."""
+    path = tmp_path / "bulk_array.vdb"
+    db = vectlite.open(str(path), dimension=2)
+    db.upsert("seed", [0.0, 1.0], {"idx": -1})
+
+    ids = [f"doc{i}" for i in range(40)]
+    vectors = np.empty((len(ids), 2), dtype=np.float32)
+    for i in range(len(ids)):
+        vectors[i, 0] = 1.0 - (i / 400)
+        vectors[i, 1] = i / 400
+    count = db.bulk_ingest_array(
+        ids,
+        vectors,
+        metadata=[{"idx": i} for i in range(len(ids))],
+        batch_size=2,
+        segment_size_threshold=10,
+        parallel_insert_threshold=1,
+    )
+
+    assert count == len(ids)
+    assert len(db) == 41
+    assert db.vector_arena_len() == 41
+    assert db.get("doc3")["metadata"]["idx"] == 3
+    assert db.index_config()["segment_size_threshold"] == 10
+    assert db.ann_segment_count() == 1
+    for i in range(21):
+        db.upsert(f"tail{i}", [0.5, 0.5], {"idx": 40 + i})
+    assert len(db) == 62
+    assert db.vector_arena_len() == 62
+    assert db.ann_segment_count() >= 3
+    assert db.search([1.0, 0.0], k=1)[0]["id"] == "doc0"
+
+    with pytest.raises(ValueError, match="vectors must be C-contiguous"):
+        db.bulk_ingest_array(["bad"], vectors[0:1, ::-1], batch_size=1)
+
+
 def test_index_config_tuning(tmp_path: Path) -> None:
     """HNSW tuning options are exposed and validated."""
     path = tmp_path / "index_config.vdb"
@@ -514,6 +553,7 @@ def test_index_config_tuning(tmp_path: Path) -> None:
         "ef_search": None,
         "parallel_insert_threshold": 256,
         "tombstone_rebuild_pct": 30,
+        "segment_size_threshold": 50000,
     }
 
     db.set_ef_search(40)
@@ -531,6 +571,7 @@ def test_index_config_tuning(tmp_path: Path) -> None:
         "ef_search": 40,
         "parallel_insert_threshold": 9999,
         "tombstone_rebuild_pct": 40,
+        "segment_size_threshold": 50000,
     }
 
     db.set_ef_search(None)
@@ -556,6 +597,7 @@ def test_index_config_tuning(tmp_path: Path) -> None:
         "ef_search": 80,
         "parallel_insert_threshold": 1,
         "tombstone_rebuild_pct": 50,
+        "segment_size_threshold": 50000,
     }
 
     with pytest.raises(vectlite.VectLiteError, match="IndexConfig.m"):

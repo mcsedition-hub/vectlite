@@ -174,7 +174,7 @@ db.close()
 - **Snapshots** -- `db.snapshot(path)` creates a self-contained copy at any time
 - **Backup / Restore** -- full backup with ANN sidecars and restore to a new path
 - **Physical collections** -- `open_store()` manages a directory of independent databases
-- **Bulk ingestion** -- `bulk_ingest()` with deferred index rebuilds for fast imports
+- **Bulk ingestion** -- `bulk_ingest()` with deferred index rebuilds for fast imports; `bulk_ingest_array()` for zero-copy NumPy / Float32Array ingest (10--30x faster)
 - **TTL / Expiry** -- `set_ttl()` / `clear_ttl()` or `ttl=` on insert/upsert; expired records auto-filtered from reads and GC'd on compact
 - **Cursor-based pagination** -- `list_cursor()` for efficient iteration over large collections without offset overhead
 - **Schema validation** -- optional typed metadata schemas with sidecar persistence and validated write wrappers
@@ -182,7 +182,7 @@ db.close()
 ### Search & Retrieval
 
 - **Distance metrics** -- cosine (default), euclidean (L2), dot product (inner product), manhattan (L1) with SIMD acceleration
-- **Dense vectors** -- automatic HNSW indexing with metric-aware distance functions
+- **Dense vectors** -- automatic HNSW indexing with metric-aware distance functions and LSM-tree-style segmenting for bounded per-insert cost
 - **Sparse vectors** -- BM25-scored inverted index for keyword retrieval
 - **Hybrid search** -- dense + sparse fusion via linear combination or reciprocal rank fusion (RRF)
 - **Vector quantization** -- scalar (int8, 4x), binary (32x), and product quantization (PQ) with 2-stage rescoring
@@ -329,6 +329,25 @@ db.bulk_ingest(records, batch_size=5000)
 
 `upsert_many(records)` and `insert_many(records)` accept the same format and also rebuild indexes once.
 
+#### Zero-Copy Bulk Ingest (NumPy)
+
+For the fastest possible ingestion from Python, pass a NumPy array directly.
+No per-record dict parsing, no per-element Python-to-Rust crossing, and the
+GIL is released for the entire ingest. 10--30x faster than `bulk_ingest(list_of_dicts)`.
+
+```python
+import numpy as np
+
+ids = [f"doc{i}" for i in range(len(embeddings))]
+vectors = np.array(embeddings, dtype=np.float32)  # shape (N, D), C-contiguous
+metadata = [{"source": "corpus"} for _ in ids]    # optional
+
+db.bulk_ingest_array(ids, vectors, metadata=metadata, batch_size=5000)
+```
+
+Only writes the default dense vector. For named vectors, sparse terms, or
+multi-vectors use `bulk_ingest(list_of_dicts)`.
+
 #### Tuning the HNSW index
 
 `bulk_ingest` accepts optional HNSW knobs so you can trade off recall, latency
@@ -338,9 +357,10 @@ and build time per workload:
 db.bulk_ingest(
     records,
     batch_size=5000,
-    m=32,                 # max links per node (default 16)
-    ef_construction=400,  # search width while building (default 200)
-    ef_search=200,        # search width at query time (default: auto)
+    m=32,                        # max links per node (default 16)
+    ef_construction=400,         # search width while building (default 200)
+    ef_search=200,               # search width at query time (default: auto)
+    segment_size_threshold=25000,# vectors per HNSW segment (default 50000)
 )
 ```
 
@@ -352,12 +372,18 @@ db.set_ef_search(200)                            # query-time only, no rebuild
 db.set_ef_search(None)                           # back to auto
 
 print(db.index_config())
-# {'m': 32, 'ef_construction': 400, 'ef_search': 200, 'parallel_insert_threshold': 256}
+# {'m': 32, 'ef_construction': 400, 'ef_search': 200,
+#  'parallel_insert_threshold': 256, 'tombstone_rebuild_pct': 30,
+#  'segment_size_threshold': 50000}
+
+# Check how many HNSW segments exist
+print(db.ann_segment_count())  # e.g. 3
 ```
 
 Rule of thumb: raise `m` and `ef_construction` for higher recall at the cost
 of build time; raise `ef_search` for higher recall at the cost of latency
-without rebuilding the index.
+without rebuilding the index. Lower `segment_size_threshold` to keep per-insert
+cost bounded as the corpus grows (LSM-tree-style segmented HNSW).
 
 ### Collections
 
@@ -833,6 +859,20 @@ do {
 const page = db.listCursor({ namespace: 'docs', filter: { source: 'blog' }, limit: 50 })
 ```
 
+### Zero-Copy Bulk Ingest (Node)
+
+For the fastest possible ingestion from Node.js, pass a `Float32Array` directly.
+The vector data is not JSON-serialised between JS and Rust -- napi-rs gives
+Rust a reference into the underlying `ArrayBuffer`.
+
+```js
+const ids = embeddings.map((_, i) => `doc${i}`)
+const vectorsFlat = new Float32Array(embeddings.flat())
+const metadata = ids.map(() => ({ source: 'corpus' })) // optional
+
+db.bulkIngestArray(ids, vectorsFlat, 384, { metadata, batchSize: 5000 })
+```
+
 ### Async API (Node)
 
 Non-blocking versions of heavy operations that run on the libuv threadpool.
@@ -1061,8 +1101,11 @@ Each database consists of:
 | `*.vdb` | Binary snapshot: magic header, version, dimension, records |
 | `*.vdb.wal` | Write-ahead log for crash-safe recovery |
 | `*.vdb.ann.*` | HNSW sidecar files (acceleration artifacts, regenerated if missing) |
+| `*.vdb.sparse` | BM25 sparse index sidecar (rebuilt on flush/compact, loaded on open) |
+| `*.vdb.col.vector` | Contiguous vector arena sidecar (cache-friendly dense scan, rebuilt on compact) |
 | `*.vdb.quant` | Quantization parameters (calibration ranges, PQ codebooks) |
 | `*.vdb.mvquant.*` | Multi-vector quantization parameters (2-bit boundaries per space) |
+| `*.vdb.pidx` | Payload index definitions (keyword/numeric index metadata) |
 | `*.vdb.schema.json` | Optional typed metadata schema (JSON sidecar for schema validation) |
 | `*.vdb.lock` | Advisory lock file for concurrency control |
 

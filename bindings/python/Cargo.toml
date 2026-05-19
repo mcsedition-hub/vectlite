@@ -15,4 +15,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.23.5", features = ["abi3-py39", "extension-module"] }
+# `numpy` gives us PyReadonlyArray2<f32> for zero-copy bulk-ingest from
+# numpy.ndarray. Version 0.23 is the PyO3 0.23-compatible release.
+numpy = "0.23"
 vectlite = { package = "vectlite-core", path = "../../crates/vectlite-core" }

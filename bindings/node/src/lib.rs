@@ -351,11 +351,11 @@ impl NativeDatabase {
             multi_vectors: MultiVectors::new(),
             expires_at,
         };
+        // CRITICAL fix: insert_record uses the incremental WAL-batch path.
+        // Previously insert_many(once(record)) triggered a full HNSW
+        // rebuild + persist on every single record.
         let mut database = self.write_open()?;
-        database
-            .insert_many(std::iter::once(record))
-            .map(|_| ())
-            .map_err(to_napi_error)
+        database.insert_record(record).map_err(to_napi_error)
     }
 
     #[napi]
@@ -385,10 +385,7 @@ impl NativeDatabase {
             expires_at,
         };
         let mut database = self.write_open()?;
-        database
-            .upsert_many(std::iter::once(record))
-            .map(|_| ())
-            .map_err(to_napi_error)
+        database.upsert_record(record).map_err(to_napi_error)
     }
 
     #[napi(js_name = "insertMany")]
@@ -422,6 +419,7 @@ impl NativeDatabase {
         ef_search: Option<u32>,
         parallel_insert_threshold: Option<u32>,
         tombstone_rebuild_pct: Option<u32>,
+        segment_size_threshold: Option<u32>,
     ) -> Result<u32> {
         let records = parse_record_batch_json(&records_json, namespace.as_deref())?;
         let mut database = self.write_open()?;
@@ -431,6 +429,7 @@ impl NativeDatabase {
             ef_search,
             parallel_insert_threshold,
             tombstone_rebuild_pct,
+            segment_size_threshold,
         );
         let count = if let Some(cfg) = tuning {
             let merged = apply_index_overrides(database.index_config(), cfg);
@@ -450,6 +449,7 @@ impl NativeDatabase {
             "ef_search": cfg.ef_search.map(|v| v as u32),
             "parallel_insert_threshold": cfg.parallel_insert_threshold as u32,
             "tombstone_rebuild_pct": cfg.tombstone_rebuild_pct as u32,
+            "segment_size_threshold": cfg.segment_size_threshold as u32,
         });
         stringify_value(value)
     }
@@ -468,6 +468,7 @@ impl NativeDatabase {
         ef_search: Option<u32>,
         parallel_insert_threshold: Option<u32>,
         tombstone_rebuild_pct: Option<u32>,
+        segment_size_threshold: Option<u32>,
     ) -> Result<()> {
         let mut database = self.write_open()?;
         let overrides = merge_index_config(
@@ -476,10 +477,101 @@ impl NativeDatabase {
             ef_search,
             parallel_insert_threshold,
             tombstone_rebuild_pct,
+            segment_size_threshold,
         )
         .ok_or_else(|| err("setIndexConfig requires at least one field"))?;
         let merged = apply_index_overrides(database.index_config(), overrides);
         database.set_index_config(merged).map_err(to_napi_error)
+    }
+
+    /// Number of HNSW segments in the active index for the given
+    /// (namespace, vector_name). Returns 0 when no graph exists. Useful
+    /// for tests and observability.
+    #[napi(js_name = "annSegmentCount")]
+    pub fn ann_segment_count(
+        &self,
+        namespace: Option<String>,
+        vector_name: Option<String>,
+    ) -> Result<u32> {
+        let db = self.read()?;
+        Ok(db.ann_segment_count(namespace.as_deref(), vector_name.as_deref()) as u32)
+    }
+
+    /// Zero-copy bulk ingest from a Float32Array.
+    ///
+    /// 10–30× faster than `bulkIngest(JSON.stringify(records))` for large
+    /// batches because:
+    ///   - The vector data isn't JSON-serialised on the JS side and parsed
+    ///     on the Rust side: napi-rs gives us a direct reference to the
+    ///     ArrayBuffer.
+    ///   - The arena is pre-grown in one allocation.
+    ///
+    /// Args:
+    ///   ids: Array<string> of length N
+    ///   vectors_flat: Float32Array of length N * dim (row-major, contiguous)
+    ///   dim: number — must equal db.dimension
+    ///   metadata_json: optional JSON string serialising `Array<object|null>`
+    ///                  of length N, OR null for empty metadata
+    ///   namespace: optional namespace override
+    ///   batch_size: WAL batch size for the underlying bulk path
+    #[napi(js_name = "bulkIngestArray")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn bulk_ingest_array(
+        &self,
+        ids: Vec<String>,
+        vectors_flat: Float32Array,
+        dim: u32,
+        metadata_json: Option<String>,
+        namespace: Option<String>,
+        batch_size: u32,
+        m: Option<u32>,
+        ef_construction: Option<u32>,
+        ef_search: Option<u32>,
+        parallel_insert_threshold: Option<u32>,
+        tombstone_rebuild_pct: Option<u32>,
+        segment_size_threshold: Option<u32>,
+    ) -> Result<u32> {
+        let dim = dim as usize;
+        let n = ids.len();
+        if vectors_flat.len() != n * dim {
+            return Err(err(format!(
+                "bulkIngestArray: vectors_flat has {} floats but ids has {} entries × dim {} = {}",
+                vectors_flat.len(),
+                n,
+                dim,
+                n * dim
+            )));
+        }
+        let metas = parse_metadata_batch_json(metadata_json.as_deref(), n)?;
+
+        let mut database = self.write_open()?;
+        let tuning = merge_index_config(
+            m,
+            ef_construction,
+            ef_search,
+            parallel_insert_threshold,
+            tombstone_rebuild_pct,
+            segment_size_threshold,
+        );
+        let config_override = tuning.map(|cfg| apply_index_overrides(database.index_config(), cfg));
+
+        // Float32Array deref via napi-rs gives &[f32] zero-copy into the
+        // ArrayBuffer; we only `to_vec()` once below for the per-record
+        // Vec<f32> alloc inside the core. No JSON parsing, no per-element
+        // V8→Rust boundary crossing.
+        let slice: &[f32] = vectors_flat.as_ref();
+        database
+            .bulk_ingest_array(
+                ids,
+                slice,
+                dim,
+                metas,
+                namespace.as_deref(),
+                batch_size as usize,
+                config_override,
+            )
+            .map(|n| n as u32)
+            .map_err(to_napi_error)
     }
 
     /// Configure WAL durability. `mode` is one of: `"per_op"` (the default,
@@ -1095,6 +1187,7 @@ impl NativeDatabase {
         ef_search: Option<u32>,
         parallel_insert_threshold: Option<u32>,
         tombstone_rebuild_pct: Option<u32>,
+        segment_size_threshold: Option<u32>,
     ) -> Result<AsyncTask<BulkIngestTask>> {
         let records = parse_record_batch_json(&records_json, namespace.as_deref())?;
         let tuning = merge_index_config(
@@ -1103,6 +1196,7 @@ impl NativeDatabase {
             ef_search,
             parallel_insert_threshold,
             tombstone_rebuild_pct,
+            segment_size_threshold,
         );
         Ok(AsyncTask::new(BulkIngestTask {
             db: self.inner.clone(),
@@ -1454,6 +1548,37 @@ fn parse_metadata_json(input: Option<String>) -> Result<Metadata> {
         None | Some(Value::Null) => Ok(Metadata::new()),
         Some(value) => json_to_metadata(&value),
     }
+}
+
+/// Parse a JSON-encoded `Array<object|null>` of length `n` into a vector of
+/// `Metadata`. Returns `None` when the input is `None` (meaning "no
+/// metadata", so the caller can default to empty maps). Each entry may be
+/// `null` → empty `Metadata`.
+fn parse_metadata_batch_json(input: Option<&str>, n: usize) -> Result<Option<Vec<Metadata>>> {
+    let Some(text) = input else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_str(text)
+        .map_err(|e| err(format!("metadata_json must be valid JSON: {e}")))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| err("metadata_json must be a JSON array"))?;
+    if items.len() != n {
+        return Err(err(format!(
+            "metadata_json has {} entries but ids has {}",
+            items.len(),
+            n
+        )));
+    }
+    let mut parsed = Vec::with_capacity(n);
+    for item in items {
+        let meta = match item {
+            Value::Null => Metadata::new(),
+            other => json_to_metadata(other)?,
+        };
+        parsed.push(meta);
+    }
+    Ok(Some(parsed))
 }
 
 fn parse_sparse_json(input: Option<String>) -> Result<SparseVector> {
@@ -2113,24 +2238,28 @@ struct IndexConfigPatch {
     ef_search: Option<usize>,
     parallel_insert_threshold: Option<usize>,
     tombstone_rebuild_pct: Option<u8>,
+    segment_size_threshold: Option<usize>,
 }
 
-/// Pack the five optional HNSW tuning fields into a patch. Returns `None`
+/// Pack the six optional HNSW tuning fields into a patch. Returns `None`
 /// when every field is `None`; explicit zeroes are preserved so core
 /// validation can reject invalid build/search widths instead of treating
 /// them as "not provided".
+#[allow(clippy::too_many_arguments)]
 fn merge_index_config(
     m: Option<u32>,
     ef_construction: Option<u32>,
     ef_search: Option<u32>,
     parallel_insert_threshold: Option<u32>,
     tombstone_rebuild_pct: Option<u32>,
+    segment_size_threshold: Option<u32>,
 ) -> Option<IndexConfigPatch> {
     if m.is_none()
         && ef_construction.is_none()
         && ef_search.is_none()
         && parallel_insert_threshold.is_none()
         && tombstone_rebuild_pct.is_none()
+        && segment_size_threshold.is_none()
     {
         return None;
     }
@@ -2140,6 +2269,7 @@ fn merge_index_config(
         ef_search: ef_search.map(|v| v as usize),
         parallel_insert_threshold: parallel_insert_threshold.map(|v| v as usize),
         tombstone_rebuild_pct: tombstone_rebuild_pct.map(|v| if v > 100 { 101 } else { v as u8 }),
+        segment_size_threshold: segment_size_threshold.map(|v| v as usize),
     })
 }
 
@@ -2157,6 +2287,9 @@ fn apply_index_overrides(current: IndexConfig, patch: IndexConfigPatch) -> Index
         tombstone_rebuild_pct: patch
             .tombstone_rebuild_pct
             .unwrap_or(current.tombstone_rebuild_pct),
+        segment_size_threshold: patch
+            .segment_size_threshold
+            .unwrap_or(current.segment_size_threshold),
     }
 }
 
